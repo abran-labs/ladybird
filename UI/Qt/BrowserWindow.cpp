@@ -2227,6 +2227,10 @@ void BrowserWindow::toggle_window_maximized()
 
 bool BrowserWindow::start_window_move()
 {
+    // Leave movement over client-side browser chrome to Hyprland's compositor binding.
+    if (is_hyprland_wayland_session())
+        return false;
+
     auto* handle = windowHandle();
     if (!handle)
         return false;
@@ -2583,8 +2587,7 @@ bool BrowserWindow::eventFilter(QObject* object, QEvent* event)
             return true;
         }
 
-        auto is_hyprland_tab_chrome = is_hyprland_wayland_session() && m_tabs_container && m_tabs_container->tab_chrome_contains(*widget);
-        if (!is_hyprland_tab_chrome && start_window_move())
+        if (start_window_move())
             return true;
     }
 

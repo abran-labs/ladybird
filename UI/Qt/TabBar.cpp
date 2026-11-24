@@ -5729,17 +5729,6 @@ bool TabWidget::tab_drop_area_contains(QWidget const& widget, QPoint position) c
     return drop_area.contains(position_in_drag_area);
 }
 
-bool TabWidget::tab_chrome_contains(QWidget const& widget) const
-{
-    auto includes_widget = [&](QWidget const& chrome) { return &chrome == &widget || chrome.isAncestorOf(&widget); };
-    if (includes_widget(*tab_drag_area_widget()))
-        return true;
-
-    // Some sidebar controls sit outside the column when arranged beside the toolbar.
-    return m_tab_bar->tab_layout() != TabLayout::Horizontal
-        && (includes_widget(m_toolbar->sidebar_slot()) || includes_widget(m_toolbar->trailing_sidebar_slot()) || includes_widget(m_toolbar->sidebar_footer()));
-}
-
 QWidget* TabWidget::tab_drag_area_widget() const
 {
     return m_tab_bar->tab_layout() == TabLayout::Horizontal ? m_tab_bar_row : m_vertical_tab_bar_column;
