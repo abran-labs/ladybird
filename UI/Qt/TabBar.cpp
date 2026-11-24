@@ -179,7 +179,8 @@ static constexpr int TAB_DETACH_DISTANCE = 40;
 static constexpr int ROW_DRAG_DEPTH_STEP = 12;
 static constexpr int VERTICAL_DRAG_CARD_MAX_WIDTH = 260;
 static constexpr int VERTICAL_DRAG_CARD_STACK_STEP = 4;
-static constexpr int VERTICAL_DRAG_CARD_CLEARANCE = 3;
+static constexpr qreal VERTICAL_DRAG_CARD_SCALE = 0.6;
+static constexpr qreal VERTICAL_DRAG_CARD_OPACITY = 0.6;
 static constexpr qreal VERTICAL_DROP_INDICATOR_DOT_RADIUS = 3.5;
 // A closing tab fades out over this much of the time the other tabs take to close the gap it leaves.
 static constexpr qreal CLOSING_TAB_FADE_PORTION = 0.4;
@@ -1284,7 +1285,7 @@ void TabBar::animate_rows_from(HashMap<u64, qreal> start_y)
             if (m_vertical_drag_landing_end.has_value() && m_vertical_drag_card) {
                 auto offset = *m_vertical_drag_landing_end - m_vertical_drag_landing_start;
                 m_vertical_drag_card->move(m_vertical_drag_landing_start + offset * m_rows_progress);
-                m_vertical_drag_card->set_opacity(1.0 - m_rows_progress);
+                m_vertical_drag_card->set_opacity(VERTICAL_DRAG_CARD_OPACITY * (1.0 - m_rows_progress));
             }
             update_tab_button_geometry();
             update();
@@ -1366,11 +1367,11 @@ void TabBar::show_vertical_drag_card(QRect source, int tab_index, SidebarRow con
     badge_font.setBold(true);
     constexpr int badge_height = 16;
     auto badge_width = max(badge_height, QFontMetrics(badge_font).horizontalAdvance(count) + 6);
-    // Leave room for the row's edge and shadow, and for the badge to straddle the leading corner.
+    // Leave room for the badge to straddle the main card's corner without changing its cursor anchor.
     auto card_origin = layers > 1 ? QPoint(badge_width / 2 + 1, 5) : QPoint(2, 2);
-    auto padding = card_origin + QPoint(stack_offset + 2, stack_offset + 3);
-    QSize size { min(source.width(), min(VERTICAL_DRAG_CARD_MAX_WIDTH, max(1, width() - padding.x()))), source.height() };
-    auto preview_size = size + QSize(padding.x(), padding.y());
+    auto hot_spot = QPoint(ceil(card_origin.x() * VERTICAL_DRAG_CARD_SCALE), ceil(card_origin.y() * VERTICAL_DRAG_CARD_SCALE));
+    QSize size { min(source.width(), VERTICAL_DRAG_CARD_MAX_WIDTH), source.height() };
+    auto preview_size = QSizeF(size + QSize(stack_offset + 2, stack_offset + 3)) * VERTICAL_DRAG_CARD_SCALE + QSizeF(hot_spot.x(), hot_spot.y());
     auto dpr = devicePixelRatioF();
     QPixmap pixmap(QSize(ceil(preview_size.width() * dpr), ceil(preview_size.height() * dpr)));
     pixmap.setDevicePixelRatio(dpr);
@@ -1378,6 +1379,10 @@ void TabBar::show_vertical_drag_card(QRect source, int tab_index, SidebarRow con
     {
         QPainter painter(&pixmap);
         painter.setRenderHint(QPainter::Antialiasing);
+        painter.setRenderHint(QPainter::SmoothPixmapTransform);
+        painter.translate(hot_spot);
+        painter.scale(VERTICAL_DRAG_CARD_SCALE, VERTICAL_DRAG_CARD_SCALE);
+        painter.translate(-card_origin);
         auto const& chrome = Theme::chrome(*this);
         auto palette = Theme::chrome_palette(*this);
         QRect card_rect(card_origin, size);
@@ -1449,10 +1454,10 @@ void TabBar::show_vertical_drag_card(QRect source, int tab_index, SidebarRow con
             painter.drawText(badge, Qt::AlignCenter, count);
         }
     }
-    auto pickup = m_drag_start_position - source.topLeft();
-    auto pickup_x = qRound(pickup.x() * size.width() / static_cast<qreal>(max(1, source.width())));
-    auto hot_spot = layers > 1 ? QPoint(18, 18) : QPoint(clamp(pickup_x, 0, size.width() - 1), clamp(pickup.y(), 0, size.height() - 1));
-    m_vertical_drag_card = new TabDragCard(*window(), AK::move(pixmap), card_origin + hot_spot);
+    // A native sidebar would cover a card in the window's backing store.
+    auto* host = parentWidget()->testAttribute(Qt::WA_NativeWindow) ? parentWidget() : window();
+    m_vertical_drag_card = new TabDragCard(*host, AK::move(pixmap), hot_spot);
+    m_vertical_drag_card->set_opacity(VERTICAL_DRAG_CARD_OPACITY);
     QApplication::setOverrideCursor(Qt::ClosedHandCursor);
     m_vertical_drag_cursor_active = true;
 }
@@ -1462,37 +1467,9 @@ void TabBar::move_vertical_drag_card(QPoint position)
     if (!m_vertical_drag_card)
         return;
 
-    auto size = m_vertical_drag_card->size();
-    // Keep the preview in the chrome even when the page is a separate native surface above the window's backing store.
-    // The sidebar has room below its last row even though the tab bar itself ends there.
-    auto sidebar_bottom = parentWidget()->height() - y();
-    auto top_left = position - m_vertical_drag_card->hot_spot();
-    top_left.setX(clamp(top_left.x(), 0, max(0, width() - size.width())));
-    top_left.setY(clamp(top_left.y(), 0, max(0, sidebar_bottom - size.height())));
-    QRect target;
-    if (m_row_drag.has_value() && m_hovered_folder.has_value()) {
-        target = folder_row_rect(*m_hovered_folder).value_or(QRect {});
-    } else if (m_vertical_drop_line.isValid()) {
-        auto sweep = displayed_vertical_drop_indicator().united(m_vertical_drop_line);
-        auto dot_extent = m_vertical_drop_line.width() > m_vertical_drop_line.height() ? VERTICAL_DROP_INDICATOR_DOT_RADIUS : 0;
-        target = sweep.adjusted(0, -dot_extent, 0, dot_extent).toAlignedRect();
-    }
-    if (target.isValid()) {
-        target.adjust(0, -VERTICAL_DRAG_CARD_CLEARANCE, 0, VERTICAL_DRAG_CARD_CLEARANCE);
-        if (target.intersects(QRect(top_left, size))) {
-            auto above = target.top() - size.height();
-            auto below = target.bottom() + 1;
-            auto fits_above = above >= 0;
-            auto fits_below = below + size.height() <= sidebar_bottom;
-            if (!fits_above && !fits_below) {
-                m_vertical_drag_card->hide();
-                return;
-            }
-            auto prefer_above = below < height() && top_left.y() - above < below - top_left.y();
-            top_left.setY(fits_above && (!fits_below || prefer_above) ? above : below);
-        }
-    }
-    m_vertical_drag_card->move(mapTo(window(), top_left));
+    // Keep the card under the cursor even over a drop indicator or a surface edge. The indicator can show
+    // through, and native surfaces can clip the overhang without moving the card.
+    m_vertical_drag_card->move(mapTo(m_vertical_drag_card->parentWidget(), position) - m_vertical_drag_card->hot_spot());
     m_vertical_drag_card->show();
     m_vertical_drag_card->raise();
 }
@@ -1505,7 +1482,7 @@ void TabBar::land_vertical_drag_card(QRect destination)
     }
     m_vertical_drag_landing_start = m_vertical_drag_card->pos();
     auto offset = QPoint(0, (destination.height() - m_vertical_drag_card->height()) / 2);
-    m_vertical_drag_landing_end = mapTo(window(), destination.topLeft() + offset);
+    m_vertical_drag_landing_end = mapTo(m_vertical_drag_card->parentWidget(), destination.topLeft() + offset) - QPoint(m_vertical_drag_card->hot_spot().x(), 0);
 }
 
 void TabBar::restore_vertical_drag_cursor()
