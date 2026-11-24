@@ -440,9 +440,51 @@ Vector<TabFolderTree::TabKey> TabFolderTree::delete_folder(TabFolderId id)
     return tabs;
 }
 
-void TabFolderTree::remove_folders_outside_tabbed_ones()
+TabFolderTree TabFolderTree::with_only_tabs_kept(Function<bool(TabKey)> const& keep) const
 {
-    *this = split([](auto) { return true; }, SplitHalf::Second).first;
+    // Classified against every tab the tree holds, before any is dropped, so a folder whose tabs are all forgotten never
+    // looks like an empty one.
+    enum class Holds : u8 {
+        Nothing,
+        OnlyForgottenTabs,
+        KeptTabs,
+    };
+    HashMap<TabFolderId, Holds> holds;
+    auto classify = [&](auto& self, TabFolderId id) -> Holds {
+        auto result = Holds::Nothing;
+        for (auto child : children(id)) {
+            auto child_holds = child.is_tab() ? (keep(child.id) ? Holds::KeptTabs : Holds::OnlyForgottenTabs) : self(self, child.id);
+            result = max(result, child_holds);
+        }
+        holds.set(id, result);
+        return result;
+    };
+    for (auto item : m_root) {
+        if (item.is_folder())
+            (void)classify(classify, item.id);
+    }
+
+    TabFolderTree tree;
+    tree.m_last_folder_id = m_last_folder_id;
+    // An empty folder goes along with the nearest folder around it that holds tabs, and at the root it has none.
+    auto copy = [&](auto& self, Vector<Item> const& items, Optional<TabFolderId> parent, bool in_kept_branch) -> void {
+        for (auto item : items) {
+            if (item.is_tab()) {
+                if (keep(item.id))
+                    tree.insert(item, parent, NumericLimits<size_t>::max());
+                continue;
+            }
+            auto folder_holds = holds.get(item.id).value();
+            if (folder_holds == Holds::OnlyForgottenTabs || (folder_holds == Holds::Nothing && !in_kept_branch))
+                continue;
+            auto const& node = m_folders.get(item.id).value();
+            tree.m_folders.set(item.id, FolderNode { .folder = node.folder, .parent = {}, .children = {} });
+            tree.insert(item, parent, NumericLimits<size_t>::max());
+            self(self, node.children, item.id, true);
+        }
+    };
+    copy(copy, m_root, {}, false);
+    return tree;
 }
 
 static JsonArray serialize_items(TabFolderTree const& tree, Vector<TabFolderTree::Item> const& items)

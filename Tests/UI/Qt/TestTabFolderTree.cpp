@@ -365,7 +365,40 @@ TEST_CASE(remapping_tabs_keeps_the_structure)
     EXPECT_EQ(remapped.folder(a)->name, "A"_string);
 }
 
-TEST_CASE(removing_untabbed_folders_keeps_those_with_tabs_and_the_empty_ones_inside_them)
+TEST_CASE(keeping_some_tabs_keeps_their_branches_and_the_empty_folders_in_them)
+{
+    // Work: kept tab 1, Ideas (empty, with Sketches), Confidential (forgotten tab 2, Drafts with forgotten tab 3 and Scratch),
+    // Mixed (Deep with kept tab 4, Secret with forgotten tab 5, Notes). Root: Archive (forgotten tab 6), Lonely (empty).
+    auto tree = tree_with_tabs({ 1, 2, 3, 4, 5, 6 });
+    auto work = tree.create_folder_around("Work"_string, items({ tab(1) })).release_value();
+    auto ideas = tree.create_folder("Ideas"_string, TabFolderTree::Destination::at_end_of(work)).release_value();
+    auto sketches = tree.create_folder("Sketches"_string, TabFolderTree::Destination::at_end_of(ideas)).release_value();
+    auto confidential = tree.create_folder("Confidential"_string, TabFolderTree::Destination::at_end_of(work)).release_value();
+    EXPECT(tree.move_items(items({ tab(2) }), TabFolderTree::Destination::at_end_of(confidential)));
+    auto drafts = tree.create_folder("Drafts"_string, TabFolderTree::Destination::at_end_of(confidential)).release_value();
+    EXPECT(tree.move_items(items({ tab(3) }), TabFolderTree::Destination::at_end_of(drafts)));
+    auto scratch = tree.create_folder("Scratch"_string, TabFolderTree::Destination::at_end_of(drafts)).release_value();
+    auto mixed = tree.create_folder("Mixed"_string, TabFolderTree::Destination::at_end_of(work)).release_value();
+    auto deep = tree.create_folder("Deep"_string, TabFolderTree::Destination::at_end_of(mixed)).release_value();
+    EXPECT(tree.move_items(items({ tab(4) }), TabFolderTree::Destination::at_end_of(deep)));
+    auto secret = tree.create_folder("Secret"_string, TabFolderTree::Destination::at_end_of(mixed)).release_value();
+    EXPECT(tree.move_items(items({ tab(5) }), TabFolderTree::Destination::at_end_of(secret)));
+    auto notes = tree.create_folder("Notes"_string, TabFolderTree::Destination::at_end_of(mixed)).release_value();
+    auto archive = tree.create_folder_around("Archive"_string, items({ tab(6) })).release_value();
+    auto lonely = tree.create_folder("Lonely"_string).release_value();
+
+    auto kept = tree.with_only_tabs_kept([](auto key) { return key == 1 || key == 4; });
+    EXPECT_EQ(kept.children(), items({ folder(work) }));
+    EXPECT_EQ(kept.children(work), items({ tab(1), folder(ideas), folder(mixed) }));
+    EXPECT_EQ(kept.children(ideas), items({ folder(sketches) }));
+    EXPECT_EQ(kept.children(mixed), items({ folder(deep), folder(notes) }));
+    EXPECT_EQ(kept.children(deep), items({ tab(4) }));
+    for (auto gone : { confidential, drafts, scratch, secret, archive, lonely })
+        EXPECT(!kept.folder(gone).has_value());
+    EXPECT_EQ(kept.tabs_in_order(), keys({ 1, 4 }));
+}
+
+TEST_CASE(keeping_every_tab_drops_only_empty_folders_outside_tabbed_ones)
 {
     auto tree = tree_with_tabs({ 1, 2 });
     auto outer = tree.create_folder_around("Outer"_string, items({ tab(2) })).release_value();
@@ -374,13 +407,13 @@ TEST_CASE(removing_untabbed_folders_keeps_those_with_tabs_and_the_empty_ones_ins
     auto empty = tree.create_folder("Empty"_string).release_value();
     auto empty_child = tree.create_folder("EmptyChild"_string, TabFolderTree::Destination::at_end_of(empty)).release_value();
 
-    tree.remove_folders_outside_tabbed_ones();
-    EXPECT(tree.folder(outer).has_value());
-    EXPECT(tree.folder(inner).has_value());
-    EXPECT(tree.folder(empty_inside).has_value());
-    EXPECT(!tree.folder(empty).has_value());
-    EXPECT(!tree.folder(empty_child).has_value());
-    EXPECT_EQ(tree.children(outer), items({ folder(inner), folder(empty_inside) }));
+    auto kept = tree.with_only_tabs_kept([](auto) { return true; });
+    EXPECT(kept.folder(outer).has_value());
+    EXPECT(kept.folder(inner).has_value());
+    EXPECT(kept.folder(empty_inside).has_value());
+    EXPECT(!kept.folder(empty).has_value());
+    EXPECT(!kept.folder(empty_child).has_value());
+    EXPECT_EQ(kept.children(outer), items({ folder(inner), folder(empty_inside) }));
 }
 
 static String string_of_bytes(size_t count, char ch = 'n')

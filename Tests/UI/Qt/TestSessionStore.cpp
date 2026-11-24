@@ -2989,3 +2989,116 @@ TEST_CASE(an_exit_that_keeps_pinned_tabs_keeps_empty_folders_inside_kept_ones)
     EXPECT(plan[0].tab_folders.has_value());
     EXPECT_EQ(plan[0].tab_folders->children(work), (Vector<TabFolderTree::Item> { TabFolderTree::Item::tab(pinned), TabFolderTree::Item::folder(ideas) }));
 }
+
+// Folder names in the saved form of every window's folders, read back as text, so nothing the exit forgot can hide.
+static String saved_tab_folders_text(Database::Database& database)
+{
+    auto statement = MUST(database.prepare_statement("SELECT coalesce(group_concat(tab_folders, '|'), '') FROM Sessions WHERE tab_folders IS NOT NULL;"sv));
+    String text;
+    database.execute_statement(statement, [&](auto statement_id) -> ErrorOr<void> {
+        text = database.result_column<String>(statement_id, 0);
+        return {};
+    });
+    return text;
+}
+
+TEST_CASE(an_exit_that_keeps_pinned_tabs_forgets_folders_of_only_forgotten_tabs_inside_kept_ones)
+{
+    // Work holds:
+    //   the pinned tab,
+    //   Ideas (empty) with Sketches (empty) inside,
+    //   Confidential with an unpinned tab and Drafts inside, Drafts holding another unpinned tab and Scratch (empty),
+    //   Mixed, holding Deep (pinned tab) and Secret Plans (an unpinned tab), and Notes (empty).
+    // At the root: Archive with an unpinned tab, and Lonely (empty).
+    auto database = create_session_database();
+    SessionTabId pinned = 0;
+    SessionTabId deep_pinned = 0;
+    TabFolderId work = 0, ideas = 0, sketches = 0, mixed = 0, deep = 0, notes = 0;
+    using Item = TabFolderTree::Item;
+    {
+        auto store = TRY_OR_FAIL(SessionStore::create(*database));
+        auto window = TRY_OR_FAIL(store->window_opened());
+        pinned = open_tab(*store, window, "https://kept.example/"sv);
+        deep_pinned = open_tab(*store, window, "https://kept-deep.example/"sv);
+        auto confidential_tab = open_tab(*store, window, "https://c.example/"sv);
+        auto drafts_tab = open_tab(*store, window, "https://d.example/"sv);
+        auto secret_tab = open_tab(*store, window, "https://s.example/"sv);
+        auto archive_tab = open_tab(*store, window, "https://a.example/"sv);
+        TRY_OR_FAIL(store->tab_pinned_changed(pinned, true));
+        TRY_OR_FAIL(store->tab_pinned_changed(deep_pinned, true));
+
+        auto tree = folder_tree_for({ pinned, deep_pinned, confidential_tab, drafts_tab, secret_tab, archive_tab });
+        work = tree.create_folder_around("Work"_string, { Item::tab(pinned) }).release_value();
+        ideas = tree.create_folder("Ideas"_string, TabFolderTree::Destination::at_end_of(work)).release_value();
+        sketches = tree.create_folder("Sketches"_string, TabFolderTree::Destination::at_end_of(ideas)).release_value();
+        auto confidential = tree.create_folder("Confidential"_string, TabFolderTree::Destination::at_end_of(work)).release_value();
+        EXPECT(tree.move_items({ Item::tab(confidential_tab) }, TabFolderTree::Destination::at_end_of(confidential)));
+        auto drafts = tree.create_folder("Drafts"_string, TabFolderTree::Destination::at_end_of(confidential)).release_value();
+        EXPECT(tree.move_items({ Item::tab(drafts_tab) }, TabFolderTree::Destination::at_end_of(drafts)));
+        (void)tree.create_folder("Scratch"_string, TabFolderTree::Destination::at_end_of(drafts)).release_value();
+        mixed = tree.create_folder("Mixed"_string, TabFolderTree::Destination::at_end_of(work)).release_value();
+        deep = tree.create_folder("Deep"_string, TabFolderTree::Destination::at_end_of(mixed)).release_value();
+        EXPECT(tree.move_items({ Item::tab(deep_pinned) }, TabFolderTree::Destination::at_end_of(deep)));
+        auto secret = tree.create_folder("Secret Plans"_string, TabFolderTree::Destination::at_end_of(mixed)).release_value();
+        EXPECT(tree.move_items({ Item::tab(secret_tab) }, TabFolderTree::Destination::at_end_of(secret)));
+        notes = tree.create_folder("Notes"_string, TabFolderTree::Destination::at_end_of(mixed)).release_value();
+        (void)tree.create_folder_around("Archive"_string, { Item::tab(archive_tab) }).release_value();
+        (void)tree.create_folder("Lonely"_string).release_value();
+        TRY_OR_FAIL(store->tab_folders_changed(window, tree));
+        quit_cleanly(*store, { window }, SessionStore::AfterExit::KeepPinnedTabs);
+    }
+
+    // What's saved holds the kept branches, empty folders in them included, and not one name of the forgotten groups.
+    auto saved = saved_tab_folders_text(*database);
+    for (auto kept : { "Work"sv, "Ideas"sv, "Sketches"sv, "Mixed"sv, "Deep"sv, "Notes"sv })
+        EXPECT(saved.contains(kept));
+    for (auto forgotten : { "Confidential"sv, "Drafts"sv, "Scratch"sv, "Secret Plans"sv, "Archive"sv, "Lonely"sv })
+        EXPECT(!saved.contains(forgotten));
+
+    // And reopening brings back exactly the kept tree.
+    auto store = TRY_OR_FAIL(SessionStore::create(*database, SessionLaunchPolicy::PinnedOnly));
+    auto plan = store->take_launch_plan();
+    EXPECT_EQ(plan.size(), 1uz);
+    EXPECT(plan[0].tab_folders.has_value());
+    auto const& tree = *plan[0].tab_folders;
+    EXPECT_EQ(tree.children(), (Vector<Item> { Item::folder(work) }));
+    EXPECT_EQ(tree.children(work), (Vector<Item> { Item::tab(pinned), Item::folder(ideas), Item::folder(mixed) }));
+    EXPECT_EQ(tree.children(ideas), (Vector<Item> { Item::folder(sketches) }));
+    EXPECT_EQ(tree.children(mixed), (Vector<Item> { Item::folder(deep), Item::folder(notes) }));
+    EXPECT_EQ(tree.children(deep), (Vector<Item> { Item::tab(deep_pinned) }));
+    EXPECT_EQ(tree.folders_in_order().size(), 6uz);
+}
+
+TEST_CASE(an_exit_that_keeps_pinned_tabs_leaves_no_forgotten_folder_name_in_the_files)
+{
+    QTemporaryDir directory;
+    VERIFY(directory.isValid());
+    auto path = ByteString { directory.path().toUtf8().constData() };
+    {
+        auto database = TRY_OR_FAIL(Database::Database::create(path, "Sessions"sv, { .foreign_keys = Database::Database::ForeignKeys::Yes }));
+        TRY_OR_FAIL(SessionStore::migrate_schema(*database));
+        auto store = TRY_OR_FAIL(SessionStore::create(*database));
+        auto window = TRY_OR_FAIL(store->window_opened());
+        auto pinned = open_tab(*store, window, "https://kept.example/"sv);
+        auto unpinned = open_tab(*store, window, "https://forgotten.example/"sv);
+        TRY_OR_FAIL(store->tab_pinned_changed(pinned, true));
+        auto tree = folder_tree_for({ pinned, unpinned });
+        auto work = tree.create_folder_around("KeptBranchName"_string, { TabFolderTree::Item::tab(pinned) }).release_value();
+        (void)tree.create_folder("EmptyKeptName"_string, TabFolderTree::Destination::at_end_of(work));
+        auto confidential = tree.create_folder("ConfidentialFolderName"_string, TabFolderTree::Destination::at_end_of(work)).release_value();
+        EXPECT(tree.move_items({ TabFolderTree::Item::tab(unpinned) }, TabFolderTree::Destination::at_end_of(confidential)));
+        TRY_OR_FAIL(store->tab_folders_changed(window, tree));
+        quit_cleanly(*store, { window }, SessionStore::AfterExit::KeepPinnedTabs);
+    }
+
+    for (auto suffix : { ""sv, "-wal"sv }) {
+        auto file = Core::File::open(ByteString::formatted("{}/Sessions.db{}", path, suffix), Core::File::OpenMode::Read);
+        if (suffix == "-wal"sv && file.is_error() && file.error().code() == ENOENT)
+            continue;
+        auto bytes = TRY_OR_FAIL(TRY_OR_FAIL(move(file))->read_until_eof());
+        auto contents = StringView { bytes.bytes() };
+        EXPECT(contents.contains("KeptBranchName"sv) == suffix.is_empty());
+        EXPECT(contents.contains("EmptyKeptName"sv) == suffix.is_empty());
+        EXPECT(!contents.contains("ConfidentialFolderName"sv));
+    }
+}

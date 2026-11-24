@@ -972,9 +972,10 @@ ErrorOr<Optional<TabFolderTree>> SessionStore::PersistedStorage::read_session_ta
     return parse_tab_folders(serialized, allowed_tabs);
 }
 
-// After the tabs that aren't kept are gone, so are the folders that held none of the kept ones, names and all, except the
-// empty folders inside a folder of kept tabs.
-ErrorOr<void> SessionStore::PersistedStorage::forget_folders_without_kept_tabs()
+// Folders forget the tabs that aren't kept: a folder holding only those goes with them, names and all, while an empty
+// folder in a branch of kept tabs stays. It runs before the tabs' rows go, since what a folder held is only known from
+// them, and inside the same transaction, so no folder outlives the decision about its tabs.
+ErrorOr<void> SessionStore::PersistedStorage::forget_folders_of_forgotten_tabs()
 {
     Vector<SessionWindowId> sessions;
     TRY(database->try_execute_bound_statement(
@@ -986,12 +987,18 @@ ErrorOr<void> SessionStore::PersistedStorage::forget_folders_without_kept_tabs()
         }));
 
     for (auto session_id : sessions) {
+        // Every tab row of the window, kept or not, so membership is classified before any row is removed. A row that
+        // fails validation is gone already, and its tab is neither kept nor anywhere to forget.
+        HashTable<SessionTabId> all_tabs;
         HashTable<SessionTabId> kept_tabs;
-        for (auto const& tab : TRY(read_recovered_tabs(session_id)))
-            kept_tabs.set(tab.id);
-        auto tree = TRY(read_session_tab_folders(session_id, kept_tabs));
+        for (auto const& tab : TRY(read_recovered_tabs(session_id))) {
+            all_tabs.set(tab.id);
+            if (tab.pinned)
+                kept_tabs.set(tab.id);
+        }
+        auto tree = TRY(read_session_tab_folders(session_id, all_tabs));
         if (tree.has_value())
-            tree->remove_folders_outside_tabbed_ones();
+            tree = tree->with_only_tabs_kept([&](auto key) { return kept_tabs.contains(key); });
         TRY(write_session_tab_folders(session_id, tree));
     }
     return {};
@@ -1276,9 +1283,10 @@ ErrorOr<void> SessionStore::PersistedStorage::forget_all_but_pinned_tabs()
         TRY(database->try_execute_bound_statement(statements.delete_closed_units_left_closed, [&](auto& bind) -> ErrorOr<void> {
             return bind("open_window_kind"sv, to_underlying(UnitKind::OpenWindow));
         }));
+        TRY(forget_folders_of_forgotten_tabs());
         TRY(database->try_execute_bound_statement(statements.delete_unpinned_tabs, [](auto&) -> ErrorOr<void> { return {}; }));
         TRY(database->try_execute_bound_statement(statements.delete_empty_sessions, [](auto&) -> ErrorOr<void> { return {}; }));
-        return forget_folders_without_kept_tabs();
+        return {};
     }));
 
     // A deleted row stays in the files, in the space that it took up and in the write-ahead log, until something writes

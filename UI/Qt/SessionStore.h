@@ -490,7 +490,7 @@ private:
         ErrorOr<void> write_session_geometry(SessionWindowId, SessionWindowGeometry const&);
         ErrorOr<void> write_session_tab_folders(SessionWindowId, Optional<TabFolderTree> const&);
         ErrorOr<Optional<TabFolderTree>> read_session_tab_folders(SessionWindowId, HashTable<SessionTabId> const& allowed_tabs);
-        ErrorOr<void> forget_folders_without_kept_tabs();
+        ErrorOr<void> forget_folders_of_forgotten_tabs();
         ErrorOr<void> demote_to_startup_recovery_unit(SessionWindowId, UnixDateTime recovered_at, IdAllocator& close_sequence_allocator);
         ErrorOr<void> reopen_session(SessionWindowId);
     };

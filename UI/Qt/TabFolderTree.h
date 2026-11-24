@@ -153,9 +153,11 @@ public:
     bool unpack_folder(TabFolderId);
     // Removes the folder with every folder and tab inside it, and returns those tabs, in order, for the caller to close.
     Vector<TabKey> delete_folder(TabFolderId);
-    // Drops every folder that has no tab inside it and isn't inside a folder that has one, for a window that keeps only
-    // some of its tabs: an empty folder stays with the folder of kept tabs it was made in.
-    void remove_folders_outside_tabbed_ones();
+    // The tree with only the tabs that keep says to, for a window that forgets the rest. A folder stays when it holds a
+    // kept tab. A folder that holds no tab at all stays when the nearest folder around it that holds tabs holds a kept one,
+    // so an empty folder stays in a kept branch, and goes with a group of only forgotten tabs, or at the root. A folder
+    // whose tabs are all forgotten goes, along with everything in it, so none of its names stay.
+    TabFolderTree with_only_tabs_kept(Function<bool(TabKey)> const& keep) const;
 
     enum class SplitHalf : u8 {
         First,
