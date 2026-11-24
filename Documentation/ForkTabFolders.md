@@ -42,8 +42,9 @@ internals that Ladybird does not have.
   Right-clicking a selected tab acts on the whole selection. **Move to
   Folder** lists existing folder destinations and **New Folder** for both
   individual tabs and multi-selection.
-- Drag tabs, selected tabs, and folders within the sidebar. A landing line
-  shows the exact insertion position and depth; distinguish dropping into a
+- Use the existing sidebar in each vertical-tab layout. Drag tabs, selected
+  tabs, and folders using live reordering, without a separate landing line.
+  Distinguish dropping into a
   folder from dropping before or after it. Reject dropping a folder into
   itself or a descendant. Keep the relative order of tabs moved together.
 - **Unpack Folder** removes only the folder and promotes its direct contents

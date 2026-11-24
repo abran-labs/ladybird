@@ -27,7 +27,7 @@ Nested cycle rejection; active preview after switching away; order of a nonconti
 
 - [ ] Integrate in `UI/Qt/TabBar.{h,cpp}` / `BrowserWindow.cpp`: reconcile native tab lifecycle, current index and pin state with visible folder rows. Only one preview under outermost collapsed ancestor; no page switch on collapse.
 - [ ] Add selection ranges, destination menu, sidebar add, rename, nested creation, unpack, confirmed recursive delete, folder icon chooser and three-state glyphs.
-- [ ] Implement multi-item drag and drop, live landing line with depth, into-folder feedback, and short expand/collapse animation. Test reorder, nested preview and background tab selection.
+- [ ] Preserve native live drag reordering in vertical layouts, support multi-item drops and into-folder feedback without a separate landing line, and add short expand/collapse animation. Test reorder, nested preview and background tab selection.
 
 ### Task 3: Build and acceptance
 
