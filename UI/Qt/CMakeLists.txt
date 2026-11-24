@@ -36,6 +36,7 @@ add_library(ladybird_impl STATIC
     EventLoopImplementationQtEventTarget.cpp
     FeedbackPopover.cpp
     FindInPageWidget.cpp
+    FolderIcons.cpp
     HiddenPageSizing.cpp
     HistoryPage.cpp
     HubConnection.cpp
@@ -69,6 +70,8 @@ add_library(ladybird_impl STATIC
     SystemAppearance.cpp
     Tab.cpp
     TabBar.cpp
+    TabFolderMenus.cpp
+    TabFolderSync.cpp
     TabFolderTree.cpp
     Theme.cpp
     VersionPage.cpp

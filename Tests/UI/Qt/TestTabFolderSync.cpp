@@ -1,0 +1,251 @@
+/*
+ * Copyright (c) 2026-present, the Ladybird developers.
+ *
+ * SPDX-License-Identifier: BSD-2-Clause
+ */
+
+#include <LibTest/TestCase.h>
+#include <UI/Qt/TabFolderSync.h>
+
+using namespace Ladybird;
+
+using Item = TabFolderTree::Item;
+using Glyph = TabFolderTree::FolderGlyph;
+using TabFolderSync::SidebarRow;
+using TabFolderSync::WindowTab;
+
+static Item tab(i64 key) { return Item::tab(key); }
+static Item folder(TabFolderId id) { return Item::folder(id); }
+
+static Vector<WindowTab> window(std::initializer_list<WindowTab> list)
+{
+    Vector<WindowTab> result;
+    for (auto tab : list)
+        result.append(tab);
+    return result;
+}
+
+static WindowTab unpinned(i64 key) { return { key, false }; }
+static WindowTab pinned(i64 key) { return { key, true }; }
+
+static Vector<i64> keys(std::initializer_list<i64> list)
+{
+    Vector<i64> result;
+    for (auto key : list)
+        result.append(key);
+    return result;
+}
+
+static Vector<Item> items(std::initializer_list<Item> list)
+{
+    Vector<Item> result;
+    for (auto item : list)
+        result.append(item);
+    return result;
+}
+
+static Vector<Item> row_items(Vector<SidebarRow> const& rows)
+{
+    Vector<Item> result;
+    for (auto const& row : rows)
+        result.append(row.item);
+    return result;
+}
+
+// Work holds tabs 2 and 3; tabs 1 and 4 are at the root.
+static TabFolderTree work_tree(TabFolderId& work)
+{
+    TabFolderTree tree;
+    TabFolderSync::reconcile(tree, window({ unpinned(1), unpinned(2), unpinned(3), unpinned(4) }));
+    work = tree.create_folder_around("Work"_string, items({ tab(2), tab(3) })).release_value();
+    return tree;
+}
+
+TEST_CASE(without_folders_the_tree_mirrors_the_window_order)
+{
+    TabFolderTree tree;
+    TabFolderSync::reconcile(tree, window({ pinned(5), unpinned(1), unpinned(2) }));
+    EXPECT_EQ(tree.tabs_in_order(), keys({ 5, 1, 2 }));
+
+    TabFolderSync::reconcile(tree, window({ pinned(5), unpinned(2), unpinned(1), unpinned(3) }));
+    EXPECT_EQ(tree.tabs_in_order(), keys({ 5, 2, 1, 3 }));
+    EXPECT(!tree.has_folders());
+}
+
+TEST_CASE(a_new_tab_joins_the_folder_of_the_tab_before_it)
+{
+    TabFolderId work = 0;
+    auto tree = work_tree(work);
+
+    // A tab opened after tab 2 lands inside Work, right after it.
+    TabFolderSync::reconcile(tree, window({ unpinned(1), unpinned(2), unpinned(9), unpinned(3), unpinned(4) }));
+    EXPECT_EQ(tree.children(work), items({ tab(2), tab(9), tab(3) }));
+    EXPECT_EQ(TabFolderSync::window_order(tree, window({ unpinned(1), unpinned(2), unpinned(9), unpinned(3), unpinned(4) })), keys({ 1, 2, 9, 3, 4 }));
+}
+
+TEST_CASE(a_new_first_unpinned_tab_goes_before_the_next_unpinned_one_not_into_a_pinned_tabs_folder)
+{
+    TabFolderTree tree;
+    TabFolderSync::reconcile(tree, window({ pinned(1), unpinned(2) }));
+    auto pins = tree.create_folder_around("Pins"_string, items({ tab(1) })).release_value();
+
+    TabFolderSync::reconcile(tree, window({ pinned(1), unpinned(7), unpinned(2) }));
+    EXPECT_EQ(tree.children(pins), items({ tab(1) }));
+    EXPECT_EQ(tree.children(), items({ folder(pins), tab(7), tab(2) }));
+}
+
+TEST_CASE(a_closed_tab_leaves_its_folder_and_the_empty_folder_stays)
+{
+    TabFolderId work = 0;
+    auto tree = work_tree(work);
+    TabFolderSync::reconcile(tree, window({ unpinned(1), unpinned(4) }));
+    EXPECT(tree.children(work).is_empty());
+    EXPECT_EQ(tree.children(), items({ tab(1), folder(work), tab(4) }));
+}
+
+TEST_CASE(a_tab_the_window_moved_follows_its_new_neighbor)
+{
+    TabFolderId work = 0;
+    auto tree = work_tree(work);
+
+    // The horizontal strip moved tab 4 between tabs 2 and 3: it joins Work.
+    auto moved = window({ unpinned(1), unpinned(2), unpinned(4), unpinned(3) });
+    TabFolderSync::follow_window_move(tree, moved, 4);
+    EXPECT_EQ(tree.children(work), items({ tab(2), tab(4), tab(3) }));
+    EXPECT_EQ(TabFolderSync::window_order(tree, moved), keys({ 1, 2, 4, 3 }));
+
+    // Moved to the front, tab 3 goes before tab 1 at the root.
+    moved = window({ unpinned(3), unpinned(1), unpinned(2), unpinned(4) });
+    TabFolderSync::follow_window_move(tree, moved, 3);
+    EXPECT_EQ(tree.children(), items({ tab(3), tab(1), folder(work) }));
+}
+
+TEST_CASE(the_window_order_puts_pinned_tabs_first_whatever_their_folders)
+{
+    TabFolderTree tree;
+    TabFolderSync::reconcile(tree, window({ unpinned(1), unpinned(2), unpinned(3) }));
+    auto work = tree.create_folder_around("Work"_string, items({ tab(2), tab(3) })).release_value();
+    EXPECT(tree.move_items(items({ tab(1) }), TabFolderDestination::at_end_of(work)));
+
+    // Tab 3 is pinned: it stays in Work, but leads the window.
+    EXPECT_EQ(TabFolderSync::window_order(tree, window({ pinned(3), unpinned(2), unpinned(1) })), keys({ 3, 2, 1 }));
+}
+
+TEST_CASE(sidebar_rows_leave_pinned_tabs_to_the_pinned_tiles)
+{
+    TabFolderId work = 0;
+    auto tree = work_tree(work);
+    auto tabs = window({ pinned(2), unpinned(1), unpinned(3), unpinned(4) });
+    auto rows = TabFolderSync::sidebar_rows(tree, tabs, 3);
+    EXPECT_EQ(row_items(rows), items({ tab(1), folder(work), tab(3), tab(4) }));
+    EXPECT_EQ(rows[2].depth, 1u);
+}
+
+TEST_CASE(a_collapsed_folder_previews_only_the_active_unpinned_tab)
+{
+    TabFolderId work = 0;
+    auto tree = work_tree(work);
+    EXPECT(tree.set_folder_collapsed(work, true));
+    auto tabs = window({ unpinned(1), unpinned(2), unpinned(3), unpinned(4) });
+
+    auto rows = TabFolderSync::sidebar_rows(tree, tabs, 3);
+    EXPECT_EQ(row_items(rows), items({ tab(1), folder(work), tab(3), tab(4) }));
+    EXPECT(rows[2].preview);
+    EXPECT_EQ(rows[1].glyph, Glyph::ClosedWithActiveTab);
+
+    // Switching away hides the preview at once, and the folder stays collapsed.
+    rows = TabFolderSync::sidebar_rows(tree, tabs, 1);
+    EXPECT_EQ(row_items(rows), items({ tab(1), folder(work), tab(4) }));
+    EXPECT_EQ(rows[1].glyph, Glyph::Closed);
+    EXPECT(tree.folder(work)->collapsed);
+
+    // A pinned active tab is already on its tile, so it never previews.
+    rows = TabFolderSync::sidebar_rows(tree, window({ pinned(3), unpinned(1), unpinned(2), unpinned(4) }), 3);
+    EXPECT_EQ(row_items(rows), items({ tab(1), folder(work), tab(4) }));
+    EXPECT_EQ(rows[1].glyph, Glyph::Closed);
+}
+
+TEST_CASE(nested_collapsed_folders_preview_once_under_the_outermost)
+{
+    TabFolderId work = 0;
+    auto tree = work_tree(work);
+    auto inner = tree.create_folder_around("Inner"_string, items({ tab(3) })).release_value();
+    EXPECT(tree.set_folder_collapsed(inner, true));
+    EXPECT(tree.set_folder_collapsed(work, true));
+
+    auto rows = TabFolderSync::sidebar_rows(tree, window({ unpinned(1), unpinned(2), unpinned(3), unpinned(4) }), 3);
+    EXPECT_EQ(row_items(rows), items({ tab(1), folder(work), tab(3), tab(4) }));
+    EXPECT_EQ(rows[2].depth, 1u);
+}
+
+TEST_CASE(a_shift_range_covers_the_visible_tab_rows_between_in_either_direction)
+{
+    TabFolderId work = 0;
+    auto tree = work_tree(work);
+    auto rows = TabFolderSync::sidebar_rows(tree, window({ unpinned(1), unpinned(2), unpinned(3), unpinned(4) }), 1);
+    EXPECT_EQ(TabFolderSync::tab_range(rows, 1, 3), keys({ 1, 2, 3 }));
+    EXPECT_EQ(TabFolderSync::tab_range(rows, 4, 2), keys({ 2, 3, 4 }));
+
+    // Hidden tabs inside a collapsed folder aren't part of a range.
+    EXPECT(tree.set_folder_collapsed(work, true));
+    rows = TabFolderSync::sidebar_rows(tree, window({ unpinned(1), unpinned(2), unpinned(3), unpinned(4) }), 1);
+    EXPECT_EQ(TabFolderSync::tab_range(rows, 1, 4), keys({ 1, 4 }));
+    EXPECT(TabFolderSync::tab_range(rows, 1, 3).is_empty());
+}
+
+TEST_CASE(rows_left_while_dragging_drop_the_moving_items_and_their_contents)
+{
+    TabFolderId work = 0;
+    auto tree = work_tree(work);
+    auto rows = TabFolderSync::sidebar_rows(tree, window({ unpinned(1), unpinned(2), unpinned(3), unpinned(4) }), 1);
+    EXPECT_EQ(row_items(TabFolderSync::rows_without(tree, rows, items({ folder(work) }))), items({ tab(1), tab(4) }));
+    EXPECT_EQ(row_items(TabFolderSync::rows_without(tree, rows, items({ tab(1), tab(3) }))), items({ folder(work), tab(2), tab(4) }));
+}
+
+TEST_CASE(a_gap_lands_before_the_row_below_it_at_that_rows_depth)
+{
+    TabFolderId work = 0;
+    auto tree = work_tree(work);
+    auto tabs = window({ unpinned(1), unpinned(2), unpinned(3), unpinned(4) });
+    auto moving = items({ tab(1) });
+    auto rows = TabFolderSync::rows_without(tree, TabFolderSync::sidebar_rows(tree, tabs, 1), moving);
+    // Rows: Work, 2, 3, 4.
+
+    // Between Work's header and its first tab: inside Work, at its start.
+    auto destination = TabFolderSync::destination_for_gap(tree, rows, 1).release_value();
+    EXPECT_EQ(destination.parent, Optional<TabFolderId> { work });
+    EXPECT_EQ(destination.index, 0u);
+    EXPECT(tree.move_items(moving, destination));
+    EXPECT_EQ(tree.children(work), items({ tab(1), tab(2), tab(3) }));
+
+    // Past the last row: the end of the root.
+    destination = TabFolderSync::destination_for_gap(tree, rows, rows.size()).release_value();
+    EXPECT(!destination.parent.has_value());
+    EXPECT(tree.move_items(items({ tab(2), tab(1) }), destination));
+    EXPECT_EQ(tree.children(), items({ folder(work), tab(4), tab(1), tab(2) }));
+}
+
+TEST_CASE(a_gap_below_a_collapsed_header_lands_inside_that_folder)
+{
+    TabFolderId work = 0;
+    auto tree = work_tree(work);
+    EXPECT(tree.set_folder_collapsed(work, true));
+    auto tabs = window({ unpinned(1), unpinned(2), unpinned(3), unpinned(4) });
+    auto moving = items({ tab(1) });
+    auto rows = TabFolderSync::rows_without(tree, TabFolderSync::sidebar_rows(tree, tabs, 3), moving);
+    // Rows: Work, 3 (preview), 4.
+
+    auto destination = TabFolderSync::destination_for_gap(tree, rows, 1).release_value();
+    EXPECT_EQ(destination.parent, Optional<TabFolderId> { work });
+    EXPECT_EQ(destination.index, 0u);
+}
+
+TEST_CASE(a_noncontiguous_selection_keeps_its_order_wherever_it_lands)
+{
+    TabFolderId work = 0;
+    auto tree = work_tree(work);
+    // The selection is listed out of order; the tree's order wins.
+    EXPECT(tree.move_items(items({ tab(4), tab(1) }), TabFolderDestination::at_end_of(work)));
+    EXPECT_EQ(tree.children(work), items({ tab(2), tab(3), tab(1), tab(4) }));
+    EXPECT_EQ(TabFolderSync::window_order(tree, window({ unpinned(1), unpinned(2), unpinned(3), unpinned(4) })), keys({ 2, 3, 1, 4 }));
+}
