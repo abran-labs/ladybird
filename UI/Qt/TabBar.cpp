@@ -21,6 +21,7 @@
 #include <UI/Qt/BrowserWindow.h>
 #include <UI/Qt/ChromeLayout.h>
 #include <UI/Qt/ChromeStyle.h>
+#include <UI/Qt/FolderIcons.h>
 #include <UI/Qt/Icon.h>
 #include <UI/Qt/LadybirdButton.h>
 #include <UI/Qt/SessionStore.h>
@@ -842,6 +843,212 @@ TabBar::TabBar(TabWidget* tab_widget)
     });
 }
 
+void TabBar::set_sidebar_rows(Vector<SidebarRow> rows, bool has_folders)
+{
+    if (!has_folders)
+        rows.clear();
+    if (m_has_sidebar_rows == has_folders && m_sidebar_rows == rows)
+        return;
+
+    m_sidebar_rows = AK::move(rows);
+    m_has_sidebar_rows = has_folders;
+    lay_out_sidebar_rows(false);
+}
+
+bool TabBar::uses_sidebar_rows() const
+{
+    return m_has_sidebar_rows && tab_layout() != TabLayout::Horizontal;
+}
+
+u64 TabBar::row_key(TabFolderTree::Item item)
+{
+    return (static_cast<u64>(item.id) << 1) | (item.is_folder() ? 1u : 0u);
+}
+
+void TabBar::lay_out_sidebar_rows(bool animate)
+{
+    // The first usable view lays rows out directly. The animation pass can start from these settled positions.
+    (void)animate;
+    m_laid_out_rows.clear();
+    m_laid_out_row_of_tab.clear();
+    m_row_start_y.clear();
+    m_rows_progress = 1.0;
+
+    for (auto const& row : m_sidebar_rows) {
+        LaidOutRow laid_out { row, static_cast<qreal>(m_laid_out_rows.size() * VERTICAL_TAB_HEIGHT) };
+        if (row.tab)
+            m_laid_out_row_of_tab.set(row.tab.data(), m_laid_out_rows.size());
+        m_laid_out_rows.append(AK::move(laid_out));
+    }
+    rows_changed_layout();
+}
+
+void TabBar::rows_changed_layout()
+{
+    updateGeometry();
+    update_tab_button_geometry();
+    update();
+}
+
+qreal TabBar::displayed_row_y(LaidOutRow const& row) const
+{
+    if (m_rows_progress >= 1.0)
+        return row.target_y;
+    auto start = m_row_start_y.get(row_key(row.row.row.item)).value_or(row.target_y);
+    return start + ((row.target_y - start) * m_rows_progress);
+}
+
+qreal TabBar::row_opacity(LaidOutRow const& row) const
+{
+    if (row.leaving)
+        return 1.0 - m_rows_progress;
+    if (row.arriving)
+        return m_rows_progress;
+    return 1.0;
+}
+
+TabBar::LaidOutRow const* TabBar::laid_out_row_of_tab(int index) const
+{
+    if (!uses_sidebar_rows() || !m_tab_widget || index < pinned_tab_count())
+        return nullptr;
+    auto* tab = m_tab_widget->tab(index);
+    if (!tab)
+        return nullptr;
+    auto row_index = m_laid_out_row_of_tab.get(tab);
+    if (!row_index.has_value() || *row_index >= m_laid_out_rows.size())
+        return nullptr;
+    return &m_laid_out_rows[*row_index];
+}
+
+int TabBar::sidebar_row_indent(size_t depth) const
+{
+    if (tab_layout() == TabLayout::VerticalCollapsed)
+        return 0;
+    return static_cast<int>(min(depth * 12, static_cast<size_t>(max(0, vertical_bar_width() / 2))));
+}
+
+QRect TabBar::sidebar_row_rect(LaidOutRow const& row, PinnedRegion const& region) const
+{
+    auto indent = sidebar_row_indent(row.row.row.depth);
+    return {
+        vertical_tabs_left() + indent,
+        qRound(VERTICAL_TAB_BAR_END_ROOM + region.height + displayed_row_y(row) - m_scroll_offset),
+        max(0, vertical_bar_width() - indent),
+        VERTICAL_TAB_HEIGHT,
+    };
+}
+
+QRect TabBar::sidebar_rect_for_tab(int index, PinnedRegion const& region) const
+{
+    auto const* row = laid_out_row_of_tab(index);
+    return row ? sidebar_row_rect(*row, region) : QRect {};
+}
+
+int TabBar::sidebar_content_height() const
+{
+    if (uses_sidebar_rows())
+        return static_cast<int>(m_sidebar_rows.size()) * VERTICAL_TAB_HEIGHT;
+    return max(0, count() - pinned_tab_count()) * VERTICAL_TAB_HEIGHT;
+}
+
+int TabBar::sidebar_tab_index_at(QPoint const& position, PinnedRegion const& region) const
+{
+    if (!uses_sidebar_rows())
+        return -1;
+    for (int index = region.count; index < count(); ++index) {
+        auto const* row = laid_out_row_of_tab(index);
+        if (!row || row->leaving)
+            continue;
+        if (sidebar_row_rect(*row, region).contains(position))
+            return index;
+    }
+    return -1;
+}
+
+Optional<TabFolderId> TabBar::folder_at(QPoint const& position) const
+{
+    if (!uses_sidebar_rows())
+        return {};
+    auto region = pinned_region();
+    for (auto const& row : m_laid_out_rows) {
+        if (row.row.row.item.is_folder() && !row.leaving && sidebar_row_rect(row, region).contains(position))
+            return row.row.row.item.id;
+    }
+    return {};
+}
+
+Optional<QRect> TabBar::folder_row_rect(TabFolderId id) const
+{
+    if (!uses_sidebar_rows())
+        return {};
+    auto region = pinned_region();
+    for (auto const& row : m_laid_out_rows) {
+        if (row.row.row.item == TabFolderTree::Item::folder(id))
+            return sidebar_row_rect(row, region);
+    }
+    return {};
+}
+
+void TabBar::set_hovered_folder(Optional<TabFolderId> folder)
+{
+    if (m_hovered_folder == folder)
+        return;
+    m_hovered_folder = folder;
+    update();
+}
+
+void TabBar::paint_sidebar_folder_rows(QPainter& painter, QRect const& clip)
+{
+    if (!uses_sidebar_rows())
+        return;
+
+    auto region = pinned_region();
+    auto const& chrome = Theme::chrome(*this);
+    auto text_color = ChromeStyle::window_activity(*this) == ChromeStyle::WindowActivity::Inactive ? chrome.muted : chrome.row_title;
+    auto title_font = ChromeStyle::chrome_title_font(font());
+    auto collapsed = tab_layout() == TabLayout::VerticalCollapsed;
+
+    painter.save();
+    painter.setClipRect(clip, Qt::IntersectClip);
+    for (auto const& row : m_laid_out_rows) {
+        if (!row.row.row.item.is_folder())
+            continue;
+        auto rect = sidebar_row_rect(row, region);
+        if (!rect.intersects(clip))
+            continue;
+        auto opacity = row_opacity(row);
+        if (opacity <= 0)
+            continue;
+
+        painter.save();
+        painter.setOpacity(opacity);
+        auto shape = collapsed ? collapsed_vertical_tab_shape_rect(rect) : tab_card_shape_rect(rect);
+        if (m_hovered_folder == row.row.row.item.id || m_pressed_folder == row.row.row.item.id) {
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(vertical_tab_hover_surface(Theme::chrome_palette(*this), m_pressed_folder == row.row.row.item.id ? 1.0 : 0.65));
+            painter.drawRoundedRect(shape, collapsed ? COLLAPSED_VERTICAL_TAB_RADIUS : VERTICAL_TAB_RADIUS, collapsed ? COLLAPSED_VERTICAL_TAB_RADIUS : VERTICAL_TAB_RADIUS);
+        }
+
+        QRect icon_rect;
+        if (collapsed) {
+            icon_rect = QRect(QPoint(), QSize(TAB_ICON_SIZE, TAB_ICON_SIZE));
+            icon_rect.moveCenter(shape.center());
+        } else {
+            icon_rect = { shape.left() + VERTICAL_TAB_CONTENT_LEADING_INSET, shape.top() + ((shape.height() - TAB_ICON_SIZE) / 2), TAB_ICON_SIZE, TAB_ICON_SIZE };
+        }
+        FolderIcons::icon(row.row.icon, row.row.row.glyph, text_color).paint(&painter, icon_rect);
+        if (!collapsed) {
+            auto title_rect = shape.adjusted(VERTICAL_TAB_CONTENT_LEADING_INSET + TAB_ICON_SIZE + HORIZONTAL_TAB_CONTENT_GAP, 0, -TAB_CONTENT_HORIZONTAL_INSET, 0);
+            auto title = row.row.name.isEmpty() ? QStringLiteral("Untitled Folder") : row.row.name;
+            painter.setFont(title_font);
+            painter.setPen(text_color);
+            painter.drawText(title_rect, Qt::AlignVCenter | Qt::AlignLeft, QFontMetrics(title_font).elidedText(title, Qt::ElideRight, title_rect.width()));
+        }
+        painter.restore();
+    }
+    painter.restore();
+}
+
 void TabBar::set_available_width(int width)
 {
     if (m_available_width != width) {
@@ -1158,6 +1365,8 @@ void TabBar::paintEvent(QPaintEvent*)
         paint_hover_shape(m_hover_animation_tab_index);
         if (m_hovered_tab_index != m_hover_animation_tab_index)
             paint_hover_shape(m_hovered_tab_index);
+    } else {
+        paint_sidebar_folder_rows(painter, unpinned_clip);
     }
 
     auto previously_selected_index = m_previously_selected_tab && m_tab_widget ? m_tab_widget->index_of(m_previously_selected_tab) : -1;
@@ -1189,6 +1398,8 @@ void TabBar::paintEvent(QPaintEvent*)
         auto selection = selection_of(index);
         auto hover_progress = hover_progress_of(index);
         bool is_hovered = hover_progress > 0.0;
+        auto const* sidebar_row = laid_out_row_of_tab(index);
+        auto is_folder_selected = sidebar_row && sidebar_row->row.selected && !is_selected;
         // A pinned tab is a tile that shows only its favicon, except where the pinned tabs keep their rows.
         auto is_pinned_tile = index < pinned_count && pinned_tabs_are_tiles();
 
@@ -1235,8 +1446,8 @@ void TabBar::paintEvent(QPaintEvent*)
         }
 
         // NB: The hovered horizontal tabs were filled before any tab was painted.
-        if (selection < 1.0 && is_hovered && is_vertical) {
-            painter.setBrush(vertical_tab_hover_surface(Theme::chrome_palette(*this), hover_progress));
+        if (selection < 1.0 && (is_hovered || is_folder_selected) && is_vertical) {
+            painter.setBrush(vertical_tab_hover_surface(Theme::chrome_palette(*this), is_folder_selected ? max(0.65, hover_progress) : hover_progress));
             painter.setPen(Qt::NoPen);
             painter.drawPath(tab_path);
         } else if (selection < 1.0 && is_vertical && !is_collapsed_vertical && is_pinned_tile) {
@@ -1495,15 +1706,40 @@ void TabBar::contextMenuEvent(QContextMenuEvent* event)
     if (!m_tab_widget)
         return;
 
+    auto* browser_window = qobject_cast<BrowserWindow*>(window());
+    if (browser_window && uses_sidebar_rows()) {
+        if (auto folder = folder_at(event->pos()); folder.has_value()) {
+            m_pressed_folder.clear();
+            browser_window->show_tab_folder_context_menu(*folder, event->globalPos());
+            return;
+        }
+        auto tab_index = tab_index_at(event->pos());
+        if (tab_index < 0) {
+            browser_window->show_sidebar_context_menu(event->globalPos());
+            return;
+        }
+        m_pressed_tab = nullptr;
+        if (auto* tab = m_tab_widget->tab(tab_index))
+            browser_window->show_tab_context_menu(*tab, event->globalPos());
+        return;
+    }
+
     auto tab_index = tab_index_at(event->pos());
     if (tab_index < 0) {
-        show_window_context_menu(*this, event->globalPos());
+        if (browser_window && tab_layout() != TabLayout::Horizontal)
+            browser_window->show_sidebar_context_menu(event->globalPos());
+        else
+            show_window_context_menu(*this, event->globalPos());
         return;
     }
 
     m_pressed_tab = nullptr;
-    if (auto* tab = m_tab_widget->tab(tab_index))
-        execute_context_menu(*tab->context_menu(), event->globalPos());
+    if (auto* tab = m_tab_widget->tab(tab_index)) {
+        if (browser_window && tab_layout() != TabLayout::Horizontal)
+            browser_window->show_tab_context_menu(*tab, event->globalPos());
+        else
+            execute_context_menu(*tab->context_menu(), event->globalPos());
+    }
 }
 
 void TabBar::dragEnterEvent(QDragEnterEvent* event)
@@ -1581,22 +1817,37 @@ void TabBar::mousePressEvent(QMouseEvent* event)
 {
     auto pressed_tab = tab_index_at(event->pos());
     m_pressed_tab = (m_tab_widget && pressed_tab >= 0) ? m_tab_widget->tab(pressed_tab) : nullptr;
+    m_pressed_folder = folder_at(event->pos());
 
-    if (pressed_tab >= 0) {
-        auto rect_of_current_tab = visual_tab_rect(pressed_tab);
+    if (pressed_tab >= 0 || m_pressed_folder.has_value()) {
+        auto rect_of_current_tab = pressed_tab >= 0 ? visual_tab_rect(pressed_tab) : folder_row_rect(*m_pressed_folder).value_or(QRect {});
         m_position_in_selected_tab_while_dragging = event->pos() - rect_of_current_tab.topLeft();
         m_drag_start_position = event->pos();
     }
 
-    // NB: QTabBar finds the pressed tab without our scroll offset, so we select it ourselves.
-    if (pressed_tab >= 0 && event->button() == Qt::LeftButton) {
-        setCurrentIndex(pressed_tab);
-    } else if (event->button() == Qt::LeftButton && start_window_move()) {
+    if (m_pressed_folder.has_value() && event->button() == Qt::LeftButton) {
+        m_pressed_tab = nullptr;
         event->accept();
         return;
     }
 
-    if (m_pressed_tab)
+    // NB: QTabBar finds the pressed tab without our scroll offset, so we select it ourselves. Ctrl and Shift selections
+    // in the folder sidebar deliberately leave the current page alone.
+    if (pressed_tab >= 0 && event->button() == Qt::LeftButton) {
+        auto* browser_window = tab_layout() == TabLayout::Horizontal ? nullptr : qobject_cast<BrowserWindow*>(window());
+        if (browser_window && (event->modifiers().testFlag(Qt::ControlModifier) || event->modifiers().testFlag(Qt::ShiftModifier))) {
+            browser_window->select_tab_for_folder(*m_tab_widget->tab(pressed_tab), event->modifiers());
+        } else {
+            if (browser_window)
+                browser_window->clear_tab_folder_selection();
+            setCurrentIndex(pressed_tab);
+        }
+    } else if (event->button() == Qt::LeftButton && !m_pressed_folder.has_value() && start_window_move()) {
+        event->accept();
+        return;
+    }
+
+    if (m_pressed_tab || m_pressed_folder.has_value())
         event->accept();
     else
         event->ignore();
@@ -1611,6 +1862,7 @@ void TabBar::mouseMoveEvent(QMouseEvent* event)
     }
 
     set_hovered_tab_index(tab_index_at(event->pos()));
+    set_hovered_folder(folder_at(event->pos()));
 
     if (count() == 0) {
         if (tab_layout() == TabLayout::Horizontal)
@@ -1647,11 +1899,23 @@ void TabBar::leaveEvent(QEvent* event)
         m_tab_width_unlock_timer->start();
 
     set_hovered_tab_index(-1);
+    set_hovered_folder({});
     QTabBar::leaveEvent(event);
 }
 
 void TabBar::mouseReleaseEvent(QMouseEvent* event)
 {
+    auto pressed_folder = m_pressed_folder;
+    m_pressed_folder.clear();
+    if (pressed_folder.has_value() && event->button() == Qt::LeftButton) {
+        if (folder_at(event->pos()) == pressed_folder) {
+            if (auto* browser_window = qobject_cast<BrowserWindow*>(window()))
+                browser_window->toggle_tab_folder(*pressed_folder);
+        }
+        event->accept();
+        return;
+    }
+
     if (m_strip_drag_card && event->button() == Qt::LeftButton) {
         auto dragged_tab = s_active_tab_dragged_tab;
         auto drop_index = drop_index_at(event->pos());
@@ -1686,7 +1950,7 @@ void TabBar::mouseReleaseEvent(QMouseEvent* event)
 
 void TabBar::mouseDoubleClickEvent(QMouseEvent* event)
 {
-    if (window_has_chrome_in_titlebar(*this) && tab_index_at(event->pos()) < 0 && event->button() == Qt::LeftButton) {
+    if (window_has_chrome_in_titlebar(*this) && tab_index_at(event->pos()) < 0 && !folder_at(event->pos()).has_value() && event->button() == Qt::LeftButton) {
         toggle_window_maximized();
         event->accept();
         return;
@@ -2622,6 +2886,9 @@ QRect TabBar::vertical_tab_rect(int index, PinnedRegion const& region) const
         return { mix(tile.left(), row_in_column.left()), mix(tile.top(), row_in_column.top()), mix(tile.width(), row_in_column.width()), VERTICAL_TAB_HEIGHT };
     }
 
+    if (uses_sidebar_rows())
+        return sidebar_rect_for_tab(index, region);
+
     auto unpinned_index = index - region.count;
     return { vertical_tabs_left(), VERTICAL_TAB_BAR_END_ROOM + region.height + (unpinned_index * VERTICAL_TAB_HEIGHT) - m_scroll_offset, vertical_bar_width(), VERTICAL_TAB_HEIGHT };
 }
@@ -2671,6 +2938,9 @@ int TabBar::tab_index_at(QPoint const& position) const
         return index < region.count ? index : -1;
     }
 
+    if (uses_sidebar_rows())
+        return sidebar_tab_index_at(position, region);
+
     auto index = region.count + ((y - region.height + m_scroll_offset) / VERTICAL_TAB_HEIGHT);
     if (index >= count())
         return -1;
@@ -2684,7 +2954,8 @@ int TabBar::tab_index_at(QPoint const& position) const
 QSize TabBar::vertical_size_hint(int tab_count) const
 {
     auto region = pinned_region();
-    return { vertical_tab_width(m_available_width, tab_layout()), (2 * VERTICAL_TAB_BAR_END_ROOM) + region.height + (max(0, tab_count - region.count) * VERTICAL_TAB_HEIGHT) };
+    auto rows_height = uses_sidebar_rows() ? sidebar_content_height() : max(0, tab_count - region.count) * VERTICAL_TAB_HEIGHT;
+    return { vertical_tab_width(m_available_width, tab_layout()), (2 * VERTICAL_TAB_BAR_END_ROOM) + region.height + rows_height };
 }
 
 bool TabBar::vertical_tabs_are_on_right() const
@@ -2697,7 +2968,7 @@ int TabBar::max_scroll_offset() const
     if (tab_layout() == TabLayout::Horizontal)
         return count() > 0 ? max(0, tabRect(count() - 1).right() + 1 - width()) : 0;
     auto region = pinned_region();
-    return max(0, (2 * VERTICAL_TAB_BAR_END_ROOM) + region.height + ((count() - region.count) * VERTICAL_TAB_HEIGHT) - height());
+    return max(0, (2 * VERTICAL_TAB_BAR_END_ROOM) + region.height + (uses_sidebar_rows() ? sidebar_content_height() : (count() - region.count) * VERTICAL_TAB_HEIGHT) - height());
 }
 
 void TabBar::set_scroll_offset(int offset)
@@ -2728,22 +2999,20 @@ void TabBar::ensure_tab_visible(int index)
         return;
     }
 
-    // A pinned tab that stays in place is always in view.
+    // A pinned tab that stays in place is always in view. Other rows use their actual rect, which also accounts for
+    // folders hiding tabs and for the active-tab preview.
     auto region = pinned_region();
     if (index < region.count && !region.scrolls)
         return;
-
-    // Where the tab sits in the part of the bar that scrolls.
-    auto tab_top = index < region.count
-        ? (index / region.columns) * VERTICAL_TAB_HEIGHT
-        : region.height + ((index - region.count) * VERTICAL_TAB_HEIGHT) - region.fixed_height();
-    auto tab_bottom = tab_top + VERTICAL_TAB_HEIGHT;
-    auto visible_height = height() - (2 * VERTICAL_TAB_BAR_END_ROOM) - region.fixed_height();
-
-    if (tab_top < m_scroll_offset)
-        set_scroll_offset(tab_top);
-    else if (tab_bottom > m_scroll_offset + visible_height)
-        set_scroll_offset(tab_bottom - visible_height);
+    auto rect = visual_tab_rect(index);
+    if (rect.isEmpty())
+        return;
+    auto visible_top = VERTICAL_TAB_BAR_END_ROOM + region.fixed_height();
+    auto visible_bottom = height() - VERTICAL_TAB_BAR_END_ROOM;
+    if (rect.top() < visible_top)
+        set_scroll_offset(m_scroll_offset + rect.top() - visible_top);
+    else if (rect.bottom() >= visible_bottom)
+        set_scroll_offset(m_scroll_offset + rect.bottom() + 1 - visible_bottom);
 }
 
 void TabBar::set_hovered_tab_index(int index)
@@ -2985,12 +3254,18 @@ void TabBar::update_tab_button_geometry()
     auto region = pinned_region();
     for (int index = 0; index < count(); ++index) {
         auto tab_rect = shifted_tab_rect(index);
-        if (!tab_rect.isValid())
-            continue;
-
         auto* close_button = tabButton(index, QTabBar::RightSide);
         auto* speaker = tabButton(index, QTabBar::LeftSide);
         auto* microphone = microphone_indicator(index);
+        if (!tab_rect.isValid()) {
+            if (uses_sidebar_rows()) {
+                for (auto* button : { close_button, speaker, static_cast<QWidget*>(microphone) }) {
+                    if (button)
+                        button->hide();
+                }
+            }
+            continue;
+        }
 
         // An unpinned tab scrolled under the pinned tabs keeps its buttons out of sight.
         if (region.count > 0 && !region.scrolls && index >= region.count && tab_rect.top() < region.height) {

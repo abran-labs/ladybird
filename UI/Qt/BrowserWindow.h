@@ -184,8 +184,24 @@ public:
     void duplicate_tab(Tab&, Web::HTML::ActivateTab = Web::HTML::ActivateTab::Yes, Optional<i32> history_step = {});
     void open_history_entry_in_new_tab(Tab&, int delta, Web::HTML::ActivateTab);
     void update_tab_audio_button(Tab&);
-    // Opens a window's restored tabs, keeping the session rows the store re-adopted for them.
-    void restore_tabs(Vector<RestoredSessionTab> const&, i64 active_tab_index);
+    // Opens a window's restored tabs, keeping the session rows the store re-adopted for them. The folders come with
+    // them, keyed by those rows' tab ids.
+    void restore_tabs(Vector<RestoredSessionTab> const&, i64 active_tab_index, Optional<TabFolderTree> tab_folders = {});
+    TabFolderTree const& tab_folders() const { return m_tab_folders; }
+    // Brings the folders in step with the window's tabs, the strip's order in step with the folders, and the sidebar's
+    // rows in step with both.
+    void update_tab_folders();
+    void toggle_tab_folder(TabFolderId);
+    // A new folder in the place of the first of the tabs, holding them all. Nothing when that isn't allowed.
+    Optional<TabFolderId> create_tab_folder_around(QString const& name, Vector<Tab*> const& tabs);
+    void move_tabs_to_folder(Vector<Tab*>, TabFolderId);
+    void restore_closed_window_folders(TabFolderTree const&, Vector<Tab*> const&);
+    void select_tab_for_folder(Tab&, Qt::KeyboardModifiers);
+    void clear_tab_folder_selection();
+    Vector<Tab*> tabs_for_folder_action(Tab&);
+    void show_tab_context_menu(Tab&, QPoint global_position);
+    void show_tab_folder_context_menu(TabFolderId, QPoint global_position);
+    void show_sidebar_context_menu(QPoint global_position);
     Tab* current_tab() const { return m_current_tab; }
 
     enum class PageCardSlot : u8 {
@@ -363,6 +379,12 @@ private:
     IsPopupWindow m_is_popup_window { IsPopupWindow::No };
 
     Optional<SessionWindowId> m_session_window_id;
+    TabFolderTree m_tab_folders;
+    Optional<String> m_saved_tab_folders;
+    Vector<TabFolderTree::TabKey> m_folder_selection;
+    Optional<TabFolderTree::TabKey> m_folder_selection_anchor;
+    bool m_reordering_tab_folders { false };
+    bool m_restoring_tab_folders { false };
     size_t m_failed_download_count { 0 };
     size_t m_acknowledged_failed_download_count { 0 };
     Optional<i64> m_window_close_active_tab_index;

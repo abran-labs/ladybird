@@ -21,6 +21,8 @@
 #include <UI/Qt/NotificationBar.h>
 #include <UI/Qt/PlainText.h>
 #include <UI/Qt/Tab.h>
+#include <UI/Qt/TabFolderSync.h>
+#include <UI/Qt/TabFolderTree.h>
 #include <UI/Qt/WindowToolbar.h>
 
 #include <QHash>
@@ -114,6 +116,27 @@ public:
     int drop_index_at(QPoint const&) const;
     void update_drop_preview(QPoint const&);
     void hide_drop_preview();
+
+    // A row of the vertical sidebar below the pinned tiles: a folder's header, or an unpinned tab, which may be the
+    // active tab shown under a collapsed folder. The window lays them out from its folders; a tab with no row is hidden.
+    struct SidebarRow {
+        TabFolderSync::SidebarRow row;
+        QPointer<Tab> tab;
+        QString name;
+        QString icon;
+        bool selected { false };
+
+        bool operator==(SidebarRow const&) const = default;
+    };
+    // What the sidebar shows below the pinned tiles, in order. While has_folders says so, the rows take the place of the
+    // plain list of unpinned tabs: an unpinned tab with no row, such as one inside a collapsed folder, is not shown.
+    void set_sidebar_rows(Vector<SidebarRow>, bool has_folders);
+    // Whether the sidebar shows its rows, rather than the plain list of its unpinned tabs. Never with horizontal tabs.
+    bool uses_sidebar_rows() const;
+    // The folder whose header is at a position of the tab bar, if any.
+    Optional<TabFolderId> folder_at(QPoint const&) const;
+    // Where a folder's header is drawn, or nothing when it has no row.
+    Optional<QRect> folder_row_rect(TabFolderId) const;
 
 private:
     virtual QSize sizeHint() const override;
@@ -225,6 +248,61 @@ private:
     TabMicrophoneIndicator* microphone_indicator(int index) const;
     int horizontal_tab_min_width(int index) const;
     int horizontal_tab_share() const;
+
+    // The sidebar's rows as laid out: where each one's top belongs, from the top of the first row below the pinned
+    // tiles, and, while the rows settle, where it moves from (see m_row_start_y).
+    struct LaidOutRow {
+        SidebarRow row;
+        qreal target_y { 0 };
+        // A row whose tab or folder no longer has a place, folding away toward the row that takes its place.
+        bool leaving { false };
+        // A row that wasn't there before, unfolding from under the row above it.
+        bool arriving { false };
+
+        bool operator==(LaidOutRow const&) const = default;
+    };
+    static u64 row_key(TabFolderTree::Item);
+    void lay_out_sidebar_rows(bool animate);
+    void rows_changed_layout();
+    qreal displayed_row_y(LaidOutRow const&) const;
+    qreal row_opacity(LaidOutRow const&) const;
+    LaidOutRow const* laid_out_row_of_tab(int index) const;
+    int sidebar_row_indent(size_t depth) const;
+    QRect sidebar_row_rect(LaidOutRow const&, PinnedRegion const&) const;
+    QRect sidebar_rect_for_tab(int index, PinnedRegion const&) const;
+    int sidebar_content_height() const;
+    void paint_sidebar_folder_rows(QPainter&, QRect const& clip);
+    int sidebar_tab_index_at(QPoint const&, PinnedRegion const&) const;
+    void set_hovered_folder(Optional<TabFolderId>);
+
+    // A drag along the sidebar's rows: the rows that stay make way for the ones moving, which follow the pointer as a card.
+    struct RowDrag {
+        Vector<TabFolderTree::Item> moving;
+        // The rows that stay, laid out around the gap the moving ones leave.
+        Vector<LaidOutRow> remaining;
+        // Where the moving rows land: before this many of the rows that stay.
+        Optional<size_t> gap;
+        // The tab being dragged when it's one tab on its own, which, as from the plain list, can leave for another window.
+        QPointer<Tab> single_tab;
+        // Where the card's left edge is, which is the dragged row's.
+        int card_left { 0 };
+    };
+    void start_row_drag(Vector<TabFolderTree::Item>);
+    void update_row_drag(QPoint position);
+    void end_row_drag(bool drop);
+    // The tab is drawn as a card above the rest of the window that follows drags, and Escape ends the drag it belongs to.
+    void show_drag_card(int index);
+
+    Vector<SidebarRow> m_sidebar_rows;
+    bool m_has_sidebar_rows { false };
+    Vector<LaidOutRow> m_laid_out_rows;
+    HashMap<Tab const*, size_t> m_laid_out_row_of_tab;
+    HashMap<u64, qreal> m_row_start_y;
+    qreal m_rows_progress { 1.0 };
+    QVariantAnimation* m_rows_animation { nullptr };
+    Optional<RowDrag> m_row_drag;
+    Optional<TabFolderId> m_pressed_folder;
+    Optional<TabFolderId> m_hovered_folder;
 
     QPointer<TabWidget> m_tab_widget;
 

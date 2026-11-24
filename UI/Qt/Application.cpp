@@ -1621,14 +1621,14 @@ BrowserWindow* Application::restore_previous_session(WindowConfiguration const& 
 
     BrowserWindow* frontmost_window = nullptr;
     for (size_t i = 0; i < plan.size(); ++i) {
-        auto const& restored = plan[i];
+        auto& restored = plan[i];
         // The plan lists the frontmost window last, and opening the windows in that order leaves it on top.
         auto configuration = restored.geometry.has_value()
             ? window_configuration_for(*restored.geometry)
             : (i == plan.size() - 1 ? frontmost_window_configuration : configuration_for_new_window());
 
         auto* window = new BrowserWindow({}, BrowserWindow::IsPopupWindow::No, WebView::IsPrivate::No, {}, restored.window_id);
-        window->restore_tabs(restored.tabs, restored.active_tab_index);
+        window->restore_tabs(restored.tabs, restored.active_tab_index, AK::move(restored.tab_folders));
         present_window(*window, configuration, ShowWindow::Yes);
         frontmost_window = window;
     }
@@ -1883,10 +1883,12 @@ void Application::reopen_recently_closed_tab(BrowserWindow* target_window, Optio
         next_insertion_index = static_cast<int>(clamp(*unit.source_tab_index, 0, static_cast<i64>(window->tab_count())));
 
     QPointer<Tab> tab_to_activate;
+    Vector<Tab*> restored_tabs;
     i64 restored_tab_index = 0;
     for (auto& closed_tab : unit.tabs) {
         auto location = next_insertion_index.has_value() ? BrowserWindow::TabLocation::at_index(*next_insertion_index) : BrowserWindow::TabLocation::end();
         auto& tab = window->create_new_tab(Web::HTML::ActivateTab::No, location);
+        restored_tabs.append(&tab);
         if (next_insertion_index.has_value())
             ++*next_insertion_index;
 
@@ -1905,6 +1907,9 @@ void Application::reopen_recently_closed_tab(BrowserWindow* target_window, Optio
         }
         ++restored_tab_index;
     }
+
+    if (unit.was_window && unit.tab_folders.has_value())
+        window->restore_closed_window_folders(*unit.tab_folders, restored_tabs);
 
     // Pinning a reopened tab can move it, so its index is resolved only now.
     if (tab_to_activate) {

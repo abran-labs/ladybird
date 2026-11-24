@@ -10,6 +10,7 @@
  */
 
 #include <AK/Platform.h>
+#include <AK/ScopeGuard.h>
 #include <AK/StdLibExtras.h>
 #include <AK/TypeCasts.h>
 #include <LibCore/BrowserVersion.h>
@@ -22,6 +23,7 @@
 #include <UI/Qt/ChromeLayout.h>
 #include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/DevToolsBanner.h>
+#include <UI/Qt/FolderIcons.h>
 #include <UI/Qt/HubConnection.h>
 #include <UI/Qt/Icon.h>
 #include <UI/Qt/LadybirdButton.h>
@@ -36,6 +38,7 @@
 #    include <UI/Qt/MacWindow.h>
 #endif
 #include <UI/Qt/TabBar.h>
+#include <UI/Qt/TabFolderMenus.h>
 #include <UI/Qt/Theme.h>
 #include <UI/Qt/WebContentView.h>
 #include <UI/Qt/WindowControlButton.h>
@@ -48,8 +51,11 @@
 #include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QIcon>
+#include <QInputDialog>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMenuBar>
+#include <QMessageBox>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
@@ -62,6 +68,7 @@
 #include <QTabBar>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QValidator>
 #include <QWheelEvent>
 #include <QWidget>
 #include <QWindow>
@@ -428,9 +435,24 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
                 location_edit->show_focus_ring_at_once();
         }
         fullscreen_mode().exit(FullscreenMode::ExitInitiatedBy::UI);
+        if (!m_restoring_tab_folders && !m_reordering_tab_folders)
+            update_tab_folders();
     });
     QObject::connect(m_tabs_container, &TabWidget::tab_close_requested, this, &BrowserWindow::request_to_close_tab);
-    QObject::connect(m_tabs_container->tab_bar(), &QTabBar::tabMoved, this, [this](int, int) {
+    QObject::connect(m_tabs_container->tab_bar(), &QTabBar::tabMoved, this, [this](int, int to) {
+        if (!m_reordering_tab_folders && to >= 0 && to < m_tabs_container->count()) {
+            auto* moved = m_tabs_container->tab(to);
+            if (auto key = moved->session_tab_id(); key.has_value()) {
+                Vector<TabFolderSync::WindowTab> tabs;
+                for (int i = 0; i < m_tabs_container->count(); ++i) {
+                    auto* tab = m_tabs_container->tab(i);
+                    if (auto id = tab->session_tab_id(); id.has_value())
+                        tabs.append({ *id, tab->is_pinned() });
+                }
+                TabFolderSync::follow_window_move(m_tab_folders, tabs, *key);
+            }
+            update_tab_folders();
+        }
         sync_session_tab_order();
     });
 
@@ -739,8 +761,356 @@ void BrowserWindow::open_history_entry_in_new_tab(Tab& source_tab, int delta, We
         duplicate_tab(source_tab, activate_tab, *step);
 }
 
-void BrowserWindow::restore_tabs(Vector<RestoredSessionTab> const& tabs, i64 active_tab_index)
+class FolderNameValidator final : public QValidator {
+public:
+    using QValidator::QValidator;
+
+    virtual State validate(QString& input, int&) const override
+    {
+        return input.toUtf8().size() <= static_cast<qsizetype>(TabFolderTree::MAX_FOLDER_NAME_BYTES) ? Acceptable : Invalid;
+    }
+};
+
+static Optional<QString> ask_for_folder_name(QWidget* parent, QString const& title, QString const& initial = {})
 {
+    QInputDialog dialog(parent);
+    dialog.setWindowTitle(title);
+    dialog.setLabelText(QStringLiteral("Folder name:"));
+    dialog.setTextValue(initial);
+    dialog.setInputMode(QInputDialog::TextInput);
+    if (auto* line_edit = dialog.findChild<QLineEdit*>()) {
+        line_edit->setMaxLength(TabFolderTree::MAX_FOLDER_NAME_BYTES);
+        line_edit->setValidator(new FolderNameValidator(line_edit));
+        line_edit->selectAll();
+    }
+    if (dialog.exec() != QDialog::Accepted)
+        return {};
+    return dialog.textValue();
+}
+
+void BrowserWindow::update_tab_folders()
+{
+    Vector<TabFolderSync::WindowTab> tabs;
+    auto all_tabs_have_keys = true;
+    for (int i = 0; i < m_tabs_container->count(); ++i) {
+        auto* tab = m_tabs_container->tab(i);
+        if (auto key = tab->session_tab_id(); key.has_value())
+            tabs.append({ *key, tab->is_pinned() });
+        else
+            all_tabs_have_keys = false;
+    }
+    TabFolderSync::reconcile(m_tab_folders, tabs);
+
+    auto contains_tab = [&](TabFolderTree::TabKey key) {
+        return tabs.contains([&](auto const& tab) { return tab.key == key; });
+    };
+    m_folder_selection.remove_all_matching([&](auto key) { return !contains_tab(key); });
+    if (m_folder_selection_anchor.has_value() && !contains_tab(*m_folder_selection_anchor))
+        m_folder_selection_anchor.clear();
+
+    if (!m_reordering_tab_folders && all_tabs_have_keys) {
+        Vector<TabFolderTree::TabKey> current_order;
+        for (auto const& tab : tabs)
+            current_order.append(tab.key);
+        auto wanted_order = TabFolderSync::window_order(m_tab_folders, tabs);
+        auto moves = TabFolderSync::moves_to_reorder(current_order, wanted_order);
+        if (!moves.is_empty()) {
+            m_reordering_tab_folders = true;
+            ScopeGuard reordering_guard { [&] { m_reordering_tab_folders = false; } };
+            for (auto move : moves) {
+                if (move.from < static_cast<size_t>(m_tabs_container->count()) && move.to < static_cast<size_t>(m_tabs_container->count()))
+                    m_tabs_container->tab_bar()->moveTab(static_cast<int>(move.from), static_cast<int>(move.to));
+            }
+        }
+        if (!moves.is_empty())
+            sync_session_tab_order();
+    }
+
+    Optional<TabFolderTree::TabKey> active;
+    if (m_current_tab)
+        active = m_current_tab->session_tab_id();
+
+    Vector<TabBar::SidebarRow> rows;
+    for (auto const& row : TabFolderSync::sidebar_rows(m_tab_folders, tabs, active)) {
+        TabBar::SidebarRow sidebar_row;
+        sidebar_row.row = row;
+        if (row.item.is_tab()) {
+            for (int i = 0; i < m_tabs_container->count(); ++i) {
+                auto* tab = m_tabs_container->tab(i);
+                if (tab->session_tab_id() != row.item.id)
+                    continue;
+                sidebar_row.tab = tab;
+                sidebar_row.selected = m_folder_selection.contains_slow(row.item.id);
+                break;
+            }
+        } else if (auto folder = m_tab_folders.folder(row.item.id); folder.has_value()) {
+            sidebar_row.name = qstring_from_ak_string(folder->name);
+            if (folder->icon.has_value())
+                sidebar_row.icon = qstring_from_ak_string(*folder->icon);
+        }
+        rows.append(AK::move(sidebar_row));
+    }
+    m_tabs_container->tab_bar()->set_sidebar_rows(AK::move(rows), m_tab_folders.has_folders());
+
+    if (!m_session_window_id.has_value())
+        return;
+    if (!m_tab_folders.has_folders()) {
+        if (m_saved_tab_folders.has_value()) {
+            auto result = session().tab_folders_changed(*m_session_window_id, m_tab_folders);
+            if (result.is_error())
+                dbgln("Unable to clear the window's tab folders in the session store: {}", result.error());
+            else
+                m_saved_tab_folders.clear();
+        }
+        return;
+    }
+
+    auto serialized = m_tab_folders.serialize();
+    if (m_saved_tab_folders == serialized)
+        return;
+    auto result = session().tab_folders_changed(*m_session_window_id, m_tab_folders);
+    if (result.is_error())
+        dbgln("Unable to record the window's tab folders in the session store: {}", result.error());
+    else
+        m_saved_tab_folders = AK::move(serialized);
+}
+
+void BrowserWindow::toggle_tab_folder(TabFolderId id)
+{
+    auto folder = m_tab_folders.folder(id);
+    if (!folder.has_value())
+        return;
+    if (m_tab_folders.set_folder_collapsed(id, !folder->collapsed))
+        update_tab_folders();
+}
+
+Optional<TabFolderId> BrowserWindow::create_tab_folder_around(QString const& name, Vector<Tab*> const& tabs)
+{
+    Vector<TabFolderTree::Item> items;
+    for (auto* tab : tabs) {
+        if (tab && tab->session_tab_id().has_value())
+            items.append(TabFolderTree::Item::tab(*tab->session_tab_id()));
+    }
+    if (items.is_empty())
+        return {};
+    auto id = m_tab_folders.create_folder_around(ak_string_from_qstring(name), items);
+    if (id.has_value())
+        update_tab_folders();
+    return id;
+}
+
+void BrowserWindow::move_tabs_to_folder(Vector<Tab*> tabs, TabFolderId id)
+{
+    Vector<TabFolderTree::Item> items;
+    for (auto* tab : tabs) {
+        if (tab && tab->session_tab_id().has_value())
+            items.append(TabFolderTree::Item::tab(*tab->session_tab_id()));
+    }
+    if (!items.is_empty() && m_tab_folders.move_items(items, TabFolderDestination::at_end_of(id)))
+        update_tab_folders();
+}
+
+void BrowserWindow::restore_closed_window_folders(TabFolderTree const& restored, Vector<Tab*> const& tabs)
+{
+    m_tab_folders = restored.with_remapped_tabs([&](TabFolderTree::TabKey index) -> Optional<TabFolderTree::TabKey> {
+        if (index < 0 || static_cast<size_t>(index) >= tabs.size() || !tabs[index])
+            return {};
+        return tabs[index]->session_tab_id();
+    });
+    m_saved_tab_folders.clear();
+    update_tab_folders();
+}
+
+void BrowserWindow::clear_tab_folder_selection()
+{
+    if (m_folder_selection.is_empty() && !m_folder_selection_anchor.has_value())
+        return;
+    m_folder_selection.clear();
+    m_folder_selection_anchor.clear();
+    update_tab_folders();
+}
+
+void BrowserWindow::select_tab_for_folder(Tab& tab, Qt::KeyboardModifiers modifiers)
+{
+    auto key = tab.session_tab_id();
+    if (!key.has_value())
+        return;
+
+    if (modifiers.testFlag(Qt::ShiftModifier)) {
+        Vector<TabFolderSync::WindowTab> tabs;
+        for (int i = 0; i < m_tabs_container->count(); ++i) {
+            auto* candidate = m_tabs_container->tab(i);
+            if (auto id = candidate->session_tab_id(); id.has_value())
+                tabs.append({ *id, candidate->is_pinned() });
+        }
+        Optional<TabFolderTree::TabKey> active;
+        if (m_current_tab)
+            active = m_current_tab->session_tab_id();
+        auto rows = TabFolderSync::sidebar_rows(m_tab_folders, tabs, active);
+        auto anchor = m_folder_selection_anchor.value_or(active.value_or(*key));
+        auto range = TabFolderSync::tab_range(rows, anchor, *key);
+        if (!range.is_empty())
+            m_folder_selection = AK::move(range);
+    } else if (modifiers.testFlag(Qt::ControlModifier)) {
+        if (!m_folder_selection.remove_all_matching([&](auto selected) { return selected == *key; }))
+            m_folder_selection.append(*key);
+    } else {
+        m_folder_selection = { *key };
+    }
+    m_folder_selection_anchor = *key;
+    update_tab_folders();
+}
+
+Vector<Tab*> BrowserWindow::tabs_for_folder_action(Tab& tab)
+{
+    auto key = tab.session_tab_id();
+    if (!key.has_value() || !m_folder_selection.contains_slow(*key)) {
+        m_folder_selection.clear();
+        if (key.has_value())
+            m_folder_selection.append(*key);
+        m_folder_selection_anchor = key;
+        update_tab_folders();
+    }
+
+    Vector<Tab*> tabs;
+    for (auto selected : m_folder_selection) {
+        for (int i = 0; i < m_tabs_container->count(); ++i) {
+            auto* candidate = m_tabs_container->tab(i);
+            if (candidate->session_tab_id() == selected) {
+                tabs.append(candidate);
+                break;
+            }
+        }
+    }
+    return tabs;
+}
+
+void BrowserWindow::show_tab_context_menu(Tab& tab, QPoint global_position)
+{
+    auto& menu = *tab.context_menu();
+    if (m_tabs_container->tab_bar()->tab_layout() == TabLayout::Horizontal) {
+        execute_context_menu(menu, global_position);
+        return;
+    }
+
+    tabs_for_folder_action(tab);
+    QPointer<QMenu> guarded_menu = &menu;
+    QPointer<QMenu> move_menu;
+    TabFolderMenus::add_move_menu(menu, m_tab_folders,
+        [this, tab = QPointer<Tab>(&tab)](TabFolderId id) {
+            if (tab)
+                move_tabs_to_folder(tabs_for_folder_action(*tab), id);
+        },
+        [this, tab = QPointer<Tab>(&tab)] {
+            if (!tab)
+                return;
+            auto tabs = tabs_for_folder_action(*tab);
+            if (auto name = ask_for_folder_name(this, QStringLiteral("New Folder")); name.has_value())
+                (void)create_tab_folder_around(*name, tabs);
+        });
+    move_menu = menu.actions().last()->menu();
+    execute_context_menu(menu, global_position);
+    if (guarded_menu && move_menu) {
+        guarded_menu->removeAction(move_menu->menuAction());
+        delete move_menu.data();
+    }
+}
+
+void BrowserWindow::show_sidebar_context_menu(QPoint global_position)
+{
+    QMenu menu(this);
+    auto* new_folder = menu.addAction(QStringLiteral("New Folder…"));
+    new_folder->setEnabled(m_tab_folders.can_create_folder());
+    if (menu.exec(global_position) != new_folder)
+        return;
+    auto name = ask_for_folder_name(this, QStringLiteral("New Folder"));
+    if (!name.has_value())
+        return;
+    if (m_tab_folders.create_folder(ak_string_from_qstring(*name)).has_value())
+        update_tab_folders();
+}
+
+void BrowserWindow::show_tab_folder_context_menu(TabFolderId id, QPoint global_position)
+{
+    if (!m_tab_folders.folder(id).has_value())
+        return;
+    switch (TabFolderMenus::exec_folder(this, global_position)) {
+    case TabFolderMenus::Action::None:
+        return;
+    case TabFolderMenus::Action::Rename: {
+        auto current = qstring_from_ak_string(m_tab_folders.folder(id)->name);
+        if (auto name = ask_for_folder_name(this, QStringLiteral("Rename Folder"), current); name.has_value()) {
+            if (m_tab_folders.rename_folder(id, ak_string_from_qstring(*name)))
+                update_tab_folders();
+        }
+        return;
+    }
+    case TabFolderMenus::Action::ChangeIcon: {
+        QString current;
+        if (auto const& icon = m_tab_folders.folder(id)->icon; icon.has_value())
+            current = qstring_from_ak_string(*icon);
+        if (auto icon = FolderIcons::choose(this, current); icon.has_value()) {
+            Optional<String> saved;
+            if (!icon->isEmpty())
+                saved = ak_string_from_qstring(*icon);
+            if (m_tab_folders.set_folder_icon(id, saved))
+                update_tab_folders();
+        }
+        return;
+    }
+    case TabFolderMenus::Action::NewSubfolder: {
+        if (!m_tab_folders.can_create_folder_in(id))
+            return;
+        if (auto name = ask_for_folder_name(this, QStringLiteral("New Subfolder")); name.has_value()) {
+            if (m_tab_folders.create_folder(ak_string_from_qstring(*name), TabFolderDestination::at_end_of(id)).has_value())
+                update_tab_folders();
+        }
+        return;
+    }
+    case TabFolderMenus::Action::Unpack:
+        if (m_tab_folders.unpack_folder(id))
+            update_tab_folders();
+        return;
+    case TabFolderMenus::Action::Delete:
+        break;
+    }
+
+    auto tabs_to_close = m_tab_folders.tabs_inside(id);
+    if (!tabs_to_close.is_empty()) {
+        auto text = tabs_to_close.size() == 1
+            ? QStringLiteral("Delete this folder and close its tab? Descendant folders will also be deleted.")
+            : qformatted("Delete this folder and close its {} tabs? Descendant folders will also be deleted.", tabs_to_close.size());
+        QMessageBox confirmation(QMessageBox::Warning, QStringLiteral("Delete Folder"), text, QMessageBox::Cancel, this);
+        auto* delete_button = confirmation.addButton(QStringLiteral("Delete Folder"), QMessageBox::DestructiveRole);
+        confirmation.exec();
+        if (confirmation.clickedButton() != delete_button)
+            return;
+    }
+
+    auto all_closed = true;
+    for (auto key : tabs_to_close) {
+        Tab* tab = nullptr;
+        for (int i = 0; i < m_tabs_container->count(); ++i) {
+            if (m_tabs_container->tab(i)->session_tab_id() == key) {
+                tab = m_tabs_container->tab(i);
+                break;
+            }
+        }
+        if (tab && !definitely_close_tab(tab_index(tab)))
+            all_closed = false;
+    }
+    if (all_closed && m_tab_folders.folder(id).has_value()) {
+        (void)m_tab_folders.delete_folder(id);
+        update_tab_folders();
+    }
+}
+
+void BrowserWindow::restore_tabs(Vector<RestoredSessionTab> const& tabs, i64 active_tab_index, Optional<TabFolderTree> tab_folders)
+{
+    m_restoring_tab_folders = true;
+    ScopeGuard restoring_guard { [&] { m_restoring_tab_folders = false; } };
+    if (tab_folders.has_value())
+        m_tab_folders = tab_folders.release_value();
     if (tabs.is_empty())
         return;
 
@@ -752,6 +1122,8 @@ void BrowserWindow::restore_tabs(Vector<RestoredSessionTab> const& tabs, i64 act
         if (i != active_index)
             create_restored_tab(tabs[i], static_cast<int>(i), !tabs[i].pinned);
     }
+    m_restoring_tab_folders = false;
+    update_tab_folders();
 }
 
 SessionStore& BrowserWindow::session() const
@@ -819,6 +1191,7 @@ Tab& BrowserWindow::create_new_tab(Web::HTML::ActivateTab activate_tab, Optional
         m_tabs_container->set_current_tab(tab);
 
     initialize_tab(tab);
+    update_tab_folders();
     return *tab;
 }
 
@@ -878,6 +1251,7 @@ Tab& BrowserWindow::create_new_tab(Web::HTML::ActivateTab activate_tab, TabLocat
         m_background_tabs_from_current_tab.append(tab);
 
     initialize_tab(tab);
+    update_tab_folders();
 
     return *tab;
 }
@@ -994,6 +1368,7 @@ void BrowserWindow::adopt_tab(Tab& tab, int index)
     }
 
     m_tabs_container->set_current_tab(&tab);
+    update_tab_folders();
 }
 
 void BrowserWindow::move_tab_to_window(int index, BrowserWindow& target_window, int target_index)
@@ -1019,6 +1394,7 @@ void BrowserWindow::move_tab_to_window(int index, BrowserWindow& target_window, 
         tab->view().prepare_for_window_move();
     uninitialize_tab(tab);
     m_tabs_container->take_tab(index);
+    update_tab_folders();
     if (m_current_tab == tab)
         set_current_tab(m_tabs_container->count() > 0 ? m_tabs_container->tab(m_tabs_container->current_index()) : nullptr);
 
@@ -1179,6 +1555,7 @@ bool BrowserWindow::close_tab(int index, SessionStore::KeepForReopening keep_for
 
     auto* tab = m_tabs_container->tab(index);
     m_tabs_container->remove_tab(index);
+    update_tab_folders();
     if (auto session_tab_id = tab->session_tab_id(); session_tab_id.has_value()) {
         SessionStore::TabClosed closed {
             .tab_id = *session_tab_id,
@@ -1261,6 +1638,7 @@ void BrowserWindow::pinned_state_changed(Tab& tab)
     }
     update_tab_close_button(tab);
     m_tabs_container->update_tab_layout();
+    update_tab_folders();
 }
 
 void BrowserWindow::activate_first_unpinned_tab()
