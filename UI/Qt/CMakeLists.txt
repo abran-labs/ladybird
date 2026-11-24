@@ -70,6 +70,8 @@ add_library(ladybird_impl STATIC
     SystemAppearance.cpp
     Tab.cpp
     TabBar.cpp
+    TabFolderDrag.cpp
+    TabFolderEditing.cpp
     TabFolderMenus.cpp
     TabFolderSync.cpp
     TabFolderTree.cpp

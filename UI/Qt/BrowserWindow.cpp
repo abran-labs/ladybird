@@ -51,9 +51,7 @@
 #include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QIcon>
-#include <QInputDialog>
 #include <QLabel>
-#include <QLineEdit>
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMouseEvent>
@@ -68,7 +66,6 @@
 #include <QTabBar>
 #include <QTimer>
 #include <QVBoxLayout>
-#include <QValidator>
 #include <QWheelEvent>
 #include <QWidget>
 #include <QWindow>
@@ -761,33 +758,6 @@ void BrowserWindow::open_history_entry_in_new_tab(Tab& source_tab, int delta, We
         duplicate_tab(source_tab, activate_tab, *step);
 }
 
-class FolderNameValidator final : public QValidator {
-public:
-    using QValidator::QValidator;
-
-    virtual State validate(QString& input, int&) const override
-    {
-        return input.toUtf8().size() <= static_cast<qsizetype>(TabFolderTree::MAX_FOLDER_NAME_BYTES) ? Acceptable : Invalid;
-    }
-};
-
-static Optional<QString> ask_for_folder_name(QWidget* parent, QString const& title, QString const& initial = {})
-{
-    QInputDialog dialog(parent);
-    dialog.setWindowTitle(title);
-    dialog.setLabelText(QStringLiteral("Folder name:"));
-    dialog.setTextValue(initial);
-    dialog.setInputMode(QInputDialog::TextInput);
-    if (auto* line_edit = dialog.findChild<QLineEdit*>()) {
-        line_edit->setMaxLength(TabFolderTree::MAX_FOLDER_NAME_BYTES);
-        line_edit->setValidator(new FolderNameValidator(line_edit));
-        line_edit->selectAll();
-    }
-    if (dialog.exec() != QDialog::Accepted)
-        return {};
-    return dialog.textValue();
-}
-
 void BrowserWindow::update_tab_folders(Optional<TabFolderTree::TabKey> new_tab_at_root)
 {
     Vector<TabFolderSync::WindowTab> tabs;
@@ -804,9 +774,9 @@ void BrowserWindow::update_tab_folders(Optional<TabFolderTree::TabKey> new_tab_a
     auto contains_tab = [&](TabFolderTree::TabKey key) {
         return tabs.contains([&](auto const& tab) { return tab.key == key; });
     };
-    m_folder_selection.remove_all_matching([&](auto key) { return !contains_tab(key); });
-    if (m_folder_selection_anchor.has_value() && !contains_tab(*m_folder_selection_anchor))
-        m_folder_selection_anchor.clear();
+    m_folder_selection.keys.remove_all_matching([&](auto key) { return !contains_tab(key); });
+    if (m_folder_selection.anchor.has_value() && !contains_tab(*m_folder_selection.anchor))
+        m_folder_selection.anchor.clear();
 
     if (!m_reordering_tab_folders && all_tabs_have_keys) {
         Vector<TabFolderTree::TabKey> current_order;
@@ -830,8 +800,16 @@ void BrowserWindow::update_tab_folders(Optional<TabFolderTree::TabKey> new_tab_a
     if (m_current_tab)
         active = m_current_tab->session_tab_id();
 
+    // Only the sidebar sees the provisional folder. Tab order and persistence still use the real tree.
+    Optional<TabFolderTree> preview_tree;
+    Optional<TabFolderId> provisional_folder;
+    if (m_folder_creation.has_value()) {
+        preview_tree = m_tab_folders;
+        provisional_folder = m_folder_creation->preview(*preview_tree);
+    }
+    auto const& sidebar_tree = preview_tree.has_value() ? *preview_tree : m_tab_folders;
     Vector<TabBar::SidebarRow> rows;
-    for (auto const& row : TabFolderSync::sidebar_rows(m_tab_folders, tabs, active)) {
+    for (auto const& row : TabFolderSync::sidebar_rows(sidebar_tree, tabs, active)) {
         TabBar::SidebarRow sidebar_row;
         sidebar_row.row = row;
         if (row.item.is_tab()) {
@@ -840,17 +818,18 @@ void BrowserWindow::update_tab_folders(Optional<TabFolderTree::TabKey> new_tab_a
                 if (tab->session_tab_id() != row.item.id)
                     continue;
                 sidebar_row.tab = tab;
-                sidebar_row.selected = m_folder_selection.contains_slow(row.item.id);
+                sidebar_row.selected = m_folder_selection.keys.contains_slow(row.item.id);
                 break;
             }
-        } else if (auto folder = m_tab_folders.folder(row.item.id); folder.has_value()) {
+        } else if (auto folder = sidebar_tree.folder(row.item.id); folder.has_value()) {
+            sidebar_row.provisional = provisional_folder == row.item.id;
             sidebar_row.name = qstring_from_ak_string(folder->name);
             if (folder->icon.has_value())
                 sidebar_row.icon = qstring_from_ak_string(*folder->icon);
         }
         rows.append(AK::move(sidebar_row));
     }
-    m_tabs_container->tab_bar()->set_sidebar_rows(AK::move(rows), m_tab_folders.has_folders());
+    m_tabs_container->tab_bar()->set_sidebar_rows(AK::move(rows), sidebar_tree.has_folders(), m_folder_selection.keys);
 
     if (!m_session_window_id.has_value())
         return;
@@ -884,29 +863,26 @@ void BrowserWindow::toggle_tab_folder(TabFolderId id)
         update_tab_folders();
 }
 
-Optional<TabFolderId> BrowserWindow::create_tab_folder_around(QString const& name, Vector<Tab*> const& tabs)
+void BrowserWindow::start_creating_tab_folder(TabFolderEditing::FolderCreation creation)
 {
-    Vector<TabFolderTree::Item> items;
-    for (auto* tab : tabs) {
-        if (tab && tab->session_tab_id().has_value())
-            items.append(TabFolderTree::Item::tab(*tab->session_tab_id()));
-    }
-    if (items.is_empty())
-        return {};
-    auto id = m_tab_folders.create_folder_around(ak_string_from_qstring(name), items);
-    if (id.has_value())
+    auto* tab_bar = m_tabs_container->tab_bar();
+    tab_bar->cancel_folder_name_edit();
+    m_folder_creation = AK::move(creation);
+    update_tab_folders();
+    if (!tab_bar->edit_folder_name({}, qstring_from_ak_string(TabFolderEditing::NEW_FOLDER_NAME), [this](Optional<String> name) {
+            auto creation = m_folder_creation.release_value();
+            if (name.has_value())
+                (void)creation.commit(m_tab_folders, name.release_value());
+            update_tab_folders();
+        })) {
+        m_folder_creation.clear();
         update_tab_folders();
-    return id;
+    }
 }
 
-void BrowserWindow::move_tabs_to_folder(Vector<Tab*> tabs, TabFolderId id)
+void BrowserWindow::move_tab_folder_items(Vector<TabFolderTree::Item> const& items, TabFolderDestination const& destination)
 {
-    Vector<TabFolderTree::Item> items;
-    for (auto* tab : tabs) {
-        if (tab && tab->session_tab_id().has_value())
-            items.append(TabFolderTree::Item::tab(*tab->session_tab_id()));
-    }
-    if (!items.is_empty() && m_tab_folders.move_items(items, TabFolderDestination::at_end_of(id)))
+    if (m_tab_folders.move_items(items, destination))
         update_tab_folders();
 }
 
@@ -923,10 +899,9 @@ void BrowserWindow::restore_closed_window_folders(TabFolderTree const& restored,
 
 void BrowserWindow::clear_tab_folder_selection()
 {
-    if (m_folder_selection.is_empty() && !m_folder_selection_anchor.has_value())
+    if (m_folder_selection.keys.is_empty() && !m_folder_selection.anchor.has_value())
         return;
-    m_folder_selection.clear();
-    m_folder_selection_anchor.clear();
+    m_folder_selection = {};
     update_tab_folders();
 }
 
@@ -936,113 +911,94 @@ void BrowserWindow::select_tab_for_folder(Tab& tab, Qt::KeyboardModifiers modifi
     if (!key.has_value())
         return;
 
+    Optional<TabFolderTree::TabKey> active;
+    if (m_current_tab)
+        active = m_current_tab->session_tab_id();
     if (modifiers.testFlag(Qt::ShiftModifier)) {
         Vector<TabFolderSync::WindowTab> tabs;
+        Vector<TabFolderSync::SidebarRow> rows;
         for (int i = 0; i < m_tabs_container->count(); ++i) {
             auto* candidate = m_tabs_container->tab(i);
-            if (auto id = candidate->session_tab_id(); id.has_value())
+            if (auto id = candidate->session_tab_id(); id.has_value()) {
                 tabs.append({ *id, candidate->is_pinned() });
-        }
-        Optional<TabFolderTree::TabKey> active;
-        if (m_current_tab)
-            active = m_current_tab->session_tab_id();
-        auto rows = TabFolderSync::sidebar_rows(m_tab_folders, tabs, active);
-        auto anchor = m_folder_selection_anchor.value_or(active.value_or(*key));
-        auto range = TabFolderSync::tab_range(rows, anchor, *key);
-        if (!range.is_empty())
-            m_folder_selection = AK::move(range);
-    } else if (modifiers.testFlag(Qt::ControlModifier)) {
-        if (!m_folder_selection.remove_all_matching([&](auto selected) { return selected == *key; }))
-            m_folder_selection.append(*key);
-    } else {
-        m_folder_selection = { *key };
-    }
-    m_folder_selection_anchor = *key;
-    update_tab_folders();
-}
-
-Vector<Tab*> BrowserWindow::tabs_for_folder_action(Tab& tab)
-{
-    auto key = tab.session_tab_id();
-    if (!key.has_value() || !m_folder_selection.contains_slow(*key)) {
-        m_folder_selection.clear();
-        if (key.has_value())
-            m_folder_selection.append(*key);
-        m_folder_selection_anchor = key;
-        update_tab_folders();
-    }
-
-    Vector<Tab*> tabs;
-    for (auto selected : m_folder_selection) {
-        for (int i = 0; i < m_tabs_container->count(); ++i) {
-            auto* candidate = m_tabs_container->tab(i);
-            if (candidate->session_tab_id() == selected) {
-                tabs.append(candidate);
-                break;
+                if (candidate->is_pinned())
+                    rows.append({ TabFolderTree::Item::tab(*id) });
             }
         }
+        rows.extend(TabFolderSync::sidebar_rows(m_tab_folders, tabs, active));
+        m_folder_selection = TabFolderEditing::extended(AK::move(m_folder_selection), rows, *key, active);
+    } else if (modifiers.testFlag(Qt::ControlModifier)) {
+        m_folder_selection = TabFolderEditing::toggled(AK::move(m_folder_selection), *key, active);
     }
-    return tabs;
+    update_tab_folders();
 }
 
 void BrowserWindow::show_tab_context_menu(Tab& tab, QPoint global_position)
 {
     auto& menu = *tab.context_menu();
-    if (m_tabs_container->tab_bar()->tab_layout() == TabLayout::Horizontal) {
+    auto key = tab.session_tab_id();
+    if (m_tabs_container->tab_bar()->tab_layout() == TabLayout::Horizontal || !key.has_value()) {
         execute_context_menu(menu, global_position);
         return;
     }
 
-    tabs_for_folder_action(tab);
+    auto keys = TabFolderEditing::context_tabs(m_folder_selection, *key);
+    if (keys != m_folder_selection.keys) {
+        m_folder_selection = { keys, key };
+        update_tab_folders();
+    }
+
+    Vector<TabFolderTree::Item> items;
+    for (auto selected : keys)
+        items.append(TabFolderTree::Item::tab(selected));
+
+    QPointer<BrowserWindow> window = this;
     QPointer<QMenu> guarded_menu = &menu;
-    QPointer<QMenu> move_menu;
-    TabFolderMenus::add_move_menu(menu, m_tab_folders,
-        [this, tab = QPointer<Tab>(&tab)](TabFolderId id) {
-            if (tab)
-                move_tabs_to_folder(tabs_for_folder_action(*tab), id);
-        },
-        [this, tab = QPointer<Tab>(&tab)] {
-            if (!tab)
-                return;
-            auto tabs = tabs_for_folder_action(*tab);
-            if (auto name = ask_for_folder_name(this, QStringLiteral("New Folder")); name.has_value())
-                (void)create_tab_folder_around(*name, tabs);
-        });
-    move_menu = menu.actions().last()->menu();
+    bool create_folder = false;
+    auto move_selection = [window, items = AK::move(items)](TabFolderId id) {
+        if (window)
+            window->move_tab_folder_items(items, TabFolderDestination::at_end_of(id));
+    };
+    TabFolderMenus::add_move_menu(menu, m_tab_folders, AK::move(move_selection), [&create_folder] { create_folder = true; });
+    QPointer<QMenu> move_menu = menu.actions().last()->menu();
     execute_context_menu(menu, global_position);
     if (guarded_menu && move_menu) {
         guarded_menu->removeAction(move_menu->menuAction());
         delete move_menu.data();
     }
+    if (window && create_folder)
+        window->start_creating_tab_folder({ {}, AK::move(keys) });
 }
 
 void BrowserWindow::show_sidebar_context_menu(QPoint global_position)
 {
-    QMenu menu(this);
-    auto* new_folder = menu.addAction(QStringLiteral("New Folder…"));
+    QPointer<BrowserWindow> window = this;
+    QPointer menu = new QMenu(this);
+    auto* new_folder = menu->addAction(QStringLiteral("New Folder…"));
     new_folder->setEnabled(m_tab_folders.can_create_folder());
-    if (menu.exec(global_position) != new_folder)
-        return;
-    auto name = ask_for_folder_name(this, QStringLiteral("New Folder"));
-    if (!name.has_value())
-        return;
-    if (m_tab_folders.create_folder(ak_string_from_qstring(*name)).has_value())
-        update_tab_folders();
+    auto create_folder = menu->exec(global_position) == new_folder;
+    delete menu.data();
+    if (window && create_folder)
+        window->start_creating_tab_folder({});
 }
 
 void BrowserWindow::show_tab_folder_context_menu(TabFolderId id, QPoint global_position)
 {
     if (!m_tab_folders.folder(id).has_value())
         return;
-    switch (TabFolderMenus::exec_folder(this, global_position)) {
+    QPointer<BrowserWindow> window = this;
+    auto action = TabFolderMenus::exec_folder(this, global_position);
+    if (!window || !m_tab_folders.folder(id).has_value())
+        return;
+    switch (action) {
     case TabFolderMenus::Action::None:
         return;
     case TabFolderMenus::Action::Rename: {
         auto current = qstring_from_ak_string(m_tab_folders.folder(id)->name);
-        if (auto name = ask_for_folder_name(this, QStringLiteral("Rename Folder"), current); name.has_value()) {
-            if (m_tab_folders.rename_folder(id, ak_string_from_qstring(*name)))
+        m_tabs_container->tab_bar()->edit_folder_name(id, current, [this, id](Optional<String> name) {
+            if (name.has_value() && m_tab_folders.rename_folder(id, name.release_value()))
                 update_tab_folders();
-        }
+        });
         return;
     }
     case TabFolderMenus::Action::ChangeIcon: {
@@ -1061,10 +1017,7 @@ void BrowserWindow::show_tab_folder_context_menu(TabFolderId id, QPoint global_p
     case TabFolderMenus::Action::NewSubfolder: {
         if (!m_tab_folders.can_create_folder_in(id))
             return;
-        if (auto name = ask_for_folder_name(this, QStringLiteral("New Subfolder")); name.has_value()) {
-            if (m_tab_folders.create_folder(ak_string_from_qstring(*name), TabFolderDestination::at_end_of(id)).has_value())
-                update_tab_folders();
-        }
+        start_creating_tab_folder({ id, {} });
         return;
     }
     case TabFolderMenus::Action::Unpack:

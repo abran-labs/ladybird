@@ -65,6 +65,10 @@ class TabMicrophoneIndicator;
 class TabWidget;
 class WindowControlsReveal;
 
+namespace TabFolderEditing {
+class FolderNameEditor;
+}
+
 static constexpr int TAB_ICON_SIZE = 16;
 
 // How much further the first and last horizontal tabs reach toward the ends of the strip, to make room for the selected
@@ -87,6 +91,7 @@ public:
     AK_ALLOC_WITH_KMALLOC;
 
     explicit TabBar(TabWidget*);
+    virtual ~TabBar() override;
 
     void set_available_width(int width);
 
@@ -125,18 +130,22 @@ public:
         QString name;
         QString icon;
         bool selected { false };
+        bool provisional { false };
 
         bool operator==(SidebarRow const&) const = default;
     };
-    // What the sidebar shows below the pinned tiles, in order. While has_folders says so, the rows take the place of the
-    // plain list of unpinned tabs: an unpinned tab with no row, such as one inside a collapsed folder, is not shown.
-    void set_sidebar_rows(Vector<SidebarRow>, bool has_folders);
+    // What the sidebar shows below the pinned tiles, in order. Folders or a selection make these rows take the place
+    // of the plain list. An unpinned tab with no row, such as one inside a collapsed folder, is not shown.
+    void set_sidebar_rows(Vector<SidebarRow>, bool has_folders, Vector<TabFolderTree::TabKey> selection);
     // Whether the sidebar shows its rows, rather than the plain list of its unpinned tabs. Never with horizontal tabs.
     bool uses_sidebar_rows() const;
     // The folder whose header is at a position of the tab bar, if any.
     Optional<TabFolderId> folder_at(QPoint const&) const;
     // Where a folder's header is drawn, or nothing when it has no row.
     Optional<QRect> folder_row_rect(TabFolderId) const;
+    // No id means the provisional row. Its name only belongs to the real tree once the edit is accepted.
+    bool edit_folder_name(Optional<TabFolderId>, QString const&, Function<void(Optional<String>)>);
+    void cancel_folder_name_edit();
 
 private:
     virtual QSize sizeHint() const override;
@@ -197,7 +206,7 @@ private:
     QPixmap render_tab_drag_pixmap(int index) const;
     void toggle_window_maximized();
     bool start_window_move();
-    void start_tab_drag(int index);
+    void start_tab_drag(int index, QPoint position);
     QPoint tab_drag_hot_spot() const;
     void start_strip_drag(int index);
     void update_strip_drag(QPoint position);
@@ -274,26 +283,57 @@ private:
     void paint_sidebar_folder_rows(QPainter&, QRect const& clip);
     int sidebar_tab_index_at(QPoint const&, PinnedRegion const&) const;
     void set_hovered_folder(Optional<TabFolderId>);
+    Optional<QRect> edited_folder_row_rect() const;
+    void ensure_edited_folder_visible();
+    void update_folder_name_editor_geometry();
+    QPointer<TabFolderEditing::FolderNameEditor> m_folder_name_editor;
+    Optional<TabFolderId> m_edited_folder;
 
     // A drag along the sidebar's rows: the rows that stay make way for the ones moving, which follow the pointer as a card.
+    // How far the card is held to the left or right picks how deep the rows land in the gap (see TabFolderDrag).
     struct RowDrag {
         Vector<TabFolderTree::Item> moving;
         // The rows that stay, laid out around the gap the moving ones leave.
-        Vector<LaidOutRow> remaining;
-        // Where the moving rows land: before this many of the rows that stay.
-        Optional<size_t> gap;
+        Vector<SidebarRow> remaining;
+        // Where the moving rows land: before this many of the rows that stay, this deep, which is this place in the tree.
+        size_t gap { 0 };
+        size_t depth { 0 };
+        Optional<TabFolderDestination> destination;
+        // Where the card was last asked to land, before rounding, so the drag can find its place again when rows change.
+        double wanted_gap { 0 };
+        double wanted_depth { 0 };
+        // How many rows the card shows, which is how many rows of room the gap takes.
+        size_t card_rows { 1 };
+        // The rows the moving items showed, by row_key(), with the grabbed row first.
+        Vector<u64> moving_keys;
+        // The depth the card's first row started at, from which the card moves aside as the depth changes.
+        size_t first_depth { 0 };
+        // Where the pointer holds the grabbed row.
+        int press_offset_y { 0 };
         // The tab being dragged when it's one tab on its own, which, as from the plain list, can leave for another window.
         QPointer<Tab> single_tab;
-        // Where the card's left edge is, which is the dragged row's.
+        // Where the card's left edge is, at the first row's starting depth.
         int card_left { 0 };
+        QPoint last_position;
+        QPixmap card;
     };
-    void start_row_drag(Vector<TabFolderTree::Item>);
-    void update_row_drag(QPoint position);
+    bool start_row_drag(TabFolderTree::Item pressed, Vector<TabFolderTree::Item>, QPoint position);
+    void update_row_drag(QPoint position, bool allow_detach = true);
     void end_row_drag(bool drop);
+    // The rows changed under a drag, as when a tab closes: the drag carries on with what's left of it.
+    void refresh_row_drag();
+    void retarget_row_drag();
+    void lay_out_row_drag();
+    void animate_rows_from(HashMap<u64, qreal> start_y);
+    int sidebar_rows_origin_y() const;
+    Vector<TabFolderTree::Item> selected_sidebar_items() const;
+    bool is_selected_sidebar_tab(int index) const;
+    QPixmap lift_drag_card(QSize, qreal radius, Function<void(QPainter&)> const& paint_contents) const;
     // The tab is drawn as a card above the rest of the window that follows drags, and Escape ends the drag it belongs to.
     void show_drag_card(int index);
 
     Vector<SidebarRow> m_sidebar_rows;
+    Vector<TabFolderTree::TabKey> m_sidebar_selection;
     bool m_has_sidebar_rows { false };
     Vector<LaidOutRow> m_laid_out_rows;
     HashMap<Tab const*, size_t> m_laid_out_row_of_tab;
@@ -301,6 +341,10 @@ private:
     qreal m_rows_progress { 1.0 };
     QVariantAnimation* m_rows_animation { nullptr };
     Optional<RowDrag> m_row_drag;
+    QPointer<QWidget> m_row_drag_card;
+    QObject* m_row_drag_cancellation_filter { nullptr };
+    // A press on a tab of a selection keeps the selection, for a drag to carry it, until the press ends without one.
+    bool m_clear_folder_selection_on_release { false };
     Optional<TabFolderId> m_pressed_folder;
     Optional<TabFolderId> m_hovered_folder;
 
@@ -425,6 +469,7 @@ public:
     void set_everything_in_sidebar(bool);
     void set_vertical_tabs_expanded(bool);
     void set_vertical_tabs_expand_on_hover(bool);
+    void set_folder_name_editor_open(bool);
     // How strongly the vertical tabs' titles show, which they don't for long once the sidebar starts to collapse.
     qreal vertical_tab_title_opacity() const;
     bool vertical_tabs_are_toggling() const { return m_vertical_tabs_toggling; }
@@ -571,6 +616,7 @@ private:
     bool m_vertical_tabs_enabled { false };
     bool m_everything_in_sidebar { false };
     bool m_vertical_tabs_expanded { true };
+    bool m_folder_name_editor_open { false };
     bool m_vertical_tabs_expand_on_hover { false };
     WebView::VerticalTabsPosition m_vertical_tabs_position { WebView::VerticalTabsPosition::Left };
     bool m_vertical_tabs_hover_expanded { false };

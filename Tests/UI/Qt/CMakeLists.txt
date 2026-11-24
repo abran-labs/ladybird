@@ -45,6 +45,8 @@ set(TEST_SOURCES
     TestSessionStore.cpp
     TestSiteSettingsPopover.cpp
     TestStringUtils.cpp
+    TestTabFolderDrag.cpp
+    TestTabFolderEditing.cpp
     TestTabFolderSync.cpp
     TestTabFolderTree.cpp
     TestWebCompatReportReview.cpp

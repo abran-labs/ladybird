@@ -22,6 +22,7 @@
 #include <UI/Qt/SessionStore.h>
 #include <UI/Qt/Tab.h>
 #include <UI/Qt/TabBar.h>
+#include <UI/Qt/TabFolderEditing.h>
 #include <UI/Qt/WindowCloseCoordinator.h>
 #include <UI/Qt/WindowScreenObserver.h>
 
@@ -195,13 +196,11 @@ public:
     // rows in step with both.
     void update_tab_folders(Optional<TabFolderTree::TabKey> new_tab_at_root = {});
     void toggle_tab_folder(TabFolderId);
-    // A new folder in the place of the first of the tabs, holding them all. Nothing when that isn't allowed.
-    Optional<TabFolderId> create_tab_folder_around(QString const& name, Vector<Tab*> const& tabs);
-    void move_tabs_to_folder(Vector<Tab*>, TabFolderId);
+    // Where tabs and folders dragged along the sidebar land. A refused move changes nothing.
+    void move_tab_folder_items(Vector<TabFolderTree::Item> const&, TabFolderDestination const&);
     void restore_closed_window_folders(TabFolderTree const&, Vector<Tab*> const&);
     void select_tab_for_folder(Tab&, Qt::KeyboardModifiers);
     void clear_tab_folder_selection();
-    Vector<Tab*> tabs_for_folder_action(Tab&);
     void show_tab_context_menu(Tab&, QPoint global_position);
     void show_tab_folder_context_menu(TabFolderId, QPoint global_position);
     void show_sidebar_context_menu(QPoint global_position);
@@ -317,6 +316,7 @@ private:
     void update_window_title(QString const&);
     void register_window_with_session_store();
     void sync_session_tab_order();
+    void start_creating_tab_folder(TabFolderEditing::FolderCreation);
     void begin_window_close_preflight(Function<void(bool approved)> on_complete = {});
 
     void set_current_tab(Tab* tab);
@@ -384,8 +384,8 @@ private:
     Optional<SessionWindowId> m_session_window_id;
     TabFolderTree m_tab_folders;
     Optional<String> m_saved_tab_folders;
-    Vector<TabFolderTree::TabKey> m_folder_selection;
-    Optional<TabFolderTree::TabKey> m_folder_selection_anchor;
+    TabFolderEditing::Selection m_folder_selection;
+    Optional<TabFolderEditing::FolderCreation> m_folder_creation;
     bool m_reordering_tab_folders { false };
     bool m_restoring_tab_folders { false };
     size_t m_failed_download_count { 0 };
