@@ -45,6 +45,7 @@ set(TEST_SOURCES
     TestSessionStore.cpp
     TestSiteSettingsPopover.cpp
     TestStringUtils.cpp
+    TestTabFolderTree.cpp
     TestWebCompatReportReview.cpp
     TestWebContentViewInputMethod.cpp
     TestWindowCloseCoordinator.cpp

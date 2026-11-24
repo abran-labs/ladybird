@@ -69,6 +69,7 @@ add_library(ladybird_impl STATIC
     SystemAppearance.cpp
     Tab.cpp
     TabBar.cpp
+    TabFolderTree.cpp
     Theme.cpp
     VersionPage.cpp
     WebCompatReportReview.cpp
