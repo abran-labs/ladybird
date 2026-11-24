@@ -326,7 +326,7 @@ private:
     bool vertical_drag_motion_enabled() const;
     void set_vertical_drop_indicator(QRect);
     QRectF displayed_vertical_drop_indicator() const;
-    void show_vertical_drag_card(QRect source, size_t item_count);
+    void show_vertical_drag_card(QRect source, int tab_index, SidebarRow const* folder = nullptr, size_t item_count = 1);
     void move_vertical_drag_card(QPoint);
     void land_vertical_drag_card(QRect);
     void restore_vertical_drag_cursor();

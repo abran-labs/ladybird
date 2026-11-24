@@ -177,7 +177,10 @@ static constexpr int TAB_DRAG_START_DISTANCE = 4;
 static constexpr int TAB_DETACH_DISTANCE = 40;
 // How far a card dragged along the sidebar's rows moves sideways to land one level deeper or shallower.
 static constexpr int ROW_DRAG_DEPTH_STEP = 12;
-static constexpr int VERTICAL_DRAG_PREVIEW_GAP = 18;
+static constexpr int VERTICAL_DRAG_CARD_MAX_WIDTH = 260;
+static constexpr int VERTICAL_DRAG_CARD_STACK_STEP = 4;
+static constexpr int VERTICAL_DRAG_CARD_CLEARANCE = 3;
+static constexpr qreal VERTICAL_DROP_INDICATOR_DOT_RADIUS = 3.5;
 // A closing tab fades out over this much of the time the other tabs take to close the gap it leaves.
 static constexpr qreal CLOSING_TAB_FADE_PORTION = 0.4;
 // The first and last tabs are this much wider, on the outer side, to make room for their feet at the ends of the tab bar.
@@ -693,13 +696,16 @@ class TabDragCard final : public QWidget {
 public:
     AK_ALLOC_WITH_KMALLOC;
 
-    TabDragCard(QWidget& parent, QPixmap pixmap)
+    TabDragCard(QWidget& parent, QPixmap pixmap, QPoint hot_spot = {})
         : QWidget(&parent)
         , m_pixmap(AK::move(pixmap))
+        , m_hot_spot(hot_spot)
     {
         setAttribute(Qt::WA_TransparentForMouseEvents);
         resize(m_pixmap.deviceIndependentSize().toSize());
     }
+
+    QPoint hot_spot() const { return m_hot_spot; }
 
     void set_opacity(qreal opacity)
     {
@@ -716,6 +722,7 @@ private:
     }
 
     QPixmap m_pixmap;
+    QPoint m_hot_spot;
     qreal m_opacity { 1.0 };
 };
 
@@ -1345,32 +1352,107 @@ void TabBar::set_vertical_drop_indicator(QRect line)
     update();
 }
 
-void TabBar::show_vertical_drag_card(QRect source, size_t item_count)
+void TabBar::show_vertical_drag_card(QRect source, int tab_index, SidebarRow const* folder, size_t item_count)
 {
     clear_vertical_drag_card();
-    // Snapshot just the leading part of the grabbed row, so even a wide sidebar has a small pickup preview.
-    source.setWidth(min(source.width(), 144));
-    auto size = source.size() * 0.6;
-    auto stack_offset = static_cast<int>(min(item_count, 3uz) - 1) * 3;
+    auto collapsed = tab_layout() == TabLayout::VerticalCollapsed;
+    auto icon_only = collapsed || (tab_index >= 0 && tab_index < pinned_tab_count() && pinned_tabs_are_tiles());
+    auto radius = tab_drag_card_radius();
+    auto layers = static_cast<int>(min(item_count, 3uz));
+    auto stack_offset = (layers - 1) * VERTICAL_DRAG_CARD_STACK_STEP;
+    auto count = QString::number(item_count);
+    auto badge_font = ChromeStyle::chrome_title_font(font());
+    badge_font.setPixelSize(10);
+    badge_font.setBold(true);
+    constexpr int badge_height = 16;
+    auto badge_width = max(badge_height, QFontMetrics(badge_font).horizontalAdvance(count) + 6);
+    // Leave room for the row's edge and shadow, and for the badge to straddle the leading corner.
+    auto card_origin = layers > 1 ? QPoint(badge_width / 2 + 1, 5) : QPoint(2, 2);
+    auto padding = card_origin + QPoint(stack_offset + 2, stack_offset + 3);
+    QSize size { min(source.width(), min(VERTICAL_DRAG_CARD_MAX_WIDTH, max(1, width() - padding.x()))), source.height() };
+    auto preview_size = size + QSize(padding.x(), padding.y());
     auto dpr = devicePixelRatioF();
-    QPixmap pixmap((size + QSize(stack_offset, stack_offset)) * dpr);
+    QPixmap pixmap(QSize(ceil(preview_size.width() * dpr), ceil(preview_size.height() * dpr)));
     pixmap.setDevicePixelRatio(dpr);
     pixmap.fill(Qt::transparent);
     {
         QPainter painter(&pixmap);
         painter.setRenderHint(QPainter::Antialiasing);
         auto const& chrome = Theme::chrome(*this);
-        painter.setPen(chrome.muted);
-        painter.setBrush(chrome.toolbar);
-        for (int offset = stack_offset; offset >= 0; offset -= 3)
-            painter.drawRoundedRect(QRectF(QPoint(offset, offset), size).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
-        QPainterPath clip;
-        clip.addRoundedRect(QRectF(QPointF(), size).adjusted(1, 1, -1, -1), 3, 3);
-        painter.setClipPath(clip);
-        painter.scale(0.6, 0.6);
-        render(&painter, QPoint(), QRegion(source), QWidget::DrawChildren);
+        auto palette = Theme::chrome_palette(*this);
+        QRect card_rect(card_origin, size);
+        auto paint_card = [&](QRect const& rect) {
+            // Give the translucent dark selection fill the same backing it has in the sidebar.
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(Theme::is_dark(palette) ? chrome.sidebar : chrome.toolbar);
+            painter.drawRoundedRect(rect, radius, radius);
+            paint_selected_vertical_tab(painter, palette, rect, radius);
+        };
+        painter.setOpacity(0.45);
+        for (int offset = stack_offset; offset > 0; offset -= VERTICAL_DRAG_CARD_STACK_STEP)
+            paint_card(card_rect.translated(offset, offset));
+        painter.setOpacity(1);
+        paint_card(card_rect);
+
+        auto contents = card_rect.adjusted(VERTICAL_TAB_CONTENT_LEADING_INSET, 0, -TAB_CONTENT_HORIZONTAL_INSET, 0);
+        QRect icon_rect(contents.left(), contents.top() + (contents.height() - TAB_ICON_SIZE) / 2, TAB_ICON_SIZE, TAB_ICON_SIZE);
+        if (icon_only)
+            icon_rect.moveCenter(card_rect.center());
+
+        QString title;
+        auto title_color = chrome.text;
+        if (folder) {
+            auto glyph = m_folder_glyphs.value(folder->row.item.id, { folder->icon, folder->row.glyph });
+            title_color = chrome.row_title;
+            FolderIcons::icon(glyph.icon, glyph.glyph, title_color).paint(&painter, icon_rect);
+            title = folder->name.isEmpty() ? QStringLiteral("Untitled Folder") : folder->name;
+        } else {
+            auto icon = tabIcon(tab_index);
+            if (icon.isNull()) {
+                auto overhang = (CHROME_ICON_CANVAS_SIZE - TAB_ICON_SIZE) / 2;
+                m_fallback_tab_icon.paint(&painter, icon_rect.adjusted(-overhang, -overhang, overhang, overhang));
+            } else {
+                icon.paint(&painter, icon_rect);
+            }
+            title = tabText(tab_index);
+        }
+
+        contents.setLeft(icon_rect.right() + HORIZONTAL_TAB_CONTENT_GAP + (folder ? 1 : 0));
+        if (!icon_only && !contents.isEmpty()) {
+            auto title_font = ChromeStyle::chrome_title_font(font());
+            QFontMetricsF metrics(title_font);
+            painter.save();
+            painter.setClipRect(contents);
+            painter.setFont(title_font);
+            painter.setPen(title_color);
+            title.replace(QLatin1Char('\n'), QLatin1Char(' '));
+            if (folder) {
+                title = QFontMetrics(title_font).elidedText(title, Qt::ElideRight, contents.width());
+            } else if (metrics.horizontalAdvance(title) > contents.width()) {
+                QLinearGradient fade(max(contents.left(), contents.right() - TAB_TITLE_FADE_WIDTH), 0, contents.right() + 1, 0);
+                fade.setColorAt(0, title_color);
+                title_color.setAlpha(0);
+                fade.setColorAt(1, title_color);
+                painter.setPen(QPen(QBrush(fade), 1));
+            }
+            painter.drawText(contents, Qt::AlignLeft | Qt::AlignVCenter | Qt::TextSingleLine, title);
+            painter.restore();
+        }
+
+        if (layers > 1) {
+            QRect badge(0, 0, badge_width, badge_height);
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(QColor(204, 48, 57));
+            painter.drawRoundedRect(badge, badge_height / 2, badge_height / 2);
+            painter.setPen(Qt::white);
+            painter.setFont(badge_font);
+            painter.drawText(badge, Qt::AlignCenter, count);
+        }
     }
-    m_vertical_drag_card = new TabDragCard(*window(), AK::move(pixmap));
+    auto pickup = m_drag_start_position - source.topLeft();
+    auto pickup_x = qRound(pickup.x() * size.width() / static_cast<qreal>(max(1, source.width())));
+    auto hot_spot = layers > 1 ? QPoint(18, 18) : QPoint(clamp(pickup_x, 0, size.width() - 1), clamp(pickup.y(), 0, size.height() - 1));
+    m_vertical_drag_card = new TabDragCard(*window(), AK::move(pixmap), card_origin + hot_spot);
     QApplication::setOverrideCursor(Qt::ClosedHandCursor);
     m_vertical_drag_cursor_active = true;
 }
@@ -1382,27 +1464,34 @@ void TabBar::move_vertical_drag_card(QPoint position)
 
     auto size = m_vertical_drag_card->size();
     // Keep the preview in the chrome even when the page is a separate native surface above the window's backing store.
-    auto below = position.y() + VERTICAL_DRAG_PREVIEW_GAP;
-    auto above = position.y() - VERTICAL_DRAG_PREVIEW_GAP - size.height();
+    // The sidebar has room below its last row even though the tab bar itself ends there.
+    auto sidebar_bottom = parentWidget()->height() - y();
+    auto top_left = position - m_vertical_drag_card->hot_spot();
+    top_left.setX(clamp(top_left.x(), 0, max(0, width() - size.width())));
+    top_left.setY(clamp(top_left.y(), 0, max(0, sidebar_bottom - size.height())));
+    QRect target;
     if (m_row_drag.has_value() && m_hovered_folder.has_value()) {
-        if (auto folder = folder_row_rect(*m_hovered_folder); folder.has_value()) {
-            below = max(below, folder->bottom() + 3);
-            above = min(above, folder->top() - size.height() - 2);
+        target = folder_row_rect(*m_hovered_folder).value_or(QRect {});
+    } else if (m_vertical_drop_line.isValid()) {
+        auto sweep = displayed_vertical_drop_indicator().united(m_vertical_drop_line);
+        auto dot_extent = m_vertical_drop_line.width() > m_vertical_drop_line.height() ? VERTICAL_DROP_INDICATOR_DOT_RADIUS : 0;
+        target = sweep.adjusted(0, -dot_extent, 0, dot_extent).toAlignedRect();
+    }
+    if (target.isValid()) {
+        target.adjust(0, -VERTICAL_DRAG_CARD_CLEARANCE, 0, VERTICAL_DRAG_CARD_CLEARANCE);
+        if (target.intersects(QRect(top_left, size))) {
+            auto above = target.top() - size.height();
+            auto below = target.bottom() + 1;
+            auto fits_above = above >= 0;
+            auto fits_below = below + size.height() <= sidebar_bottom;
+            if (!fits_above && !fits_below) {
+                m_vertical_drag_card->hide();
+                return;
+            }
+            auto prefer_above = below < height() && top_left.y() - above < below - top_left.y();
+            top_left.setY(fits_above && (!fits_below || prefer_above) ? above : below);
         }
     }
-    auto x = position.x() + VERTICAL_DRAG_PREVIEW_GAP;
-    if (x + size.width() > width())
-        x = position.x() - VERTICAL_DRAG_PREVIEW_GAP - size.width();
-    x = clamp(x, 0, max(0, width() - size.width()));
-    if (m_vertical_drop_line.isValid()) {
-        auto sweep = displayed_vertical_drop_indicator().united(m_vertical_drop_line).toAlignedRect();
-        if (x < sweep.right() && x + size.width() > sweep.left()) {
-            below = max(below, sweep.bottom() + 3);
-            above = min(above, sweep.top() - size.height() - 2);
-        }
-    }
-    auto y = below + size.height() <= height() ? below : above;
-    auto top_left = QPoint(x, clamp(y, 0, max(0, height() - size.height())));
     m_vertical_drag_card->move(mapTo(window(), top_left));
     m_vertical_drag_card->show();
     m_vertical_drag_card->raise();
@@ -1451,7 +1540,12 @@ bool TabBar::start_row_drag(TabFolderTree::Item pressed, Vector<TabFolderTree::I
     set_hovered_tab_index(-1);
     set_hovered_folder({});
     auto source = sidebar_row_rect(m_laid_out_rows[*grabbed], pinned_region());
-    show_vertical_drag_card(source, drag.moving.size());
+    if (pressed.is_folder()) {
+        show_vertical_drag_card(sidebar_folder_shape(source, tab_layout() == TabLayout::VerticalCollapsed), -1, &row, drag.moving.size());
+    } else {
+        auto index = m_tab_widget->index_of(row.tab);
+        show_vertical_drag_card(tab_drag_card_rect(index), index, nullptr, drag.moving.size());
+    }
     m_row_drag_grabbed = pressed;
     m_row_drag = AK::move(drag);
     m_row_drag_cancellation_filter = new TabDragCancellationFilter([this] { end_row_drag(false); });
@@ -2273,11 +2367,27 @@ void TabBar::paintEvent(QPaintEvent*)
     painter.setClipping(false);
     if (is_vertical && m_vertical_drop_line.isValid()) {
         painter.save();
-        painter.setClipRect(!m_row_drag.has_value() && dragging_pinned_tab() ? rect() : unpinned_clip);
+        auto clip = !m_row_drag.has_value() && dragging_pinned_tab() ? rect() : unpinned_clip;
+        painter.setClipRect(clip);
         auto line = displayed_vertical_drop_indicator();
+        auto color = Theme::chrome(*this).muted;
+        auto dot_diameter = 2 * VERTICAL_DROP_INDICATOR_DOT_RADIUS;
+        if (line.width() > dot_diameter && line.width() > line.height() && clip.height() >= dot_diameter && line.intersects(clip)) {
+            // The hollow endpoint belongs to the same animated, clipped line as the stroke.
+            auto center_y = clamp(line.center().y(),
+                clip.top() + VERTICAL_DROP_INDICATOR_DOT_RADIUS, clip.bottom() + 1 - VERTICAL_DROP_INDICATOR_DOT_RADIUS);
+            line.translate(0, center_y - line.center().y());
+            QPointF center(line.left() + VERTICAL_DROP_INDICATOR_DOT_RADIUS, center_y);
+            auto stroke_width = line.height();
+            auto radius = VERTICAL_DROP_INDICATOR_DOT_RADIUS - stroke_width / 2;
+            painter.setPen(QPen(color, stroke_width));
+            painter.setBrush(Qt::NoBrush);
+            painter.drawEllipse(center, radius, radius);
+            line.setLeft(line.left() + dot_diameter - stroke_width / 2);
+        }
         auto radius = min(line.width(), line.height()) / 2;
         painter.setPen(Qt::NoPen);
-        painter.setBrush(Theme::chrome(*this).muted);
+        painter.setBrush(color);
         painter.drawRoundedRect(line, radius, radius);
         painter.restore();
     }
@@ -3295,7 +3405,7 @@ void TabBar::start_strip_drag(int index, QPoint position)
     m_tab_drag_card_offset = tab_drag_card_rect(index).topLeft() - visual_tab_rect(index).topLeft();
     m_strip_drag_card = new TabDragCard(*window(), m_tab_drag_pixmap);
     if (tab_layout() != TabLayout::Horizontal)
-        show_vertical_drag_card(visual_tab_rect(index), 1);
+        show_vertical_drag_card(tab_drag_card_rect(index), index);
 
     s_active_tab_drag_source = m_tab_widget;
     s_active_tab_dragged_tab = m_tab_widget->tab(index);
@@ -3974,8 +4084,9 @@ void TabBar::update_tab_button_geometry()
             did_update_button = true;
         }
 
+        // The rail's close badge protrudes over the leading end of the insertion line.
         auto should_be_visible = index != dragged_index
-            && (!is_close_button || (index == m_hovered_tab_index && !m_tab_widget->can_expand_vertical_tabs_on_hover()));
+            && (!is_close_button || (!m_vertical_drag_cursor_active && index == m_hovered_tab_index && !m_tab_widget->can_expand_vertical_tabs_on_hover()));
         if (button->isVisible() != should_be_visible) {
             button->setVisible(should_be_visible);
             did_update_button = true;
