@@ -181,7 +181,10 @@ public:
 
     // The window's folders, with each tab keyed by its session tab id, written at once like a pin. A tree without folders
     // clears them. A transient store keeps them only for reopening a closed window in this run.
+    // A tree whose saved form would pass MAX_TAB_FOLDERS_BYTES is refused with an error and changes nothing; the last
+    // tree accepted stays. A TabFolderTree within its own limits stays far below it for any real number of tabs.
     ErrorOr<void> tab_folders_changed(SessionWindowId, TabFolderTree const&);
+    static constexpr size_t MAX_TAB_FOLDERS_BYTES = 4uz * 1024 * 1024;
     void application_quitting();
     void application_quit_aborted();
 

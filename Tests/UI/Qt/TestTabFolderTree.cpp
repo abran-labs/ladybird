@@ -365,18 +365,231 @@ TEST_CASE(remapping_tabs_keeps_the_structure)
     EXPECT_EQ(remapped.folder(a)->name, "A"_string);
 }
 
-TEST_CASE(removing_folders_without_tabs_keeps_those_with_tabs_deep_inside)
+TEST_CASE(removing_untabbed_folders_keeps_those_with_tabs_and_the_empty_ones_inside_them)
 {
     auto tree = tree_with_tabs({ 1, 2 });
     auto outer = tree.create_folder_around("Outer"_string, items({ tab(2) })).release_value();
     auto inner = tree.create_folder_around("Inner"_string, items({ tab(2) })).release_value();
     auto empty_inside = tree.create_folder("EmptyInside"_string, TabFolderTree::Destination::at_end_of(outer)).release_value();
     auto empty = tree.create_folder("Empty"_string).release_value();
+    auto empty_child = tree.create_folder("EmptyChild"_string, TabFolderTree::Destination::at_end_of(empty)).release_value();
 
-    tree.remove_folders_without_tabs();
+    tree.remove_folders_outside_tabbed_ones();
     EXPECT(tree.folder(outer).has_value());
     EXPECT(tree.folder(inner).has_value());
-    EXPECT(!tree.folder(empty_inside).has_value());
+    EXPECT(tree.folder(empty_inside).has_value());
     EXPECT(!tree.folder(empty).has_value());
-    EXPECT_EQ(tree.children(outer), items({ folder(inner) }));
+    EXPECT(!tree.folder(empty_child).has_value());
+    EXPECT_EQ(tree.children(outer), items({ folder(inner), folder(empty_inside) }));
+}
+
+static String string_of_bytes(size_t count, char ch = 'n')
+{
+    StringBuilder builder;
+    for (size_t i = 0; i < count; ++i)
+        builder.append(ch);
+    return builder.to_string_without_validation();
+}
+
+TEST_CASE(folder_names_longer_than_the_limit_are_rejected_without_changing_the_tree)
+{
+    auto tree = tree_with_tabs({ 1 });
+    auto longest = string_of_bytes(TabFolderTree::MAX_FOLDER_NAME_BYTES);
+    auto too_long = string_of_bytes(TabFolderTree::MAX_FOLDER_NAME_BYTES + 1);
+
+    auto a = tree.create_folder(longest);
+    EXPECT(a.has_value());
+    auto before = tree.serialize();
+    EXPECT(!tree.create_folder(too_long).has_value());
+    EXPECT(!tree.create_folder_around(too_long, items({ tab(1) })).has_value());
+    EXPECT(!tree.rename_folder(*a, too_long));
+    EXPECT_EQ(tree.serialize(), before);
+    EXPECT(TabFolderTree::is_valid_folder_name(longest));
+    EXPECT(!TabFolderTree::is_valid_folder_name(too_long));
+}
+
+TEST_CASE(folder_icons_must_be_a_short_nonempty_id)
+{
+    TabFolderTree tree;
+    auto a = tree.create_folder("A"_string).release_value();
+    EXPECT(tree.set_folder_icon(a, string_of_bytes(TabFolderTree::MAX_FOLDER_ICON_BYTES, 'i')));
+    auto before = tree.serialize();
+    EXPECT(!tree.set_folder_icon(a, string_of_bytes(TabFolderTree::MAX_FOLDER_ICON_BYTES + 1, 'i')));
+    EXPECT(!tree.set_folder_icon(a, String {}));
+    EXPECT_EQ(tree.serialize(), before);
+    EXPECT(tree.set_folder_icon(a, {}));
+}
+
+// A chain of nested folders, the outermost first.
+static Vector<TabFolderId> nest_folders(TabFolderTree& tree, size_t count, Optional<TabFolderId> parent = {})
+{
+    Vector<TabFolderId> chain;
+    for (size_t i = 0; i < count; ++i) {
+        auto id = tree.create_folder(MUST(String::formatted("level {}", i)), TabFolderTree::Destination::at_end_of(parent));
+        EXPECT(id.has_value());
+        if (!id.has_value())
+            break;
+        chain.append(*id);
+        parent = id;
+    }
+    return chain;
+}
+
+TEST_CASE(folders_nest_only_up_to_the_depth_limit)
+{
+    auto tree = tree_with_tabs({ 1 });
+    auto chain = nest_folders(tree, TabFolderTree::MAX_FOLDER_DEPTH);
+    EXPECT_EQ(chain.size(), TabFolderTree::MAX_FOLDER_DEPTH);
+    auto before = tree.serialize();
+
+    EXPECT(!tree.create_folder("Too deep"_string, TabFolderTree::Destination::at_end_of(chain.last())).has_value());
+
+    // Wrapping the outermost folder would push the innermost one past the limit, so nothing is created.
+    EXPECT(!tree.create_folder_around("Wrapper"_string, items({ folder(chain.first()) })).has_value());
+    EXPECT_EQ(tree.serialize(), before);
+
+    // A tab can still go into the innermost folder; tabs don't add depth.
+    EXPECT(tree.move_items(items({ tab(1) }), TabFolderTree::Destination::at_end_of(chain.last())));
+}
+
+TEST_CASE(moving_a_subtree_past_the_depth_limit_is_rejected)
+{
+    TabFolderTree tree;
+    auto deep = nest_folders(tree, TabFolderTree::MAX_FOLDER_DEPTH - 1);
+    auto pair = nest_folders(tree, 2);
+    auto before = tree.serialize();
+
+    EXPECT(!tree.can_move_items(items({ folder(pair.first()) }), TabFolderTree::Destination::at_end_of(deep.last())));
+    EXPECT(!tree.move_items(items({ folder(pair.first()) }), TabFolderTree::Destination::at_end_of(deep.last())));
+    EXPECT_EQ(tree.serialize(), before);
+
+    // The innermost of the pair alone fits.
+    EXPECT(tree.move_items(items({ folder(pair.last()) }), TabFolderTree::Destination::at_end_of(deep.last())));
+}
+
+TEST_CASE(a_window_holds_only_up_to_the_folder_limit)
+{
+    TabFolderTree tree;
+    for (size_t i = 0; i < TabFolderTree::MAX_FOLDERS; ++i)
+        EXPECT(tree.create_folder("f"_string).has_value());
+    EXPECT(!tree.can_create_folder());
+    EXPECT(!tree.create_folder("one more"_string).has_value());
+}
+
+TEST_CASE(every_accepted_tree_at_the_limits_round_trips)
+{
+    // The worst case for the saved size: control characters escape to six bytes each.
+    auto worst_name = string_of_bytes(TabFolderTree::MAX_FOLDER_NAME_BYTES, '\x01');
+    auto worst_icon = string_of_bytes(TabFolderTree::MAX_FOLDER_ICON_BYTES, '\x02');
+
+    auto tree = tree_with_tabs({ 1, 2 });
+    auto unrelated = tree.create_folder_around("Unrelated"_string, items({ tab(2) })).release_value();
+    auto chain = nest_folders(tree, TabFolderTree::MAX_FOLDER_DEPTH);
+    EXPECT(tree.move_items(items({ tab(1) }), TabFolderTree::Destination::at_end_of(chain.last())));
+    while (tree.can_create_folder()) {
+        auto id = tree.create_folder(worst_name).release_value();
+        EXPECT(tree.set_folder_icon(id, worst_icon));
+    }
+    EXPECT(tree.rename_folder(chain.last(), worst_name));
+
+    auto serialized = tree.serialize();
+    EXPECT(serialized.byte_count() <= TabFolderTree::MAX_SERIALIZED_BYTES_WITHOUT_TABS);
+    auto restored = TRY_OR_FAIL(TabFolderTree::deserialize(serialized, allowed({ 1, 2 })));
+    EXPECT_EQ(restored.serialize(), serialized);
+    EXPECT_EQ(restored.children(unrelated), items({ tab(2) }));
+    EXPECT_EQ(restored.children(chain.last()), items({ tab(1) }));
+}
+
+TEST_CASE(deserializing_rejects_trees_past_the_limits)
+{
+    auto make_chain = [](size_t depth) {
+        StringBuilder builder;
+        builder.append(R"({"version":1,"root":)"sv);
+        for (size_t i = 0; i < depth; ++i)
+            builder.appendff(R"([{{"folder":{{"id":{},"name":"x","collapsed":false,"children":)", i + 1);
+        builder.append("[]"sv);
+        for (size_t i = 0; i < depth; ++i)
+            builder.append("}}]"sv);
+        builder.append('}');
+        return builder.to_byte_string();
+    };
+    EXPECT(!TabFolderTree::deserialize(make_chain(TabFolderTree::MAX_FOLDER_DEPTH), {}).is_error());
+    EXPECT(TabFolderTree::deserialize(make_chain(TabFolderTree::MAX_FOLDER_DEPTH + 1), {}).is_error());
+
+    StringBuilder many;
+    many.append(R"({"version":1,"root":[)"sv);
+    for (size_t i = 0; i <= TabFolderTree::MAX_FOLDERS; ++i)
+        many.appendff(R"({}{{"folder":{{"id":{},"name":"x","collapsed":false,"children":[]}}}})", i == 0 ? "" : ",", i + 1);
+    many.append("]}"sv);
+    EXPECT(TabFolderTree::deserialize(many.string_view(), {}).is_error());
+}
+
+TEST_CASE(new_folders_get_a_fresh_id_after_the_largest_possible_one)
+{
+    auto max_id = NumericLimits<TabFolderId>::max();
+    auto tree = TRY_OR_FAIL(TabFolderTree::deserialize(MUST(String::formatted(R"({{"version":1,"root":[{{"tab":1}},{{"folder":{{"id":{},"name":"max","collapsed":false,"children":[]}}}}]}})", max_id)), allowed({ 1 })));
+    EXPECT(tree.folder(max_id).has_value());
+
+    auto created = tree.create_folder("A"_string);
+    EXPECT(created.has_value());
+    EXPECT(*created > 0 && *created != max_id);
+    auto around = tree.create_folder_around("B"_string, items({ tab(1) }));
+    EXPECT(around.has_value());
+    EXPECT(*around > 0 && *around != max_id && *around != *created);
+    EXPECT_EQ(tree.children(*around), items({ tab(1) }));
+
+    auto restored = TRY_OR_FAIL(TabFolderTree::deserialize(tree.serialize(), allowed({ 1 })));
+    EXPECT_EQ(restored.serialize(), tree.serialize());
+}
+
+TEST_CASE(splitting_keeps_each_empty_folder_in_exactly_one_half_with_its_ancestors)
+{
+    // Work holds pinned tab 1 and an empty Ideas folder (with an empty Sketches folder in it); tab 2 is unpinned at the root.
+    auto tree = tree_with_tabs({ 1, 2 });
+    auto work = tree.create_folder_around("Work"_string, items({ tab(1) })).release_value();
+    auto ideas = tree.create_folder("Ideas"_string, TabFolderTree::Destination::at_end_of(work)).release_value();
+    auto sketches = tree.create_folder("Sketches"_string, TabFolderTree::Destination::at_end_of(ideas)).release_value();
+    auto loose = tree.create_folder("Loose"_string).release_value();
+    auto reading = tree.create_folder_around("Reading"_string, items({ tab(2) })).release_value();
+    auto later = tree.create_folder("Later"_string, TabFolderTree::Destination::at_end_of(reading)).release_value();
+
+    auto split = tree.split([](auto key) { return key == 1; }, TabFolderTree::SplitHalf::Second);
+    auto const& pinned = split.first;
+    auto const& unpinned = split.second;
+
+    EXPECT_EQ(pinned.children(), items({ folder(work) }));
+    EXPECT_EQ(pinned.children(work), items({ tab(1), folder(ideas) }));
+    EXPECT_EQ(pinned.children(ideas), items({ folder(sketches) }));
+    EXPECT(!pinned.folder(loose).has_value());
+    EXPECT(!pinned.folder(reading).has_value());
+
+    EXPECT_EQ(unpinned.children(), items({ folder(reading), folder(loose) }));
+    EXPECT_EQ(unpinned.children(reading), items({ tab(2), folder(later) }));
+    EXPECT(!unpinned.folder(work).has_value());
+    EXPECT(!unpinned.folder(ideas).has_value());
+    EXPECT(!unpinned.folder(sketches).has_value());
+}
+
+TEST_CASE(splitting_puts_folders_without_a_tabbed_ancestor_in_the_default_half)
+{
+    auto tree = tree_with_tabs({ 1 });
+    auto loose = tree.create_folder("Loose"_string).release_value();
+    auto inner = tree.create_folder("Inner"_string, TabFolderTree::Destination::at_end_of(loose)).release_value();
+
+    auto split = tree.split([](auto) { return true; }, TabFolderTree::SplitHalf::First);
+    EXPECT_EQ(split.first.children(), items({ tab(1), folder(loose) }));
+    EXPECT_EQ(split.first.children(loose), items({ folder(inner) }));
+    EXPECT(!split.second.has_folders());
+}
+
+TEST_CASE(splitting_a_folder_with_tabs_on_both_sides_keeps_it_in_both)
+{
+    auto tree = tree_with_tabs({ 1, 2 });
+    auto both = tree.create_folder_around("Both"_string, items({ tab(1), tab(2) })).release_value();
+    auto empty = tree.create_folder("Empty"_string, TabFolderTree::Destination::at_end_of(both)).release_value();
+
+    auto split = tree.split([](auto key) { return key == 1; }, TabFolderTree::SplitHalf::Second);
+    // An empty folder under one that's in both halves goes to the default half only.
+    EXPECT_EQ(split.first.children(both), items({ tab(1) }));
+    EXPECT_EQ(split.second.children(both), items({ tab(2), folder(empty) }));
 }

@@ -12,8 +12,6 @@
 namespace Ladybird {
 
 static constexpr i64 TAB_FOLDER_TREE_FORMAT_VERSION = 1;
-static constexpr size_t MAX_FOLDER_NAME_BYTES = 1024;
-static constexpr size_t MAX_FOLDER_ICON_BYTES = 128;
 
 static Vector<TabFolderTree::Item> const& empty_children()
 {
@@ -199,9 +197,40 @@ void TabFolderTree::insert(Item item, Optional<TabFolderId> parent, size_t index
     set_parent(item, parent);
 }
 
-TabFolderId TabFolderTree::allocate_folder_id()
+// Ids only grow, so a folder deleted and another created never look like the same one, until the largest id is taken.
+// From then on, the smallest free one goes; there's always one, since a window holds only so many folders.
+Optional<TabFolderId> TabFolderTree::allocate_folder_id() const
 {
-    return ++m_last_folder_id;
+    if (m_last_folder_id < NumericLimits<TabFolderId>::max())
+        return m_last_folder_id + 1;
+    for (TabFolderId id = 1; id < NumericLimits<TabFolderId>::max(); ++id) {
+        if (!m_folders.contains(id))
+            return id;
+    }
+    return {};
+}
+
+size_t TabFolderTree::depth_in(Optional<TabFolderId> parent) const
+{
+    size_t depth = 1;
+    for (; parent.has_value(); parent = parent_of(Item::folder(*parent)))
+        ++depth;
+    return depth;
+}
+
+size_t TabFolderTree::subtree_folder_depth(Item item) const
+{
+    if (!item.is_folder())
+        return 0;
+    size_t deepest_child = 0;
+    for (auto child : children(item.id))
+        deepest_child = max(deepest_child, subtree_folder_depth(child));
+    return 1 + deepest_child;
+}
+
+bool TabFolderTree::can_create_folder_in(Optional<TabFolderId> parent) const
+{
+    return can_create_folder() && children_of(parent) && depth_in(parent) <= MAX_FOLDER_DEPTH;
 }
 
 bool TabFolderTree::add_tab(TabKey key, Destination destination)
@@ -251,12 +280,16 @@ void TabFolderTree::reconcile_tabs(Vector<TabKey> const& window_order)
 
 Optional<TabFolderId> TabFolderTree::create_folder(String name, Destination destination)
 {
-    if (!children_of(destination.parent))
+    if (!is_valid_folder_name(name) || !can_create_folder_in(destination.parent))
         return {};
     auto id = allocate_folder_id();
-    m_folders.set(id, FolderNode { .folder = { .id = id, .name = move(name), .icon = {}, .collapsed = false }, .parent = {}, .children = {} });
-    insert(Item::folder(id), destination.parent, destination.index);
-    return id;
+    if (!id.has_value())
+        return {};
+    m_last_folder_id = max(m_last_folder_id, *id);
+    auto folder_id = *id;
+    m_folders.set(folder_id, FolderNode { .folder = { .id = folder_id, .name = move(name), .icon = {}, .collapsed = false }, .parent = {}, .children = {} });
+    insert(Item::folder(folder_id), destination.parent, destination.index);
+    return folder_id;
 }
 
 Optional<TabFolderId> TabFolderTree::create_folder_around(String name, Vector<Item> const& items)
@@ -268,8 +301,18 @@ Optional<TabFolderId> TabFolderTree::create_folder_around(String name, Vector<It
             return {};
     }
 
+    if (!is_valid_folder_name(name))
+        return {};
     auto selection = normalized_selection(items);
     auto position = position_of(selection.first()).release_value();
+    if (!can_create_folder_in(position.parent))
+        return {};
+    // The new folder adds a level above every item it takes in.
+    auto base_depth = depth_in(position.parent);
+    for (auto item : selection) {
+        if (base_depth + subtree_folder_depth(item) > MAX_FOLDER_DEPTH)
+            return {};
+    }
     auto id = create_folder(move(name), position).release_value();
     auto moved = move_items(selection, Destination::at_end_of(id));
     VERIFY(moved);
@@ -279,7 +322,7 @@ Optional<TabFolderId> TabFolderTree::create_folder_around(String name, Vector<It
 bool TabFolderTree::rename_folder(TabFolderId id, String name)
 {
     auto node = m_folders.find(id);
-    if (node == m_folders.end())
+    if (node == m_folders.end() || !is_valid_folder_name(name))
         return false;
     node->value.folder.name = move(name);
     return true;
@@ -288,7 +331,7 @@ bool TabFolderTree::rename_folder(TabFolderId id, String name)
 bool TabFolderTree::set_folder_icon(TabFolderId id, Optional<String> icon)
 {
     auto node = m_folders.find(id);
-    if (node == m_folders.end())
+    if (node == m_folders.end() || (icon.has_value() && !is_valid_folder_icon(*icon)))
         return false;
     node->value.folder.icon = move(icon);
     return true;
@@ -330,6 +373,8 @@ bool TabFolderTree::can_move_items(Vector<Item> const& items, Destination const&
             if (*destination.parent == item.id || is_inside(Item::folder(*destination.parent), item.id))
                 return false;
         }
+        if (depth_in(destination.parent) - 1 + subtree_folder_depth(item) > MAX_FOLDER_DEPTH)
+            return false;
     }
     return true;
 }
@@ -395,12 +440,9 @@ Vector<TabFolderTree::TabKey> TabFolderTree::delete_folder(TabFolderId id)
     return tabs;
 }
 
-void TabFolderTree::remove_folders_without_tabs()
+void TabFolderTree::remove_folders_outside_tabbed_ones()
 {
-    for (auto const& entry : folders_in_order()) {
-        if (m_folders.contains(entry.id) && tabs_inside(entry.id).is_empty())
-            (void)delete_folder(entry.id);
-    }
+    *this = split([](auto) { return true; }, SplitHalf::Second).first;
 }
 
 static JsonArray serialize_items(TabFolderTree const& tree, Vector<TabFolderTree::Item> const& items)
@@ -447,7 +489,7 @@ ErrorOr<TabFolderTree> TabFolderTree::deserialize(StringView serialized, HashTab
         return Error::from_string_literal("Tab folder tree has no root");
 
     TabFolderTree tree;
-    auto read_items = [&](auto& self, JsonArray const& array, Optional<TabFolderId> parent) -> ErrorOr<void> {
+    auto read_items = [&](auto& self, JsonArray const& array, Optional<TabFolderId> parent, size_t depth) -> ErrorOr<void> {
         for (size_t i = 0; i < array.size(); ++i) {
             auto const& value = array.at(i);
             if (!value.is_object() || value.as_object().size() != 1)
@@ -466,16 +508,20 @@ ErrorOr<TabFolderTree> TabFolderTree::deserialize(StringView serialized, HashTab
             auto folder_object = entry.get_object("folder"sv);
             if (!folder_object.has_value())
                 return Error::from_string_literal("Tab folder tree entry is not a tab or a folder");
+            if (depth + 1 > MAX_FOLDER_DEPTH)
+                return Error::from_string_literal("Tab folders nest too deep");
+            if (tree.m_folders.size() >= MAX_FOLDERS)
+                return Error::from_string_literal("Tab folder tree has too many folders");
             auto id = folder_object->get_i64("id"sv);
             if (!id.has_value() || *id <= 0 || tree.m_folders.contains(*id))
                 return Error::from_string_literal("Tab folder has an invalid id");
             auto name = folder_object->get_string("name"sv);
-            if (!name.has_value() || name->byte_count() > MAX_FOLDER_NAME_BYTES)
+            if (!name.has_value() || !is_valid_folder_name(*name))
                 return Error::from_string_literal("Tab folder has an invalid name");
             Optional<String> icon;
             if (folder_object->has("icon"sv)) {
                 auto icon_value = folder_object->get_string("icon"sv);
-                if (!icon_value.has_value() || icon_value->byte_count() > MAX_FOLDER_ICON_BYTES)
+                if (!icon_value.has_value() || !is_valid_folder_icon(*icon_value))
                     return Error::from_string_literal("Tab folder has an invalid icon");
                 icon = *icon_value;
             }
@@ -493,12 +539,88 @@ ErrorOr<TabFolderTree> TabFolderTree::deserialize(StringView serialized, HashTab
             tree.m_folders.set(*id, FolderNode { .folder = { .id = *id, .name = *name, .icon = move(icon), .collapsed = collapsed }, .parent = {}, .children = {} });
             tree.insert(Item::folder(*id), parent, NumericLimits<size_t>::max());
             tree.m_last_folder_id = max(tree.m_last_folder_id, *id);
-            TRY(self(self, *children, *id));
+            TRY(self(self, *children, *id, depth + 1));
         }
         return {};
     };
-    TRY(read_items(read_items, *root, {}));
+    TRY(read_items(read_items, *root, {}, 0));
     return tree;
+}
+
+TabFolderTree::Split TabFolderTree::split(Function<bool(TabKey)> const& in_first, SplitHalf default_half) const
+{
+    struct Halves {
+        bool first { false };
+        bool second { false };
+    };
+    HashMap<TabFolderId, Halves> halves;
+
+    auto has_tabs = [](Halves h) { return h.first || h.second; };
+    auto only_one = [](Halves h) { return h.first != h.second; };
+    auto default_halves = Halves { default_half == SplitHalf::First, default_half == SplitHalf::Second };
+
+    // Which halves hold a tab of each folder.
+    auto collect = [&](auto& self, TabFolderId id) -> Halves {
+        Halves result;
+        for (auto child : children(id)) {
+            if (child.is_tab()) {
+                (in_first(child.id) ? result.first : result.second) = true;
+            } else {
+                auto child_halves = self(self, child.id);
+                result.first |= child_halves.first;
+                result.second |= child_halves.second;
+            }
+        }
+        halves.set(id, result);
+        return result;
+    };
+    for (auto item : m_root) {
+        if (item.is_folder())
+            (void)collect(collect, item.id);
+    }
+
+    // A folder without tabs takes the half of its nearest ancestor with tabs.
+    auto assign = [&](auto& self, TabFolderId id, Optional<Halves> inherited) -> void {
+        auto own = halves.get(id).value();
+        Optional<Halves> passed_down = inherited;
+        if (has_tabs(own)) {
+            passed_down = own;
+        } else {
+            halves.set(id, inherited.has_value() && only_one(*inherited) ? *inherited : default_halves);
+        }
+        for (auto child : children(id)) {
+            if (child.is_folder())
+                self(self, child.id, passed_down);
+        }
+    };
+    for (auto item : m_root) {
+        if (item.is_folder())
+            assign(assign, item.id, {});
+    }
+
+    auto build = [&](bool first) {
+        TabFolderTree tree;
+        tree.m_last_folder_id = m_last_folder_id;
+        auto copy = [&](auto& self, Vector<Item> const& items, Optional<TabFolderId> parent) -> void {
+            for (auto item : items) {
+                if (item.is_tab()) {
+                    if (in_first(item.id) == first)
+                        tree.insert(item, parent, NumericLimits<size_t>::max());
+                    continue;
+                }
+                auto folder_halves = halves.get(item.id).value();
+                if (!(first ? folder_halves.first : folder_halves.second))
+                    continue;
+                auto const& node = m_folders.get(item.id).value();
+                tree.m_folders.set(item.id, FolderNode { .folder = node.folder, .parent = {}, .children = {} });
+                tree.insert(item, parent, NumericLimits<size_t>::max());
+                self(self, node.children, item.id);
+            }
+        };
+        copy(copy, m_root, {});
+        return tree;
+    };
+    return Split { build(true), build(false) };
 }
 
 TabFolderTree TabFolderTree::with_remapped_tabs(Function<Optional<TabKey>(TabKey)> const& remap) const

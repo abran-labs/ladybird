@@ -2898,3 +2898,94 @@ TEST_CASE(an_exit_that_keeps_pinned_tabs_forgets_folders_without_pinned_tabs)
     EXPECT_EQ(select_i64(*database, "SELECT COUNT(*) FROM Sessions WHERE tab_folders LIKE '%Kept%';"_string), 1);
     EXPECT_EQ(select_i64(*database, "SELECT COUNT(*) FROM Sessions WHERE tab_folders LIKE '%ecret%';"_string), 0);
 }
+
+TEST_CASE(pinned_only_keeps_an_empty_folder_inside_a_pinned_tabs_folder)
+{
+    auto database = create_session_database();
+    SessionWindowId window = 0;
+    SessionTabId pinned = 0;
+    SessionTabId unpinned = 0;
+    TabFolderId work = 0;
+    TabFolderId ideas = 0;
+    {
+        auto store = TRY_OR_FAIL(SessionStore::create(*database));
+        window = TRY_OR_FAIL(store->window_opened());
+        pinned = open_tab(*store, window, "https://a.example/"sv);
+        unpinned = open_tab(*store, window, "https://b.example/"sv);
+        TRY_OR_FAIL(store->tab_pinned_changed(pinned, true));
+        auto tree = folder_tree_for({ pinned, unpinned });
+        work = tree.create_folder_around("Work"_string, { TabFolderTree::Item::tab(pinned) }).release_value();
+        ideas = tree.create_folder("Ideas"_string, TabFolderTree::Destination::at_end_of(work)).release_value();
+        TRY_OR_FAIL(store->tab_folders_changed(window, tree));
+        quit_cleanly(*store, { window });
+    }
+
+    auto store = TRY_OR_FAIL(SessionStore::create(*database, SessionLaunchPolicy::PinnedOnly));
+    auto plan = store->take_launch_plan();
+    EXPECT_EQ(plan.size(), 1uz);
+    EXPECT(plan[0].tab_folders.has_value());
+    EXPECT_EQ(plan[0].tab_folders->children(work), (Vector<TabFolderTree::Item> { TabFolderTree::Item::tab(pinned), TabFolderTree::Item::folder(ideas) }));
+
+    auto unit = TRY_OR_FAIL(store->take_most_recently_closed());
+    EXPECT(unit.has_value());
+    EXPECT_EQ(unit->tabs.size(), 1uz);
+    // The remainder holds only the unpinned root tab, so it has no folders of its own.
+    EXPECT(!unit->tab_folders.has_value());
+
+    // And the pinned window's folders were written, so a later run keeps Ideas too.
+    store->mark_clean_exit();
+    store = TRY_OR_FAIL(SessionStore::create(*database, SessionLaunchPolicy::PinnedOnly));
+    plan = store->take_launch_plan();
+    EXPECT_EQ(plan.size(), 1uz);
+    EXPECT(plan[0].tab_folders.has_value());
+    EXPECT(plan[0].tab_folders->folder(ideas).has_value());
+}
+
+TEST_CASE(a_folder_tree_too_large_to_save_is_refused_and_keeps_the_saved_one)
+{
+    auto database = create_session_database();
+    auto store = TRY_OR_FAIL(SessionStore::create(*database));
+    auto window = TRY_OR_FAIL(store->window_opened());
+    auto a = open_tab(*store, window, "https://a.example/"sv);
+
+    auto tree = folder_tree_for({ a });
+    (void)tree.create_folder_around("Kept"_string, { TabFolderTree::Item::tab(a) });
+    TRY_OR_FAIL(store->tab_folders_changed(window, tree));
+
+    // Far more tab keys than any window holds, so the saved form would pass the read limit.
+    auto huge = tree;
+    for (i64 i = 0; i < 300'000; ++i)
+        (void)huge.add_tab(1'000'000'000'000'000 + i);
+    EXPECT(huge.serialize().byte_count() > SessionStore::MAX_TAB_FOLDERS_BYTES);
+    EXPECT(store->tab_folders_changed(window, huge).is_error());
+
+    // The refusal leaves what was saved, and later writes don't pick up the refused tree.
+    (void)open_tab(*store, window, "https://b.example/"sv);
+    EXPECT_EQ(select_i64(*database, "SELECT COUNT(*) FROM Sessions WHERE tab_folders LIKE '%Kept%' AND length(tab_folders) < 1000;"_string), 1);
+}
+
+TEST_CASE(an_exit_that_keeps_pinned_tabs_keeps_empty_folders_inside_kept_ones)
+{
+    auto database = create_session_database();
+    TabFolderId work = 0;
+    TabFolderId ideas = 0;
+    SessionTabId pinned = 0;
+    {
+        auto store = TRY_OR_FAIL(SessionStore::create(*database));
+        auto window = TRY_OR_FAIL(store->window_opened());
+        pinned = open_tab(*store, window, "https://a.example/"sv);
+        auto unpinned = open_tab(*store, window, "https://b.example/"sv);
+        TRY_OR_FAIL(store->tab_pinned_changed(pinned, true));
+        auto tree = folder_tree_for({ pinned, unpinned });
+        work = tree.create_folder_around("Work"_string, { TabFolderTree::Item::tab(pinned) }).release_value();
+        ideas = tree.create_folder("Ideas"_string, TabFolderTree::Destination::at_end_of(work)).release_value();
+        TRY_OR_FAIL(store->tab_folders_changed(window, tree));
+        quit_cleanly(*store, { window }, SessionStore::AfterExit::KeepPinnedTabs);
+    }
+
+    auto store = TRY_OR_FAIL(SessionStore::create(*database, SessionLaunchPolicy::PinnedOnly));
+    auto plan = store->take_launch_plan();
+    EXPECT_EQ(plan.size(), 1uz);
+    EXPECT(plan[0].tab_folders.has_value());
+    EXPECT_EQ(plan[0].tab_folders->children(work), (Vector<TabFolderTree::Item> { TabFolderTree::Item::tab(pinned), TabFolderTree::Item::folder(ideas) }));
+}

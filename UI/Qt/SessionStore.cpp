@@ -36,7 +36,6 @@ static constexpr u32 UNCLEAN_EXITS_THAT_STOP_LAUNCH_RESTORE = 2;
 static constexpr u32 MAX_CLOSED_TABS = 25;
 static constexpr u32 MAX_CLOSED_WINDOWS = 5;
 static constexpr size_t MAX_ACTIVE_URL_BYTES = 8uz * 1024 * 1024;
-static constexpr size_t MAX_TAB_FOLDERS_BYTES = 4uz * 1024 * 1024;
 static constexpr int FLUSH_TIMER_INTERVAL_MILLISECONDS = 30'000;
 
 static i64 index_as_i64(size_t index)
@@ -965,7 +964,7 @@ ErrorOr<Optional<TabFolderTree>> SessionStore::PersistedStorage::read_session_ta
             return bind("id"sv, window_id);
         },
         [&](Database::ResultRow& row) -> ErrorOr<void> {
-            auto text = row.read_optional_text("tab_folders"sv, MAX_TAB_FOLDERS_BYTES);
+            auto text = row.read_optional_text("tab_folders"sv, SessionStore::MAX_TAB_FOLDERS_BYTES);
             if (!text.is_error())
                 serialized = text.release_value();
             return {};
@@ -973,7 +972,8 @@ ErrorOr<Optional<TabFolderTree>> SessionStore::PersistedStorage::read_session_ta
     return parse_tab_folders(serialized, allowed_tabs);
 }
 
-// After the tabs that aren't kept are gone, so are the folders that held none of the kept ones, names and all.
+// After the tabs that aren't kept are gone, so are the folders that held none of the kept ones, names and all, except the
+// empty folders inside a folder of kept tabs.
 ErrorOr<void> SessionStore::PersistedStorage::forget_folders_without_kept_tabs()
 {
     Vector<SessionWindowId> sessions;
@@ -991,7 +991,7 @@ ErrorOr<void> SessionStore::PersistedStorage::forget_folders_without_kept_tabs()
             kept_tabs.set(tab.id);
         auto tree = TRY(read_session_tab_folders(session_id, kept_tabs));
         if (tree.has_value())
-            tree->remove_folders_without_tabs();
+            tree->remove_folders_outside_tabbed_ones();
         TRY(write_session_tab_folders(session_id, tree));
     }
     return {};
@@ -1211,21 +1211,14 @@ ErrorOr<SessionStore::RecoveryResult> SessionStore::PersistedStorage::recover_op
             Optional<TabFolderTree> pinned_tab_folders;
             Optional<TabFolderTree> unpinned_tab_folders;
             if (all_tab_folders.has_value()) {
-                pinned_tab_folders = all_tab_folders->with_remapped_tabs([&](auto key) -> Optional<SessionTabId> {
-                    return pinned_tab_ids.contains(key) ? Optional<SessionTabId> { key } : Optional<SessionTabId> {};
-                });
-                pinned_tab_folders->remove_folders_without_tabs();
-                unpinned_tab_folders = all_tab_folders->with_remapped_tabs([&](auto key) -> Optional<SessionTabId> {
-                    return unpinned_tab_ids.contains(key) ? Optional<SessionTabId> { key } : Optional<SessionTabId> {};
-                });
-                for (auto const& entry : all_tab_folders->folders_in_order()) {
-                    if (unpinned_tab_folders->folder(entry.id).has_value() && unpinned_tab_folders->tabs_inside(entry.id).is_empty() && !all_tab_folders->tabs_inside(entry.id).is_empty())
-                        (void)unpinned_tab_folders->delete_folder(entry.id);
-                }
-                if (!pinned_tab_folders->has_folders())
-                    pinned_tab_folders.clear();
-                if (!unpinned_tab_folders->has_folders())
-                    unpinned_tab_folders.clear();
+                // A folder without tabs stays with the half its tabbed ancestor went to, or else with the remainder
+                // when there is one, since a remainder without tabs leaves no unit to keep it in.
+                auto default_half = unpinned_tabs.is_empty() ? TabFolderTree::SplitHalf::First : TabFolderTree::SplitHalf::Second;
+                auto split = all_tab_folders->split([&](auto key) { return pinned_tab_ids.contains(key); }, default_half);
+                if (split.first.has_folders())
+                    pinned_tab_folders = move(split.first);
+                if (split.second.has_folders())
+                    unpinned_tab_folders = move(split.second);
             }
 
             if (!pinned_tabs.is_empty()) {
@@ -1411,7 +1404,7 @@ ErrorOr<Vector<SessionStore::ClosedUnit>> SessionStore::PersistedStorage::load_c
                 auto session_id = row.read_integer<i64>("id"sv);
                 auto closed_time = row.read_integer<i64>("closed_time"sv);
                 auto geometry = read_window_geometry(row);
-                auto tab_folders = row.read_optional_text("tab_folders"sv, MAX_TAB_FOLDERS_BYTES);
+                auto tab_folders = row.read_optional_text("tab_folders"sv, SessionStore::MAX_TAB_FOLDERS_BYTES);
 
                 Optional<ClosedSessionUnit::Origin> validated_origin;
                 if (!origin.is_error()) {
@@ -2036,6 +2029,9 @@ ErrorOr<void> SessionStore::tab_pinned_changed(SessionTabId tab_id, bool pinned)
 
 ErrorOr<void> SessionStore::tab_folders_changed(SessionWindowId window_id, TabFolderTree const& tree)
 {
+    // Refused rather than written, since a saved tree past the read limit would come back as no folders at all.
+    if (tree.has_folders() && tree.serialize().byte_count() > MAX_TAB_FOLDERS_BYTES)
+        return Error::from_string_literal("Tab folders are too large to save");
     if (!m_transient_storage.set_tab_folders(window_id, tree))
         return {};
     return drain_window_metadata();
