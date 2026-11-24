@@ -8,11 +8,51 @@
 
 #include <UI/Qt/StringUtils.h>
 
+#include <QColor>
 #include <QHash>
 #include <QMenu>
 #include <QPointer>
 
 namespace Ladybird::TabFolderMenus {
+
+QString effective_folder_color(TabFolderTree::Folder const& folder)
+{
+    if (folder.color.has_value())
+        return qstring_from_ak_string(*folder.color);
+    auto const& colors = TabFolderTree::FOLDER_COLORS;
+    auto index = static_cast<size_t>(folder.id < 0 ? -folder.id : folder.id) % colors.size();
+    return qstring_from_ak_string(colors[index]);
+}
+
+QColor folder_color(QString const& name, bool dark)
+{
+    struct Entry {
+        char const* name;
+        QRgb light;
+        QRgb dark;
+    };
+    static constexpr Entry entries[] {
+        { "grey", 0x5F6368, 0xDADCE0 },
+        { "blue", 0x1A73E8, 0x8AB4F8 },
+        { "red", 0xD93025, 0xF28B82 },
+        { "yellow", 0xE37400, 0xFDD663 },
+        { "green", 0x1E8E3E, 0x81C995 },
+        { "pink", 0xD01884, 0xFF8BCB },
+        { "purple", 0x9334E6, 0xC58AF9 },
+        { "cyan", 0x007B83, 0x78D9EC },
+        { "orange", 0xE8710A, 0xFCAD70 },
+    };
+    for (auto const& entry : entries) {
+        if (name == QLatin1String(entry.name))
+            return QColor(dark ? entry.dark : entry.light);
+    }
+    return QColor(dark ? entries[0].dark : entries[0].light);
+}
+
+QColor folder_color_text(bool dark)
+{
+    return dark ? QColor(0x20, 0x21, 0x24) : QColor(Qt::white);
+}
 
 Action exec_folder(QWidget* parent, QPoint const& global_pos)
 {

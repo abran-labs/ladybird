@@ -9,7 +9,9 @@
 #include <UI/Qt/TabFolderTree.h>
 #include <functional>
 
+class QColor;
 class QMenu;
+class QString;
 class QPoint;
 class QWidget;
 
@@ -23,6 +25,13 @@ enum class Action {
     Unpack,
     Delete,
 };
+
+// How a folder's named color looks on the horizontal strip, in a light or a dark window. A folder without a color of its
+// own takes one from its id, so that groups side by side tell apart, as Chromium gives each new group the next color.
+QString effective_folder_color(TabFolderTree::Folder const&);
+QColor folder_color(QString const& name, bool dark);
+// What reads on a chip of that color.
+QColor folder_color_text(bool dark);
 
 Action exec_folder(QWidget* parent, QPoint const& global_pos);
 

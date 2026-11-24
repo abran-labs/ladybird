@@ -203,6 +203,8 @@ public:
     void clear_tab_folder_selection();
     void show_tab_context_menu(Tab&, QPoint global_position);
     void show_tab_folder_context_menu(TabFolderId, QPoint global_position);
+    // The menu of a group's chip on the horizontal strip, modeled on Chromium's tab group editor.
+    void show_strip_group_context_menu(TabFolderId, QPoint global_position);
     void show_sidebar_context_menu(QPoint global_position);
     Tab* current_tab() const { return m_current_tab; }
 

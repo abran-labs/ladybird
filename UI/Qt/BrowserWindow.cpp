@@ -58,6 +58,7 @@
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
+#include <QPixmap>
 #include <QPlatformSurfaceEvent>
 #include <QPropertyAnimation>
 #include <QPushButton>
@@ -447,7 +448,10 @@ BrowserWindow::BrowserWindow(Vector<URL::URL> const& initial_urls, IsPopupWindow
                     if (auto id = tab->session_tab_id(); id.has_value())
                         tabs.append({ *id, tab->is_pinned() });
                 }
-                TabFolderSync::follow_window_move(m_tab_folders, tabs, *key);
+                if (m_tabs_container->tab_bar()->tab_layout() == TabLayout::Horizontal)
+                    TabFolderSync::follow_strip_move(m_tab_folders, tabs, *key);
+                else
+                    TabFolderSync::follow_window_move(m_tab_folders, tabs, *key);
             }
             update_tab_folders();
         }
@@ -844,6 +848,45 @@ void BrowserWindow::update_tab_folders(Optional<TabFolderTree::TabKey> new_tab_a
     }
     m_tabs_container->tab_bar()->set_sidebar_rows(AK::move(rows), sidebar_tree.has_folders(), m_folder_selection.keys);
 
+    // The horizontal strip shows the same tree: a chip for each top-level folder, before its tabs.
+    {
+        auto tab_for_key = [&](TabFolderTree::TabKey key) -> Tab* {
+            for (int i = 0; i < m_tabs_container->count(); ++i) {
+                if (auto* tab = m_tabs_container->tab(i); tab->session_tab_id() == key)
+                    return tab;
+            }
+            return nullptr;
+        };
+        auto strip = TabFolderSync::strip_groups(sidebar_tree, tabs, active);
+        Vector<TabBar::StripChip> chips;
+        for (auto const& group : strip.chips) {
+            auto folder = sidebar_tree.folder(group.folder);
+            if (!folder.has_value())
+                continue;
+            TabBar::StripChip chip;
+            chip.folder = group.folder;
+            chip.name = qstring_from_ak_string(folder->name);
+            chip.color = TabFolderMenus::effective_folder_color(*folder);
+            chip.collapsed = group.collapsed;
+            chip.provisional = provisional_folder == group.folder;
+            if (group.before_tab.has_value())
+                chip.before_tab = tab_for_key(*group.before_tab);
+            chips.append(AK::move(chip));
+        }
+        HashMap<Tab const*, TabFolderId> group_of_tab;
+        HashTable<Tab const*> hidden;
+        for (size_t i = 0; i < tabs.size(); ++i) {
+            auto* tab = tab_for_key(tabs[i].key);
+            if (!tab)
+                continue;
+            if (strip.group_of_tab[i].has_value())
+                group_of_tab.set(tab, *strip.group_of_tab[i]);
+            if (strip.hidden[i])
+                hidden.set(tab);
+        }
+        m_tabs_container->tab_bar()->set_strip_groups(AK::move(chips), AK::move(group_of_tab), AK::move(hidden));
+    }
+
     if (!m_session_window_id.has_value())
         return;
     if (!m_tab_folders.has_folders()) {
@@ -1038,6 +1081,10 @@ void BrowserWindow::show_tab_context_menu(Tab& tab, QPoint global_position)
     menu->addSeparator();
     menu->addAction(Application::the().reopen_recently_closed_tab_action());
     Optional<TabFolderId> folder;
+    if (horizontal) {
+        if (auto clicked_key = tab.session_tab_id(); clicked_key.has_value() && !tab.is_pinned())
+            keys = { *clicked_key };
+    }
     if (!keys.is_empty()) {
         TabFolderMenus::add_move_menu(*menu, m_tab_folders, [&](TabFolderId id) {
             command = Command::MoveToFolder;
@@ -1224,6 +1271,158 @@ void BrowserWindow::show_tab_folder_context_menu(TabFolderId id, QPoint global_p
             update_tab_folders();
         return;
     case TabFolderMenus::Action::Delete:
+        break;
+    }
+
+    if (m_window_close_coordinator.is_running() || m_window_close_approved)
+        return;
+    if (m_tab_folders.delete_empty_folder(id)) {
+        update_tab_folders();
+        return;
+    }
+    begin_window_close_preflight({}, id);
+}
+
+void BrowserWindow::show_strip_group_context_menu(TabFolderId id, QPoint global_position)
+{
+    auto folder = m_tab_folders.folder(id);
+    if (!folder.has_value())
+        return;
+
+    enum class Command {
+        None,
+        Rename,
+        Color,
+        NewTab,
+        Ungroup,
+        Close,
+        ActivateTab,
+    };
+    Command command = Command::None;
+    QString chosen_color;
+    Optional<TabFolderTree::TabKey> chosen_tab;
+
+    QPointer<BrowserWindow> window = this;
+    QPointer menu = new QMenu(this);
+    menu->addAction(QStringLiteral("&Rename Group…"), [&] { command = Command::Rename; });
+    auto* colors = menu->addMenu(QStringLiteral("&Color"));
+    auto current_color = TabFolderMenus::effective_folder_color(*folder);
+    auto dark = Theme::is_dark(*this);
+    for (auto name : TabFolderTree::FOLDER_COLORS) {
+        auto color_name = qstring_from_ak_string(name);
+        auto label = color_name;
+        label[0] = label[0].toUpper();
+        QPixmap swatch(14, 14);
+        swatch.fill(Qt::transparent);
+        {
+            QPainter painter(&swatch);
+            painter.setRenderHint(QPainter::Antialiasing);
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(TabFolderMenus::folder_color(color_name, dark));
+            painter.drawEllipse(QRectF(1, 1, 12, 12));
+        }
+        auto* action = colors->addAction(QIcon(swatch), label, [&, color_name] {
+            command = Command::Color;
+            chosen_color = color_name;
+        });
+        action->setCheckable(true);
+        action->setChecked(color_name == current_color);
+    }
+    menu->addSeparator();
+    menu->addAction(QStringLiteral("&New Tab in Group"), [&] { command = Command::NewTab; });
+
+    // Folders inside the group keep their places in the tree; the strip reaches them, and their tabs, from here.
+    auto add_nested = [&](auto& self, QMenu& parent_menu, TabFolderId parent) -> void {
+        for (auto item : m_tab_folders.children(parent)) {
+            if (!item.is_folder())
+                continue;
+            auto nested = m_tab_folders.folder(item.id);
+            auto label = nested->name.is_empty() ? QStringLiteral("Untitled Folder") : qstring_from_ak_string(nested->name);
+            label.replace(QLatin1Char('&'), QStringLiteral("&&"));
+            auto* submenu = parent_menu.addMenu(label);
+            self(self, *submenu, item.id);
+            auto first_tab = true;
+            for (auto child : m_tab_folders.children(item.id)) {
+                if (!child.is_tab())
+                    continue;
+                if (first_tab && !submenu->isEmpty())
+                    submenu->addSeparator();
+                first_tab = false;
+                auto key = child.id;
+                QString title;
+                for (int i = 0; i < tab_count(); ++i) {
+                    if (tab_at(i)->session_tab_id() == key)
+                        title = tab_at(i)->title();
+                }
+                if (title.isEmpty())
+                    title = QStringLiteral("Untitled");
+                title.replace(QLatin1Char('&'), QStringLiteral("&&"));
+                submenu->addAction(title, [&, key] {
+                    command = Command::ActivateTab;
+                    chosen_tab = key;
+                });
+            }
+            if (submenu->isEmpty())
+                submenu->setEnabled(false);
+        }
+    };
+    if (m_tab_folders.children(id).contains([](auto item) { return item.is_folder(); })) {
+        auto* nested = menu->addMenu(QStringLiteral("&Folders in Group"));
+        add_nested(add_nested, *nested, id);
+    }
+    menu->addSeparator();
+    menu->addAction(QStringLiteral("&Ungroup"), [&] { command = Command::Ungroup; });
+    menu->addAction(QStringLiteral("&Close Group"), [&] { command = Command::Close; });
+
+    execute_context_menu(*menu, global_position);
+    delete menu.data();
+    if (!window || !m_tab_folders.folder(id).has_value())
+        return;
+
+    switch (command) {
+    case Command::None:
+        return;
+    case Command::Rename: {
+        auto current = qstring_from_ak_string(m_tab_folders.folder(id)->name);
+        m_tabs_container->tab_bar()->edit_folder_name(id, current, [this, id](Optional<String> name) {
+            if (name.has_value() && m_tab_folders.rename_folder(id, name.release_value()))
+                update_tab_folders();
+        });
+        return;
+    }
+    case Command::Color:
+        if (m_tab_folders.set_folder_color(id, ak_string_from_qstring(chosen_color)))
+            update_tab_folders();
+        return;
+    case Command::NewTab: {
+        (void)m_tab_folders.set_folder_collapsed(id, false);
+        auto keys = m_tab_folders.tabs_inside(id);
+        Tab* last = nullptr;
+        for (int i = 0; i < tab_count(); ++i) {
+            if (auto key = tab_at(i)->session_tab_id(); key.has_value() && keys.contains_slow(*key) && !tab_at(i)->is_pinned())
+                last = tab_at(i);
+        }
+        auto& tab = last ? new_tab_from_url(Application::settings().new_tab_page_url(), Web::HTML::ActivateTab::Yes, TabLocation::after_tab(*last))
+                         : new_tab_from_url(Application::settings().new_tab_page_url(), Web::HTML::ActivateTab::Yes, TabLocation::end());
+        if (auto key = tab.session_tab_id(); key.has_value() && !m_tab_folders.is_inside(TabFolderTree::Item::tab(*key), id))
+            move_tab_folder_items({ TabFolderTree::Item::tab(*key) }, TabFolderDestination::at_end_of(id));
+        else
+            update_tab_folders();
+        return;
+    }
+    case Command::ActivateTab:
+        for (int i = 0; i < tab_count(); ++i) {
+            if (tab_at(i)->session_tab_id() == chosen_tab) {
+                activate_tab(i);
+                break;
+            }
+        }
+        return;
+    case Command::Ungroup:
+        if (m_tab_folders.unpack_folder(id))
+            update_tab_folders();
+        return;
+    case Command::Close:
         break;
     }
 

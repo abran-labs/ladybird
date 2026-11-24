@@ -6,6 +6,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/AllOf.h>
 #include <AK/Array.h>
 #include <AK/Function.h>
 #include <AK/QuickSort.h>
@@ -37,6 +38,7 @@
 #include <UI/Qt/TabBar.h>
 #include <UI/Qt/TabFolderEditing.h>
 #include <UI/Qt/TabFolderDrag.h>
+#include <UI/Qt/TabFolderMenus.h>
 #include <UI/Qt/Theme.h>
 #if defined(LADYBIRD_HAS_WAYLAND_CLIENT)
 #    include <UI/Qt/WaylandWindow.h>
@@ -186,6 +188,17 @@ static constexpr qreal VERTICAL_DROP_INDICATOR_DOT_RADIUS = 3.5;
 static constexpr qreal CLOSING_TAB_FADE_PORTION = 0.4;
 // The first and last tabs are this much wider, on the outer side, to make room for their feet at the ends of the tab bar.
 static constexpr int HORIZONTAL_TAB_END_ROOM = 8;
+// A tab group's chip on the horizontal strip, modeled on Chromium's tab group header: a rounded, colored label with the
+// group's name, which the selected tab's foot beside it never reaches.
+static constexpr int STRIP_CHIP_GAP = 8;
+static constexpr int STRIP_CHIP_HEIGHT = 22;
+static constexpr qreal STRIP_CHIP_RADIUS = 6;
+static constexpr int STRIP_CHIP_PADDING = 8;
+static constexpr int STRIP_CHIP_EMPTY_WIDTH = 14;
+static constexpr int STRIP_CHIP_EMPTY_HEIGHT = 14;
+static constexpr int STRIP_CHIP_MAX_TEXT_WIDTH = 110;
+static constexpr int STRIP_CHIP_EDITING_WIDTH = 140;
+static constexpr int STRIP_GROUP_UNDERLINE_THICKNESS = 2;
 static_assert(HORIZONTAL_TAB_END_ROOM >= HORIZONTAL_TAB_FOOT_RADIUS);
 // Each end of a tab's content is about as far from the tab's side as it is from the tab's top: the favicon 7 px in from
 // the left, and the close button's glyph 11 px in from the right.
@@ -356,10 +369,6 @@ static QRectF tab_card_shape_rect(QRectF const& rect)
     return rect.adjusted(TAB_CARD_SHAPE_HORIZONTAL_INSET, TAB_CARD_SHAPE_TOP_INSET, -TAB_CARD_SHAPE_HORIZONTAL_INSET, -TAB_CARD_SHAPE_BOTTOM_INSET);
 }
 
-static HorizontalTabEndRoom settled_horizontal_tab_end_room(int index, int count)
-{
-    return { index == 0 ? static_cast<qreal>(HORIZONTAL_TAB_END_ROOM) : 0, index == count - 1 ? static_cast<qreal>(HORIZONTAL_TAB_END_ROOM) : 0 };
-}
 
 // How much of its padding a horizontal tab keeps, from all of it at the padded width down to none at the minimum width.
 static qreal horizontal_tab_padding_scale(QRectF const& rect, HorizontalTabEndRoom end_room)
@@ -895,6 +904,289 @@ bool TabBar::uses_sidebar_rows() const
     return m_has_sidebar_rows && tab_layout() != TabLayout::Horizontal;
 }
 
+void TabBar::set_strip_groups(Vector<StripChip> chips, HashMap<Tab const*, TabFolderId> group_of_tab, HashTable<Tab const*> hidden)
+{
+    auto same_hidden = m_strip_hidden.size() == hidden.size() && all_of(hidden, [&](auto const* tab) { return m_strip_hidden.contains(tab); });
+    if (m_strip_chips == chips && m_strip_group_of_tab == group_of_tab && same_hidden)
+        return;
+    m_strip_chips = AK::move(chips);
+    m_strip_group_of_tab = AK::move(group_of_tab);
+    m_strip_hidden = AK::move(hidden);
+    if (m_pressed_chip.has_value() && !m_strip_chips.contains([&](auto const& chip) { return chip.folder == *m_pressed_chip; }))
+        m_pressed_chip.clear();
+    apply_strip_groups();
+}
+
+// Tabs in a collapsed group leave the horizontal strip, as QTabBar's own hidden tabs, so that its layout, scrolling and
+// tab lookup pass them over. Every tab is shown in the vertical layouts, which place their tabs themselves.
+void TabBar::apply_strip_groups()
+{
+    if (!m_tab_widget)
+        return;
+    auto horizontal = tab_layout() == TabLayout::Horizontal;
+    for (int index = 0; index < count(); ++index) {
+        auto* tab = m_tab_widget->tab(index);
+        // NB: The current tab is never hidden, or QTabBar would move the selection away from it.
+        auto shown = !horizontal || !tab || index == currentIndex() || !m_strip_hidden.contains(tab);
+        if (isTabVisible(index) != shown)
+            setTabVisible(index, shown);
+    }
+    if (horizontal) {
+        refresh_tab_layout();
+        if (m_tab_widget)
+            m_tab_widget->update_tab_layout();
+    }
+    update();
+}
+
+bool TabBar::is_tab_shown_on_strip(int index) const
+{
+    if (index < 0 || index >= count())
+        return false;
+    return tab_layout() != TabLayout::Horizontal || isTabVisible(index);
+}
+
+Optional<int> TabBar::first_visible_tab() const
+{
+    return next_visible_tab(-1);
+}
+
+Optional<int> TabBar::last_visible_tab() const
+{
+    return previous_visible_tab(count());
+}
+
+Optional<int> TabBar::previous_visible_tab(int index) const
+{
+    for (auto candidate = min(index, count()) - 1; candidate >= 0; --candidate) {
+        if (is_tab_shown_on_strip(candidate))
+            return candidate;
+    }
+    return {};
+}
+
+Optional<int> TabBar::next_visible_tab(int index) const
+{
+    for (auto candidate = max(index, -1) + 1; candidate < count(); ++candidate) {
+        if (is_tab_shown_on_strip(candidate))
+            return candidate;
+    }
+    return {};
+}
+
+int TabBar::visible_unpinned_tab_count() const
+{
+    auto visible = 0;
+    for (auto index = pinned_tab_count(); index < count(); ++index) {
+        if (is_tab_shown_on_strip(index))
+            ++visible;
+    }
+    return visible;
+}
+
+// A chip sits before the first shown tab from the one it belongs before, or after the last shown tab when there's none.
+Optional<TabBar::ChipAnchor> TabBar::chip_anchor(StripChip const& chip) const
+{
+    if (tab_layout() != TabLayout::Horizontal || !m_tab_widget || count() == 0)
+        return {};
+    if (chip.before_tab) {
+        if (auto index = m_tab_widget->index_of(chip.before_tab); index >= 0) {
+            if (auto shown = next_visible_tab(index - 1); shown.has_value())
+                return ChipAnchor { *shown, false };
+        }
+    }
+    if (auto last = last_visible_tab(); last.has_value())
+        return ChipAnchor { *last, true };
+    return {};
+}
+
+int TabBar::strip_chip_width(StripChip const& chip) const
+{
+    if (m_folder_name_editor && (chip.provisional || m_edited_folder == chip.folder))
+        return STRIP_CHIP_EDITING_WIDTH;
+    if (chip.name.isEmpty())
+        return STRIP_CHIP_EMPTY_WIDTH;
+    // NB: Rounded up, with a pixel to spare, so that a name that fits is never elided by the painter's own rounding.
+    QFontMetricsF metrics(ChromeStyle::chrome_title_font(font()));
+    auto text_width = static_cast<int>(ceil(metrics.horizontalAdvance(chip.name))) + 1;
+    return min(text_width, STRIP_CHIP_MAX_TEXT_WIDTH) + (2 * STRIP_CHIP_PADDING);
+}
+
+int TabBar::strip_chip_room(StripChip const& chip) const
+{
+    // NB: The selected tab's foot reaches HORIZONTAL_TAB_FOOT_RADIUS past its body on either side, which the gaps leave
+    //     room for.
+    return strip_chip_width(chip) + (2 * STRIP_CHIP_GAP);
+}
+
+int TabBar::leading_chip_room(int index) const
+{
+    auto room = 0;
+    for (auto const& chip : m_strip_chips) {
+        if (auto anchor = chip_anchor(chip); anchor.has_value() && anchor->index == index && !anchor->trailing)
+            room += strip_chip_room(chip);
+    }
+    return room;
+}
+
+int TabBar::trailing_chip_room(int index) const
+{
+    auto room = 0;
+    for (auto const& chip : m_strip_chips) {
+        if (auto anchor = chip_anchor(chip); anchor.has_value() && anchor->index == index && anchor->trailing)
+            room += strip_chip_room(chip);
+    }
+    return room;
+}
+
+int TabBar::strip_chips_width() const
+{
+    auto width = 0;
+    for (auto const& chip : m_strip_chips) {
+        if (chip_anchor(chip).has_value())
+            width += strip_chip_room(chip);
+    }
+    return width;
+}
+
+HorizontalTabEndRoom TabBar::settled_end_room(int index) const
+{
+    // A chip at either end of the strip takes the room the selected tab's foot needs there.
+    auto left = index == first_visible_tab() && leading_chip_room(index) == 0 ? static_cast<qreal>(HORIZONTAL_TAB_END_ROOM) : 0;
+    auto right = index == last_visible_tab() && trailing_chip_room(index) == 0 ? static_cast<qreal>(HORIZONTAL_TAB_END_ROOM) : 0;
+    return { left, right };
+}
+
+// Where a horizontal tab sits on the strip, before any scrolling, without the room for the chips beside it.
+QRect TabBar::strip_tab_rect_unscrolled(int index) const
+{
+    auto rect = tabRect(index);
+    if (!rect.isValid())
+        return {};
+    return rect.adjusted(leading_chip_room(index), 0, -trailing_chip_room(index), 0);
+}
+
+Optional<QRect> TabBar::strip_chip_rect(TabFolderId folder) const
+{
+    if (tab_layout() != TabLayout::Horizontal)
+        return {};
+    for (size_t i = 0; i < m_strip_chips.size(); ++i) {
+        auto const& chip = m_strip_chips[i];
+        if (chip.folder != folder)
+            continue;
+        auto anchor = chip_anchor(chip);
+        if (!anchor.has_value())
+            return {};
+        auto tab = tabRect(anchor->index).translated(-m_scroll_offset, 0);
+        auto x = anchor->trailing ? tab.right() + 1 - trailing_chip_room(anchor->index) : tab.left();
+        for (size_t j = 0; j < i; ++j) {
+            auto other = chip_anchor(m_strip_chips[j]);
+            if (other.has_value() && other->index == anchor->index && other->trailing == anchor->trailing)
+                x += strip_chip_room(m_strip_chips[j]);
+        }
+        auto width = strip_chip_width(chip);
+        auto height = chip.name.isEmpty() && !(m_folder_name_editor && (chip.provisional || m_edited_folder == chip.folder)) ? STRIP_CHIP_EMPTY_HEIGHT : STRIP_CHIP_HEIGHT;
+        auto card_top = tab.top() + HORIZONTAL_TAB_CARD_SHAPE_TOP_INSET;
+        auto card_height = HORIZONTAL_TAB_HEIGHT - HORIZONTAL_TAB_CARD_SHAPE_TOP_INSET - HORIZONTAL_TAB_CARD_SHAPE_BOTTOM_INSET;
+        return QRect { x + STRIP_CHIP_GAP, card_top + ((card_height - height) / 2), width, height };
+    }
+    return {};
+}
+
+Optional<QRect> TabBar::provisional_chip_rect() const
+{
+    for (auto const& chip : m_strip_chips) {
+        if (chip.provisional)
+            return strip_chip_rect(chip.folder);
+    }
+    return {};
+}
+
+Optional<TabFolderId> TabBar::strip_chip_at(QPoint const& position) const
+{
+    if (tab_layout() != TabLayout::Horizontal || !rect().contains(position))
+        return {};
+    for (auto const& chip : m_strip_chips) {
+        if (chip.provisional)
+            continue;
+        // NB: The whole height of the strip around the chip takes the click, like the rest of a tab does.
+        if (auto chip_rect = strip_chip_rect(chip.folder); chip_rect.has_value() && position.x() >= chip_rect->left() - (STRIP_CHIP_GAP / 2) && position.x() <= chip_rect->right() + (STRIP_CHIP_GAP / 2))
+            return chip.folder;
+    }
+    return {};
+}
+
+void TabBar::set_hovered_chip(Optional<TabFolderId> chip)
+{
+    if (m_hovered_chip == chip)
+        return;
+    m_hovered_chip = chip;
+    update();
+}
+
+// Each group's chip, and a line in its color under the chip and the group's shown tabs, as Chromium draws a tab group's
+// header and underline.
+void TabBar::paint_strip_groups(QPainter& painter)
+{
+    if (m_strip_chips.is_empty() || !m_tab_widget)
+        return;
+    auto dark = Theme::is_dark(*this);
+    auto inactive = ChromeStyle::window_activity(*this) == ChromeStyle::WindowActivity::Inactive;
+    auto title_font = ChromeStyle::chrome_title_font(font());
+    painter.save();
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    for (auto const& chip : m_strip_chips) {
+        auto chip_rect = strip_chip_rect(chip.folder);
+        if (!chip_rect.has_value())
+            continue;
+        auto color = TabFolderMenus::folder_color(chip.color, dark);
+        if (inactive)
+            color.setAlphaF(0.7f);
+
+        auto right = chip_rect->right() + 1;
+        for (int index = 0; index < count(); ++index) {
+            auto* tab = m_tab_widget->tab(index);
+            if (!tab || m_strip_group_of_tab.get(tab) != chip.folder || !is_tab_shown_on_strip(index))
+                continue;
+            auto tab_rect = shifted_tab_rect(index);
+            if (tab_rect.isValid())
+                right = max(right, qRound(horizontal_selected_tab_body_rect(QRectF(tab_rect), horizontal_tab_end_room(index)).right()));
+        }
+        if (right > chip_rect->right() + 1) {
+            QRectF underline { static_cast<qreal>(chip_rect->left()), static_cast<qreal>(HORIZONTAL_TAB_HEIGHT - STRIP_GROUP_UNDERLINE_THICKNESS - HORIZONTAL_TAB_CARD_SHAPE_BOTTOM_INSET), static_cast<qreal>(right - chip_rect->left()), static_cast<qreal>(STRIP_GROUP_UNDERLINE_THICKNESS) };
+            painter.setPen(Qt::NoPen);
+            painter.setBrush(color);
+            painter.drawRoundedRect(underline, STRIP_GROUP_UNDERLINE_THICKNESS / 2.0, STRIP_GROUP_UNDERLINE_THICKNESS / 2.0);
+        }
+
+        auto editing = m_folder_name_editor && (chip.provisional || m_edited_folder == chip.folder);
+        auto fill = color;
+        if (m_pressed_chip == chip.folder)
+            fill = dark ? fill.lighter(115) : fill.darker(115);
+        else if (m_hovered_chip == chip.folder)
+            fill = dark ? fill.lighter(108) : fill.darker(108);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(fill);
+        auto radius = chip.name.isEmpty() && !editing ? STRIP_CHIP_EMPTY_HEIGHT / 2.0 : STRIP_CHIP_RADIUS;
+        painter.drawRoundedRect(QRectF(*chip_rect), radius, radius);
+        // A collapsed group's chip is ringed, so it reads as holding more than it shows.
+        if (chip.collapsed) {
+            auto ring = fill;
+            ring.setAlphaF(0.45f);
+            painter.setBrush(Qt::NoBrush);
+            painter.setPen(QPen(ring, 2));
+            painter.drawRoundedRect(QRectF(*chip_rect).adjusted(-2, -2, 2, 2), radius + 2, radius + 2);
+        }
+        if (!editing && !chip.name.isEmpty()) {
+            painter.setFont(title_font);
+            painter.setPen(TabFolderMenus::folder_color_text(dark));
+            auto text_rect = chip_rect->adjusted(STRIP_CHIP_PADDING, 0, -STRIP_CHIP_PADDING, 0);
+            painter.drawText(text_rect, Qt::AlignVCenter | Qt::AlignLeft, QFontMetrics(title_font).elidedText(chip.name, Qt::ElideRight, text_rect.width()));
+        }
+    }
+    painter.restore();
+}
+
 u64 TabBar::row_key(TabFolderTree::Item item)
 {
     return (static_cast<u64>(item.id) << 1) | (item.is_folder() ? 1u : 0u);
@@ -1020,6 +1312,11 @@ Optional<TabFolderId> TabBar::folder_at(QPoint const& position) const
 
 Optional<QRect> TabBar::edited_folder_row_rect() const
 {
+    if (tab_layout() == TabLayout::Horizontal) {
+        if (m_edited_folder.has_value())
+            return strip_chip_rect(*m_edited_folder);
+        return provisional_chip_rect();
+    }
     if (!uses_sidebar_rows())
         return {};
     if (m_edited_folder.has_value())
@@ -1045,6 +1342,8 @@ bool TabBar::edit_folder_name(Optional<TabFolderId> id, QString const& name, Fun
         QPointer<TabBar> tab_bar = this;
         done(AK::move(accepted_name));
         if (tab_bar) {
+            if (tab_bar->tab_layout() == TabLayout::Horizontal)
+                tab_bar->refresh_tab_layout();
             tab_bar->set_scroll_offset(tab_bar->m_scroll_offset);
             tab_bar->m_tab_widget->set_folder_name_editor_open(false);
             tab_bar->update();
@@ -1055,9 +1354,13 @@ bool TabBar::edit_folder_name(Optional<TabFolderId> id, QString const& name, Fun
     m_folder_name_editor->setPalette(palette);
     m_folder_name_editor->setFont(ChromeStyle::chrome_title_font(font()));
     m_folder_name_editor->setTextMargins(0, 0, 0, 0);
+    auto editor_text = tab_layout() == TabLayout::Horizontal ? TabFolderMenus::folder_color_text(Theme::is_dark(*this)) : Theme::chrome(*this).row_title;
     m_folder_name_editor->setStyleSheet(qformatted(
         "QLineEdit {{ background: transparent; border: none; padding: 0; color: {}; }}",
-        ChromeStyle::style_sheet_color(Theme::chrome(*this).row_title)));
+        ChromeStyle::style_sheet_color(editor_text)));
+    // A chip on the horizontal strip widens to hold the field while it's edited.
+    if (tab_layout() == TabLayout::Horizontal)
+        refresh_tab_layout();
 
     // Recompute after the pending row has given the sidebar its new height.
     if (parentWidget()->layout())
@@ -1079,6 +1382,15 @@ void TabBar::cancel_folder_name_edit()
 
 void TabBar::ensure_edited_folder_visible()
 {
+    if (tab_layout() == TabLayout::Horizontal) {
+        if (auto chip = edited_folder_row_rect(); chip.has_value()) {
+            if (chip->left() < 0)
+                set_scroll_offset(m_scroll_offset + chip->left());
+            else if (chip->right() >= width())
+                set_scroll_offset(m_scroll_offset + chip->right() + 1 - width());
+        }
+        return;
+    }
     if (auto row = edited_folder_row_rect(); row.has_value()) {
         auto top = VERTICAL_TAB_BAR_END_ROOM + pinned_region().fixed_height();
         auto bottom = height() - VERTICAL_TAB_BAR_END_ROOM;
@@ -1102,6 +1414,12 @@ void TabBar::update_folder_name_editor_geometry()
         });
         return;
     }
+    if (tab_layout() == TabLayout::Horizontal) {
+        m_folder_name_editor->setGeometry(row->adjusted(STRIP_CHIP_PADDING, 1, -STRIP_CHIP_PADDING, -1));
+        m_folder_name_editor->clearMask();
+        m_folder_name_editor->raise();
+        return;
+    }
     auto shape = tab_card_shape_rect(*row);
     auto title = shape.adjusted(VERTICAL_TAB_CONTENT_LEADING_INSET + TAB_ICON_SIZE + HORIZONTAL_TAB_CONTENT_GAP - 2, 3, -TAB_CONTENT_HORIZONTAL_INSET + 2, -3);
     auto top = VERTICAL_TAB_BAR_END_ROOM + pinned_region().fixed_height();
@@ -1115,6 +1433,8 @@ void TabBar::update_folder_name_editor_geometry()
 
 Optional<QRect> TabBar::folder_row_rect(TabFolderId id) const
 {
+    if (tab_layout() == TabLayout::Horizontal)
+        return strip_chip_rect(id);
     if (!uses_sidebar_rows())
         return {};
     auto region = pinned_region();
@@ -1716,6 +2036,9 @@ void TabBar::set_tab_layout(TabLayout tab_layout)
     m_tab_layout = tab_layout;
     m_scroll_offset = 0;
     m_locked_tab_width = {};
+    m_pressed_chip.clear();
+    m_hovered_chip.clear();
+    apply_strip_groups();
 
     if (m_tab_layout == TabLayout::Horizontal) {
         setShape(QTabBar::RoundedNorth);
@@ -1827,9 +2150,12 @@ QSize TabBar::tabSizeHint(int index) const
     }
 
     if (auto count = this->count(); count > 0) {
+        (void)count;
         auto pinned_count = pinned_tab_count();
-        // The first and last tabs also take room for their feet at the ends of the tab bar.
-        auto end_room = (index == 0 ? HORIZONTAL_TAB_END_ROOM : 0) + (index == count - 1 ? HORIZONTAL_TAB_END_ROOM : 0);
+        // The first and last tabs also take room for their feet at the ends of the tab bar, and a tab with group chips
+        // before or after it takes their room too.
+        auto settled = settled_end_room(index);
+        auto end_room = static_cast<int>(settled.left + settled.right) + leading_chip_room(index) + trailing_chip_room(index);
         if (index < pinned_count) {
             hint.setWidth(HORIZONTAL_PINNED_TAB_WIDTH + end_room);
             hint.setHeight(HORIZONTAL_TAB_HEIGHT);
@@ -1862,13 +2188,15 @@ int TabBar::horizontal_tab_min_width(int index) const
 int TabBar::horizontal_tab_share() const
 {
     auto pinned_count = pinned_tab_count();
-    auto remaining_width = (m_available_width > 0 ? m_available_width : this->width()) - (pinned_count * HORIZONTAL_PINNED_TAB_WIDTH) - (2 * HORIZONTAL_TAB_END_ROOM);
-    auto sharing_count = count() - pinned_count;
+    auto remaining_width = (m_available_width > 0 ? m_available_width : this->width()) - (pinned_count * HORIZONTAL_PINNED_TAB_WIDTH) - (2 * HORIZONTAL_TAB_END_ROOM) - strip_chips_width();
+    auto sharing_count = visible_unpinned_tab_count();
     if (sharing_count <= 0)
         return HORIZONTAL_TAB_MIN_WIDTH;
 
     Vector<int, 8> larger_min_widths;
     for (int index = pinned_count; index < count(); ++index) {
+        if (!is_tab_shown_on_strip(index))
+            continue;
         if (auto min_width = horizontal_tab_min_width(index); min_width > HORIZONTAL_TAB_MIN_WIDTH)
             larger_min_widths.append(min_width);
     }
@@ -1942,6 +2270,21 @@ bool TabBar::event(QEvent* event)
 
 Optional<ToolTipContent> TabBar::tooltip_at(QPoint position) const
 {
+    if (auto chip = strip_chip_at(position); chip.has_value()) {
+        auto tabs = 0;
+        for (auto const& [tab, folder] : m_strip_group_of_tab) {
+            if (folder == *chip && m_tab_widget && m_tab_widget->index_of(const_cast<Tab*>(tab)) >= 0)
+                ++tabs;
+        }
+        for (auto const& strip_chip : m_strip_chips) {
+            if (strip_chip.folder != *chip)
+                continue;
+            auto name = strip_chip.name.isEmpty() ? QStringLiteral("Unnamed group") : strip_chip.name;
+            auto text = tabs == 1 ? QStringLiteral("%1 - 1 tab").arg(name) : QStringLiteral("%1 - %2 tabs").arg(name).arg(tabs);
+            return ToolTipContent { .text = AK::move(text), .rect = strip_chip_rect(*chip).value_or(QRect {}) };
+        }
+    }
+
     auto hovered_tab = tab_index_at(position);
     if (hovered_tab < 0)
         return {};
@@ -2090,8 +2433,9 @@ void TabBar::paintEvent(QPaintEvent*)
         // Horizontal tabs are divided by lines, except around the selected tab and the hovered one, and between pinned
         // tabs. The last tab has none after it.
         if (!is_vertical) {
-            auto next_index = index + 1;
-            auto next_is_pinned = next_index < pinned_count;
+            // NB: Tabs hidden in a collapsed group are passed over, and a group's chip stands between tabs on its own.
+            auto next_index = next_visible_tab(index).value_or(count());
+            auto next_is_pinned = next_index < pinned_count || trailing_chip_room(index) > 0 || (next_index < count() && leading_chip_room(next_index) > 0);
             // NB: The lines beside the tabs the selection moves between stay hidden until the tabs have settled, so none
             //     shows over a tab still being selected or not, nor over one opening or closing.
             auto selection_is_settling = m_selection_animation->state() == QAbstractAnimation::Running || m_layout_animation_progress < 1.0;
@@ -2342,6 +2686,8 @@ void TabBar::paintEvent(QPaintEvent*)
     m_tabs_with_cut_titles = AK::move(tabs_with_cut_titles);
 
     painter.setClipping(false);
+    if (!is_vertical)
+        paint_strip_groups(painter);
     if (is_vertical && m_vertical_drop_line.isValid()) {
         painter.save();
         auto clip = !m_row_drag.has_value() && dragging_pinned_tab() ? rect() : unpinned_clip;
@@ -2399,6 +2745,11 @@ void TabBar::contextMenuEvent(QContextMenuEvent* event)
     event->accept();
     auto* browser_window = qobject_cast<BrowserWindow*>(window());
     auto in_vertical_sidebar = browser_window && tab_layout() != TabLayout::Horizontal;
+    if (auto chip = strip_chip_at(event->pos()); browser_window && chip.has_value()) {
+        m_pressed_chip.clear();
+        browser_window->show_strip_group_context_menu(*chip, event->globalPos());
+        return;
+    }
     if (in_vertical_sidebar) {
         if (auto folder = folder_at(event->pos()); folder.has_value()) {
             m_pressed_folder.clear();
@@ -2506,6 +2857,14 @@ void TabBar::mousePressEvent(QMouseEvent* event)
         return;
     }
 
+    if (auto chip = strip_chip_at(event->pos()); chip.has_value() && event->button() == Qt::LeftButton) {
+        m_pressed_chip = chip;
+        m_pressed_tab = nullptr;
+        update();
+        event->accept();
+        return;
+    }
+
     auto pressed_tab = tab_index_at(event->pos());
     m_pressed_tab = (m_tab_widget && pressed_tab >= 0) ? m_tab_widget->tab(pressed_tab) : nullptr;
     m_pressed_folder = folder_at(event->pos());
@@ -2569,6 +2928,11 @@ void TabBar::mouseMoveEvent(QMouseEvent* event)
 
     set_hovered_tab_index(tab_index_at(event->pos()));
     set_hovered_folder(folder_at(event->pos()));
+    set_hovered_chip(strip_chip_at(event->pos()));
+    if (m_pressed_chip.has_value()) {
+        event->accept();
+        return;
+    }
 
     if (m_pressed_folder.has_value() && event->buttons().testFlag(Qt::LeftButton)) {
         if ((event->pos() - m_drag_start_position).manhattanLength() >= TAB_DRAG_START_DISTANCE) {
@@ -2616,6 +2980,7 @@ void TabBar::leaveEvent(QEvent* event)
         m_tab_width_unlock_timer->start();
 
     set_hovered_tab_index(-1);
+    set_hovered_chip({});
     if (!m_row_drag.has_value())
         set_hovered_folder({});
     QTabBar::leaveEvent(event);
@@ -2637,6 +3002,18 @@ void TabBar::mouseReleaseEvent(QMouseEvent* event)
         m_clear_folder_selection_on_release = false;
         if (auto* browser_window = qobject_cast<BrowserWindow*>(window()))
             browser_window->clear_tab_folder_selection();
+    }
+
+    // A click on a group's chip expands or collapses the group, as Chromium's tab group header does.
+    if (auto pressed_chip = m_pressed_chip; pressed_chip.has_value()) {
+        m_pressed_chip.clear();
+        update();
+        if (event->button() == Qt::LeftButton && strip_chip_at(event->pos()) == pressed_chip) {
+            if (auto* browser_window = qobject_cast<BrowserWindow*>(window()))
+                browser_window->toggle_tab_folder(*pressed_chip);
+        }
+        event->accept();
+        return;
     }
 
     auto pressed_folder = m_pressed_folder;
@@ -2697,7 +3074,7 @@ void TabBar::mouseReleaseEvent(QMouseEvent* event)
 
 void TabBar::mouseDoubleClickEvent(QMouseEvent* event)
 {
-    if (window_has_chrome_in_titlebar(*this) && tab_index_at(event->pos()) < 0 && !folder_at(event->pos()).has_value() && event->button() == Qt::LeftButton) {
+    if (window_has_chrome_in_titlebar(*this) && tab_index_at(event->pos()) < 0 && !folder_at(event->pos()).has_value() && !strip_chip_at(event->pos()).has_value() && event->button() == Qt::LeftButton) {
         toggle_window_maximized();
         event->accept();
         return;
@@ -2804,7 +3181,11 @@ int TabBar::drop_slot_at(QPoint const& position) const
         auto best_slot = first_slot;
         auto best_distance = NumericLimits<qreal>::max();
         for (auto slot = first_slot; slot <= last_slot; ++slot) {
-            auto offset = QRectF(rect_for_slot(slot)).center() - point;
+            // A tab hidden in a collapsed group has no place of its own to drop at.
+            auto rect = rect_for_slot(slot);
+            if (rect.isEmpty())
+                continue;
+            auto offset = QRectF(rect).center() - point;
             if (auto distance = QPointF::dotProduct(offset, offset); distance < best_distance) {
                 best_distance = distance;
                 best_slot = slot;
@@ -2941,10 +3322,15 @@ TabBar::DropPreview TabBar::drop_preview_for_slot(Optional<int> slot) const
 
     // The tabs between the dragged tab and its drop slot move over by one place to fill the dragged tab's place.
     if (auto dragged_index = dragged_tab_index(); dragged_index.has_value()) {
-        for (int index = *dragged_index + 1; index <= *slot; ++index)
-            move_to(index, visual_tab_rect(index - 1));
-        for (int index = *slot; index < *dragged_index; ++index)
-            move_to(index, visual_tab_rect(index + 1));
+        // NB: A tab moves into the place of the shown tab beside it, past any tab hidden in a collapsed group.
+        for (int index = *dragged_index + 1; index <= *slot; ++index) {
+            if (auto previous = previous_visible_tab(index); previous.has_value() && is_tab_shown_on_strip(index))
+                move_to(index, visual_tab_rect(*previous));
+        }
+        for (int index = *slot; index < *dragged_index; ++index) {
+            if (auto next = next_visible_tab(index); next.has_value() && is_tab_shown_on_strip(index))
+                move_to(index, visual_tab_rect(*next));
+        }
         return preview;
     }
 
@@ -3013,8 +3399,10 @@ void TabBar::update_layout_animation()
     HashMap<Tab const*, HorizontalTabEndRoom> target_end_rooms;
     for (int index = 0; index < count(); ++index) {
         if (auto* tab = m_tab_widget->tab(index)) {
-            targets.set(tab, tabRect(index));
-            target_end_rooms.set(tab, settled_horizontal_tab_end_room(index, count()));
+            if (!is_tab_shown_on_strip(index))
+                continue;
+            targets.set(tab, strip_tab_rect_unscrolled(index));
+            target_end_rooms.set(tab, settled_end_room(index));
         }
     }
 
@@ -3086,7 +3474,7 @@ QRect TabBar::animated_tab_rect(int index, QRect const& target) const
 
 HorizontalTabEndRoom TabBar::horizontal_tab_end_room(int index) const
 {
-    auto settled = settled_horizontal_tab_end_room(index, count());
+    auto settled = settled_end_room(index);
     if (m_layout_animation_progress >= 1.0 || !m_tab_widget)
         return settled;
     auto* tab = m_tab_widget->tab(index);
@@ -3172,6 +3560,8 @@ int TabBar::horizontal_tabs_end_offset() const
     auto animated_end = closing_tab_rect().isEmpty() ? NumericLimits<int>::min() : closing_tab_rect().right();
     auto settled_end = NumericLimits<int>::min();
     for (int index = 0; index < count(); ++index) {
+        if (!is_tab_shown_on_strip(index))
+            continue;
         auto target = visual_tab_rect(index);
         animated_end = max(animated_end, animated_tab_rect(index, target).right());
         settled_end = max(settled_end, target.right());
@@ -3181,6 +3571,8 @@ int TabBar::horizontal_tabs_end_offset() const
 
 QRect TabBar::shifted_tab_rect(int index) const
 {
+    if (!is_tab_shown_on_strip(index))
+        return {};
     auto tab_rect = animated_tab_rect(index, visual_tab_rect(index));
     auto shift = current_tab_shift(index);
     return {
@@ -3682,8 +4074,10 @@ bool TabBar::pinned_tabs_are_tiles() const
 
 QRect TabBar::visual_tab_rect(int index) const
 {
-    if (tab_layout() == TabLayout::Horizontal)
-        return tabRect(index).translated(-m_scroll_offset, 0);
+    if (tab_layout() == TabLayout::Horizontal) {
+        auto rect = strip_tab_rect_unscrolled(index);
+        return rect.isValid() ? rect.translated(-m_scroll_offset, 0) : QRect {};
+    }
 
     if (index < 0 || index >= count())
         return {};
@@ -3784,8 +4178,11 @@ bool TabBar::vertical_tabs_are_on_right() const
 
 int TabBar::max_scroll_offset() const
 {
-    if (tab_layout() == TabLayout::Horizontal)
-        return count() > 0 ? max(0, tabRect(count() - 1).right() + 1 - width()) : 0;
+    if (tab_layout() == TabLayout::Horizontal) {
+        if (auto last = last_visible_tab(); last.has_value())
+            return max(0, tabRect(*last).right() + 1 - width());
+        return 0;
+    }
     auto region = pinned_region();
     return max(0, (2 * VERTICAL_TAB_BAR_END_ROOM) + region.height + (uses_sidebar_rows() ? sidebar_content_height() : (count() - region.count) * VERTICAL_TAB_HEIGHT) - height());
 }
@@ -3808,9 +4205,12 @@ void TabBar::ensure_tab_visible(int index)
 
     if (tab_layout() == TabLayout::Horizontal) {
         // A tab scrolled into view clears the fade at the end it comes from, unless it is the first or the last.
+        // NB: The tab's own rect takes in the chips of the groups before and after it, so they scroll into view along with it.
         auto tab_rect = tabRect(index);
-        auto left = tab_rect.left() - (index > 0 ? HORIZONTAL_TAB_STRIP_FADE_WIDTH : 0);
-        auto right = tab_rect.right() + 1 + (index < count() - 1 ? HORIZONTAL_TAB_STRIP_FADE_WIDTH : 0);
+        if (!tab_rect.isValid())
+            return;
+        auto left = tab_rect.left() - (index != first_visible_tab() ? HORIZONTAL_TAB_STRIP_FADE_WIDTH : 0);
+        auto right = tab_rect.right() + 1 + (index != last_visible_tab() ? HORIZONTAL_TAB_STRIP_FADE_WIDTH : 0);
         if (left < m_scroll_offset)
             set_scroll_offset(left);
         else if (right > m_scroll_offset + width())
@@ -3894,6 +4294,12 @@ void TabBar::update_tab_button_geometry()
             return button->x() >= visible_left && button->x() + button->width() <= visible_right;
         };
         for (int index = 0; index < count(); ++index) {
+            // QTabBar hides the buttons of a tab hidden in a collapsed group; the microphone is the tab bar's own.
+            if (!is_tab_shown_on_strip(index)) {
+                if (auto* microphone = microphone_indicator(index); microphone && microphone->isVisible())
+                    microphone->hide();
+                continue;
+            }
             auto is_dragged = index == dragged_index;
             auto tab_rect = shifted_tab_rect(index);
             auto shape_rect = horizontal_tab_card_shape_rect(QRectF(tab_rect), horizontal_tab_end_room(index));
@@ -6315,7 +6721,7 @@ void TabWidget::update_tab_layout()
 
     m_tab_bar->set_available_width(available_for_tabs);
 
-    auto tabs_width = (pinned_count * HORIZONTAL_PINNED_TAB_WIDTH) + ((m_tab_bar->count() - pinned_count) * HORIZONTAL_TAB_MAX_WIDTH) + (2 * HORIZONTAL_TAB_END_ROOM);
+    auto tabs_width = (pinned_count * HORIZONTAL_PINNED_TAB_WIDTH) + (m_tab_bar->visible_unpinned_tab_count() * HORIZONTAL_TAB_MAX_WIDTH) + (2 * HORIZONTAL_TAB_END_ROOM) + m_tab_bar->strip_chips_width();
     auto tab_bar_width = min(available_for_tabs, tabs_width + max(0, m_tab_bar->horizontal_tabs_end_offset()));
     m_tab_bar->setFixedWidth(max(0, tab_bar_width));
     place_horizontal_new_tab_button();

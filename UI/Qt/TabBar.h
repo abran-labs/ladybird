@@ -25,6 +25,7 @@
 #include <UI/Qt/TabFolderTree.h>
 #include <UI/Qt/WindowToolbar.h>
 
+#include <QColor>
 #include <QHash>
 #include <QLabel>
 #include <QPixmap>
@@ -140,6 +141,30 @@ public:
     void set_sidebar_rows(Vector<SidebarRow>, bool has_folders, Vector<TabFolderTree::TabKey> selection);
     // Whether the sidebar shows its rows, rather than the plain list of its unpinned tabs. Never with horizontal tabs.
     bool uses_sidebar_rows() const;
+    // A top-level folder as the horizontal strip shows it: a named, colored chip before its tabs, as Chromium's tab group
+    // header is. The window gives the chips from its folders; a collapsed chip's tabs, but for the active one, are hidden.
+    struct StripChip {
+        TabFolderId folder { 0 };
+        QString name;
+        // One of TabFolderTree::FOLDER_COLORS; the theme decides how it looks.
+        QString color;
+        bool collapsed { false };
+        // A folder being made, whose name is edited in place before the real tree takes it.
+        bool provisional { false };
+        // The tab the chip sits before, or nothing for a chip after every tab.
+        QPointer<Tab> before_tab;
+
+        bool operator==(StripChip const&) const = default;
+    };
+    void set_strip_groups(Vector<StripChip>, HashMap<Tab const*, TabFolderId> group_of_tab, HashTable<Tab const*> hidden);
+    // The chip at a position of the horizontal strip, if any.
+    Optional<TabFolderId> strip_chip_at(QPoint const&) const;
+    Optional<QRect> strip_chip_rect(TabFolderId) const;
+    // Whether a tab is on the strip, rather than hidden in a collapsed group.
+    bool is_tab_shown_on_strip(int index) const;
+    // The room the chips take on the strip, which the strip's width leaves out of the tabs' share.
+    int strip_chips_width() const;
+    int visible_unpinned_tab_count() const;
     // The folder whose header is at a position of the tab bar, if any.
     Optional<TabFolderId> folder_at(QPoint const&) const;
     // Where a folder's header is drawn, or nothing when it has no row.
@@ -337,6 +362,31 @@ private:
     QPixmap lift_drag_card(QSize, qreal radius, Function<void(QPainter&)> const& paint_contents) const;
     // The tab is drawn as a card above the rest of the window that follows drags, and Escape ends the drag it belongs to.
     void show_drag_card(int index);
+
+    struct ChipAnchor {
+        int index { -1 };
+        bool trailing { false };
+    };
+    Optional<ChipAnchor> chip_anchor(StripChip const&) const;
+    void apply_strip_groups();
+    int strip_chip_width(StripChip const&) const;
+    int strip_chip_room(StripChip const&) const;
+    int leading_chip_room(int index) const;
+    int trailing_chip_room(int index) const;
+    void set_hovered_chip(Optional<TabFolderId>);
+    HorizontalTabEndRoom settled_end_room(int index) const;
+    Optional<int> first_visible_tab() const;
+    Optional<int> last_visible_tab() const;
+    Optional<QRect> provisional_chip_rect() const;
+    QRect strip_tab_rect_unscrolled(int index) const;
+    Optional<int> previous_visible_tab(int index) const;
+    Optional<int> next_visible_tab(int index) const;
+    void paint_strip_groups(QPainter&);
+    Vector<StripChip> m_strip_chips;
+    HashMap<Tab const*, TabFolderId> m_strip_group_of_tab;
+    HashTable<Tab const*> m_strip_hidden;
+    Optional<TabFolderId> m_pressed_chip;
+    Optional<TabFolderId> m_hovered_chip;
 
     Vector<SidebarRow> m_sidebar_rows;
     Vector<TabFolderTree::TabKey> m_sidebar_selection;
