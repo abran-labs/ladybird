@@ -633,6 +633,11 @@ void BrowserWindow::initialize_window_context_menu()
     auto* new_tab_action = m_window_context_menu->addAction("New &Tab");
     QObject::connect(new_tab_action, &QAction::triggered, this, &BrowserWindow::open_new_tab);
 
+    m_new_folder_action = m_window_context_menu->addAction(QStringLiteral("New Folder…"));
+    QObject::connect(m_new_folder_action, &QAction::triggered, this, [this] {
+        start_creating_tab_folder({});
+    });
+
     m_reopen_closed_tab_action = m_window_context_menu->addAction("&Reopen Closed Tab");
     QObject::connect(m_reopen_closed_tab_action, &QAction::triggered, this, [this] {
         Application::the().reopen_recently_closed_tab(this);
@@ -673,6 +678,13 @@ void BrowserWindow::initialize_window_context_menu()
 
 void BrowserWindow::show_window_context_menu(QPoint global_position)
 {
+    show_window_context_menu(global_position, false);
+}
+
+void BrowserWindow::show_window_context_menu(QPoint global_position, bool include_new_folder)
+{
+    m_new_folder_action->setVisible(include_new_folder);
+    m_new_folder_action->setEnabled(include_new_folder && m_tab_folders.can_create_folder());
     m_reopen_closed_tab_action->setEnabled(session().has_closed_units());
     m_always_on_top_action->setChecked(windowFlags().testFlag(Qt::WindowStaysOnTopHint));
     auto current_tab_layout = to_underlying(tab_layout_choice(Application::settings().tab_settings()));
@@ -972,14 +984,7 @@ void BrowserWindow::show_tab_context_menu(Tab& tab, QPoint global_position)
 
 void BrowserWindow::show_sidebar_context_menu(QPoint global_position)
 {
-    QPointer<BrowserWindow> window = this;
-    QPointer menu = new QMenu(this);
-    auto* new_folder = menu->addAction(QStringLiteral("New Folder…"));
-    new_folder->setEnabled(m_tab_folders.can_create_folder());
-    auto create_folder = menu->exec(global_position) == new_folder;
-    delete menu.data();
-    if (window && create_folder)
-        window->start_creating_tab_folder({});
+    show_window_context_menu(global_position, true);
 }
 
 void BrowserWindow::show_tab_folder_context_menu(TabFolderId id, QPoint global_position)

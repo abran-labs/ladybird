@@ -333,6 +333,7 @@ private:
     void initialize_application_menu();
     void initialize_ladybird_menu();
     void initialize_window_context_menu();
+    void show_window_context_menu(QPoint global_position, bool include_new_folder);
 
     void update_chrome_style();
 
@@ -375,6 +376,7 @@ private:
     MenuZoomRow* m_ladybird_menu_zoom_row { nullptr };
 
     QMenu* m_window_context_menu { nullptr };
+    QAction* m_new_folder_action { nullptr };
     QAction* m_reopen_closed_tab_action { nullptr };
     QAction* m_always_on_top_action { nullptr };
     QActionGroup* m_tab_layout_actions { nullptr };
