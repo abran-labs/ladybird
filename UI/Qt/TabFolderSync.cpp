@@ -94,6 +94,37 @@ void follow_window_move(TabFolderTree& tree, Vector<WindowTab> const& tabs, TabK
         (void)tree.move_items({ Item::tab(moved) }, *destination);
 }
 
+static Optional<TabFolderId> top_level_folder_of(TabFolderTree const& tree, TabFolderTree::Item item)
+{
+    Optional<TabFolderId> top;
+    for (auto parent = tree.parent_of(item); parent.has_value(); parent = tree.parent_of(Item::folder(*parent)))
+        top = parent;
+    return top;
+}
+
+void follow_strip_move(TabFolderTree& tree, Vector<WindowTab> const& tabs, TabKey moved)
+{
+    auto index = index_in_window(tabs, moved);
+    if (!index.has_value() || tabs[*index].pinned || !tree.contains(Item::tab(moved)))
+        return;
+    auto neighbor = neighbor_in_tree(tree, tabs, *index);
+    if (!neighbor.has_value())
+        return;
+    auto moved_group = top_level_folder_of(tree, Item::tab(moved));
+    auto neighbor_group = top_level_folder_of(tree, Item::tab(neighbor->key));
+    if (neighbor_group.has_value() && neighbor_group != moved_group && tree.folder(*neighbor_group)->collapsed) {
+        auto position = tree.position_of(Item::folder(*neighbor_group));
+        if (!position.has_value())
+            return;
+        if (neighbor->is_before)
+            ++position->index;
+        (void)tree.move_items({ Item::tab(moved) }, *position);
+        return;
+    }
+    if (auto destination = destination_beside(tree, *neighbor); destination.has_value())
+        (void)tree.move_items({ Item::tab(moved) }, *destination);
+}
+
 Vector<TabKey> window_order(TabFolderTree const& tree, Vector<WindowTab> const& tabs)
 {
     Vector<TabKey> order;

@@ -423,3 +423,40 @@ TEST_CASE(a_folder_after_every_tab_sits_at_the_end_of_the_strip)
     EXPECT_EQ(strip.chips, expected);
     EXPECT_EQ(strip.hidden, flags({ false, true }));
 }
+
+TEST_CASE(a_tab_dropped_beside_a_collapsed_group_on_the_strip_stays_outside_it)
+{
+    TabFolderId work = 0;
+    auto tree = work_tree(work);
+    EXPECT(tree.set_folder_collapsed(work, true));
+
+    // Tab 1 is dropped right after the collapsed Work chip, whose tabs 2 and 3 are hidden: it lands after the folder.
+    auto moved = window({ unpinned(2), unpinned(3), unpinned(1), unpinned(4) });
+    TabFolderSync::follow_strip_move(tree, moved, 1);
+    EXPECT_EQ(tree.children(), items({ folder(work), tab(1), tab(4) }));
+    EXPECT_EQ(tree.children(work), items({ tab(2), tab(3) }));
+
+    // Tab 4 dropped in front of the collapsed group lands before the folder, not inside it.
+    moved = window({ unpinned(4), unpinned(2), unpinned(3), unpinned(1) });
+    TabFolderSync::follow_strip_move(tree, moved, 4);
+    EXPECT_EQ(tree.children(), items({ tab(4), folder(work), tab(1) }));
+    EXPECT_EQ(tree.children(work), items({ tab(2), tab(3) }));
+}
+
+TEST_CASE(a_tab_moved_within_or_into_an_open_group_on_the_strip_follows_its_neighbor)
+{
+    TabFolderId work = 0;
+    auto tree = work_tree(work);
+    auto inner = tree.create_folder_around("Inner"_string, items({ tab(3) })).release_value();
+
+    // Into the open group, next to a tab of a nested folder: it joins that nested folder, as the sidebar would show it.
+    auto moved = window({ unpinned(2), unpinned(3), unpinned(1), unpinned(4) });
+    TabFolderSync::follow_strip_move(tree, moved, 1);
+    EXPECT_EQ(tree.children(inner), items({ tab(3), tab(1) }));
+
+    // A tab of a collapsed group moving among its own hidden siblings stays in it.
+    EXPECT(tree.set_folder_collapsed(work, true));
+    moved = window({ unpinned(3), unpinned(2), unpinned(1), unpinned(4) });
+    TabFolderSync::follow_strip_move(tree, moved, 2);
+    EXPECT(tree.is_inside(tab(2), work));
+}

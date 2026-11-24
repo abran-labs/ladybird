@@ -43,6 +43,10 @@ void reconcile(TabFolderTree&, Vector<WindowTab> const&, Optional<TabKey> new_ta
 // else to the one now after it. A pinned tab keeps its place in the tree.
 void follow_window_move(TabFolderTree&, Vector<WindowTab> const&, TabKey moved);
 
+// The horizontal strip moved an unpinned tab. Like follow_window_move(), but a tab that lands beside a collapsed
+// top-level folder it wasn't in goes beside that folder at the root, rather than into a group whose tabs are hidden.
+void follow_strip_move(TabFolderTree&, Vector<WindowTab> const&, TabKey moved);
+
 // The order the native strip should have: the pinned tabs as the window has them, then the unpinned ones in tree order.
 Vector<TabKey> window_order(TabFolderTree const&, Vector<WindowTab> const&);
 
