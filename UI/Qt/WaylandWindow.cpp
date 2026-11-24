@@ -7,12 +7,19 @@
 #include <UI/Qt/WaylandWindow.h>
 
 #include <QGuiApplication>
+#include <QStringList>
 #include <QWindow>
 
 #include <string.h>
 #include <wayland-client.h>
 
 namespace Ladybird {
+
+bool is_hyprland_wayland_session()
+{
+    return qEnvironmentVariable("XDG_CURRENT_DESKTOP").split(':').contains(QStringLiteral("Hyprland"), Qt::CaseInsensitive)
+        && qGuiApp->nativeInterface<QNativeInterface::QWaylandApplication>();
+}
 
 wl_surface* wayland_surface_for_window(QWindow const& window)
 {
