@@ -6,15 +6,18 @@
 
 #include <AK/Array.h>
 #include <UI/Qt/FolderIcons.h>
+#include <UI/Qt/Theme.h>
 
-#include <QDialog>
-#include <QDialogButtonBox>
+#include <QEventLoop>
+#include <QGuiApplication>
 #include <QHeaderView>
 #include <QIconEngine>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QPainter>
 #include <QPainterPath>
-#include <QStyle>
+#include <QPointer>
+#include <QScreen>
 #include <QStyledItemDelegate>
 #include <QTableWidget>
 #include <QVBoxLayout>
@@ -372,91 +375,176 @@ public:
     virtual void paint(QPainter* painter, QStyleOptionViewItem const& option, QModelIndex const& index) const override
     {
         auto const& entry = find_entry(index.data(Qt::UserRole).toString());
-        auto is_default = !entry.paint;
-        QStyleOptionViewItem tile(option);
-        initStyleOption(&tile, index);
-        if (is_default) {
-            tile.displayAlignment = Qt::AlignHCenter | Qt::AlignBottom;
-        } else {
-            // The item retains its label for accessibility and tooltips.
-            tile.text.clear();
-            tile.features.setFlag(QStyleOptionViewItem::HasDisplay, false);
+        auto const& panel = Theme::panel();
+        auto selected = option.state.testFlag(QStyle::State_Selected);
+        auto hovered = option.state.testFlag(QStyle::State_MouseOver);
+        if (selected || hovered) {
+            painter->save();
+            painter->setRenderHint(QPainter::Antialiasing);
+            painter->setPen(Qt::NoPen);
+            painter->setBrush(selected ? Theme::selected_row() : panel.control);
+            painter->drawRoundedRect(QRectF(option.rect).adjusted(2, 2, -2, -2), 6, 6);
+            painter->restore();
         }
-        auto color_group = tile.state.testFlag(QStyle::State_Active) ? QPalette::Active : QPalette::Inactive;
-        auto color_role = tile.state.testFlag(QStyle::State_Selected) ? QPalette::HighlightedText : QPalette::Text;
-        // Some desktop themes use a faint accent wash as the highlight. Keep the base text color on that wash.
-        if (tile.palette.color(color_group, QPalette::Highlight).alphaF() < 0.5)
-            tile.palette.setColor(color_group, QPalette::HighlightedText, tile.palette.color(color_group, QPalette::Text));
-        tile.widget->style()->drawControl(QStyle::CE_ItemViewItem, &tile, painter, tile.widget);
 
-        auto icon_rect = tile.rect;
-        if (is_default)
-            icon_rect.adjust(0, 0, 0, -tile.fontMetrics.height());
-        auto side = is_default ? 16 : 20;
-        auto glyph_rect = QRect(QPoint(), QSize(side, side));
-        glyph_rect.moveCenter(icon_rect.center());
-        paint_icon(*painter, glyph_rect, entry, FolderGlyph::Closed, tile.palette.color(color_group, color_role));
+        // Render only the glyph. The model keeps its label for accessibility.
+        QRect glyph_rect(0, 0, 18, 18);
+        glyph_rect.moveCenter(option.rect.center());
+        paint_icon(*painter, glyph_rect, entry, FolderGlyph::Closed, selected ? QColor(Qt::white) : panel.text);
     }
 };
 
-std::optional<QString> choose(QWidget* parent, QString const& current)
-{
-    QDialog dialog(parent);
-    dialog.setWindowTitle("Change Folder Icon");
-    auto* layout = new QVBoxLayout(&dialog);
+class FolderIconPopup final : public QWidget {
+public:
+    AK_ALLOC_WITH_KMALLOC;
 
-    constexpr int columns = 5;
-    constexpr int rows = (CATALOG.size() + columns - 1) / columns;
-    auto* grid = new QTableWidget(rows, columns, &dialog);
-    grid->setAccessibleName("Folder icons");
-    grid->setItemDelegate(new FolderIconDelegate(grid));
-    grid->setSelectionMode(QAbstractItemView::SingleSelection);
-    grid->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    grid->setTabKeyNavigation(false);
-    grid->setShowGrid(false);
-    grid->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    grid->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    grid->horizontalHeader()->hide();
-    grid->verticalHeader()->hide();
-    grid->horizontalHeader()->setSectionResizeMode(QHeaderView::Fixed);
-    grid->verticalHeader()->setSectionResizeMode(QHeaderView::Fixed);
-    grid->horizontalHeader()->setDefaultSectionSize(max(44, grid->fontMetrics().horizontalAdvance("Default") + 10));
-    grid->verticalHeader()->setDefaultSectionSize(max(37, grid->fontMetrics().height() + 22));
-    grid->setFixedSize({
-        grid->horizontalHeader()->length() + 2 * grid->frameWidth(),
-        grid->verticalHeader()->length() + 2 * grid->frameWidth(),
-    });
-    layout->addWidget(grid, 0, Qt::AlignHCenter);
+    FolderIconPopup(QWidget* parent, QString const& current, QEventLoop& loop)
+        : QWidget(parent, Qt::Popup | Qt::FramelessWindowHint)
+        , m_loop(loop)
+    {
+        setAttribute(Qt::WA_TranslucentBackground);
 
-    auto* name = new QLabel(&dialog);
-    name->setAlignment(Qt::AlignHCenter);
-    layout->addWidget(name);
-    QObject::connect(grid, &QTableWidget::currentItemChanged, name, [name](QTableWidgetItem* item) {
-        name->setText(item ? item->text() : QString());
-    });
+        auto* layout = new QVBoxLayout(this);
+        layout->setContentsMargins(8, 8, 8, 8);
+        layout->setSpacing(4);
 
-    auto const& initial = find_entry(current);
-    for (size_t i = 0; i < CATALOG.size(); ++i) {
-        auto const& entry = CATALOG[i];
-        auto* item = new QTableWidgetItem(QLatin1StringView(entry.label));
-        item->setData(Qt::UserRole, QString::fromLatin1(entry.id));
-        item->setData(Qt::AccessibleTextRole, item->text());
-        item->setToolTip(item->text());
-        grid->setItem(i / columns, i % columns, item);
-        if (&entry == &initial)
-            grid->setCurrentItem(item);
+        auto* heading = new QLabel("Icons", this);
+        heading->setIndent(4);
+        auto heading_font = heading->font();
+        heading_font.setWeight(QFont::DemiBold);
+        heading->setFont(heading_font);
+        auto heading_palette = heading->palette();
+        heading_palette.setColor(QPalette::WindowText, Theme::panel().text);
+        heading->setPalette(heading_palette);
+        layout->addWidget(heading);
+
+        constexpr int columns = 5;
+        constexpr int rows = (CATALOG.size() + columns - 1) / columns;
+        constexpr int tile_size = 32;
+        m_grid = new QTableWidget(rows, columns, this);
+        m_grid->setAccessibleName("Folder icons");
+        m_grid->setItemDelegate(new FolderIconDelegate(m_grid));
+        m_grid->setSelectionMode(QAbstractItemView::SingleSelection);
+        m_grid->setEditTriggers(QAbstractItemView::NoEditTriggers);
+        m_grid->setTabKeyNavigation(false);
+        m_grid->setMouseTracking(true);
+        m_grid->setFrameShape(QFrame::NoFrame);
+        m_grid->setShowGrid(false);
+        m_grid->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        m_grid->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        m_grid->viewport()->setAutoFillBackground(false);
+        for (auto* header : { m_grid->horizontalHeader(), m_grid->verticalHeader() }) {
+            header->hide();
+            header->setSectionResizeMode(QHeaderView::Fixed);
+            header->setMinimumSectionSize(tile_size);
+            header->setDefaultSectionSize(tile_size);
+        }
+        m_grid->setFixedSize(columns * tile_size, rows * tile_size);
+        layout->addWidget(m_grid);
+
+        auto const& initial = find_entry(current);
+        for (size_t i = 0; i < CATALOG.size(); ++i) {
+            auto const& entry = CATALOG[i];
+            auto* item = new QTableWidgetItem(QLatin1StringView(entry.label));
+            item->setData(Qt::UserRole, QString::fromLatin1(entry.id));
+            item->setData(Qt::AccessibleTextRole, item->text());
+            m_grid->setItem(i / columns, i % columns, item);
+            if (&entry == &initial)
+                m_grid->setCurrentItem(item);
+        }
+
+        connect(m_grid, &QTableWidget::itemClicked, this, &FolderIconPopup::commit);
+        m_grid->installEventFilter(this);
+        setFocusProxy(m_grid);
+        setFocus(Qt::PopupFocusReason);
+        setFixedSize(sizeHint());
     }
 
-    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
-    layout->addWidget(buttons);
-    QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
-    QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-    QObject::connect(grid, &QTableWidget::itemDoubleClicked, &dialog, &QDialog::accept);
+    std::optional<QString> choice() const { return m_choice; }
 
-    grid->setFocus();
-    if (dialog.exec() != QDialog::Accepted || !grid->currentItem())
+    void move_below(QRect const& anchor_global)
+    {
+        constexpr int gap = 4;
+        auto x = layoutDirection() == Qt::RightToLeft ? anchor_global.right() - width() + 1 : anchor_global.left();
+        auto y = anchor_global.bottom() + 1 + gap;
+        auto* anchor_screen = QGuiApplication::screenAt(anchor_global.center());
+        if (!anchor_screen)
+            anchor_screen = parentWidget() ? parentWidget()->screen() : screen();
+        if (anchor_screen) {
+            auto bounds = anchor_screen->availableGeometry();
+            if (y + height() > bounds.bottom() + 1)
+                y = anchor_global.top() - gap - height();
+            x = clamp(x, bounds.left(), max(bounds.left(), bounds.right() - width() + 1));
+            y = clamp(y, bounds.top(), max(bounds.top(), bounds.bottom() - height() + 1));
+        }
+        move(x, y);
+    }
+
+private:
+    void commit(QTableWidgetItem* item)
+    {
+        if (!item)
+            return;
+        m_choice = item->data(Qt::UserRole).toString();
+        close();
+    }
+
+    virtual bool eventFilter(QObject* watched, QEvent* event) override
+    {
+        if (watched == m_grid && event->type() == QEvent::KeyPress) {
+            switch (static_cast<QKeyEvent*>(event)->key()) {
+            case Qt::Key_Escape:
+                close();
+                return true;
+            case Qt::Key_Return:
+            case Qt::Key_Enter:
+            case Qt::Key_Space:
+                commit(m_grid->currentItem());
+                return true;
+            default:
+                break;
+            }
+        }
+        return QWidget::eventFilter(watched, event);
+    }
+
+    virtual void hideEvent(QHideEvent* event) override
+    {
+        QWidget::hideEvent(event);
+        m_loop.quit();
+    }
+
+    virtual void paintEvent(QPaintEvent*) override
+    {
+        auto const& panel = Theme::panel();
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.setPen(panel.edge);
+        painter.setBrush(panel.surface);
+        painter.drawRoundedRect(QRectF(rect()).adjusted(.5, .5, -.5, -.5), 10, 10);
+    }
+
+    QEventLoop& m_loop;
+    QTableWidget* m_grid { nullptr };
+    std::optional<QString> m_choice;
+};
+
+std::optional<QString> choose(QWidget* parent, QString const& current, QRect const& anchor_global)
+{
+    // Wait for a choice without making the window modal. Qt handles outside
+    // clicks as popup dismissals, including compositor-driven hides.
+    QEventLoop loop;
+    QPointer popup = new FolderIconPopup(parent, current, loop);
+    QObject::connect(popup, &QObject::destroyed, &loop, &QEventLoop::quit);
+    popup->move_below(anchor_global);
+    popup->show();
+    if (popup && popup->isVisible())
+        loop.exec();
+    if (!popup)
         return {};
-    return grid->currentItem()->data(Qt::UserRole).toString();
+    auto choice = popup->choice();
+    delete popup.data();
+    return choice;
 }
 
 }

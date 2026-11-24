@@ -1010,12 +1010,17 @@ void BrowserWindow::show_tab_folder_context_menu(TabFolderId id, QPoint global_p
         QString current;
         if (auto const& icon = m_tab_folders.folder(id)->icon; icon.has_value())
             current = qstring_from_ak_string(*icon);
-        if (auto icon = FolderIcons::choose(this, current); icon.has_value()) {
+        auto* tab_bar = m_tabs_container->tab_bar();
+        auto row = tab_bar->folder_row_rect(id);
+        if (!row.has_value())
+            return;
+        auto anchor = QRect(tab_bar->mapToGlobal(row->topLeft()), row->size());
+        if (auto icon = FolderIcons::choose(this, current, anchor); icon.has_value() && window && window->m_tab_folders.folder(id).has_value()) {
             Optional<String> saved;
             if (!icon->isEmpty())
                 saved = ak_string_from_qstring(*icon);
-            if (m_tab_folders.set_folder_icon(id, saved))
-                update_tab_folders();
+            if (window->m_tab_folders.set_folder_icon(id, saved))
+                window->update_tab_folders();
         }
         return;
     }
