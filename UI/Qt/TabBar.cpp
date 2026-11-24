@@ -1868,21 +1868,21 @@ void TabBar::paintEvent(QPaintEvent*)
         }
 
         // NB: The hovered horizontal tabs were filled before any tab was painted.
-        if (selection < 1.0 && (is_hovered || is_folder_selected) && is_vertical) {
-            auto palette = Theme::chrome_palette(*this);
-            painter.setBrush(is_folder_selected ? ChromeStyle::chrome_active_tab_surface(palette) : vertical_tab_hover_surface(palette, hover_progress));
+        auto card_selection = is_folder_selected ? 1.0 : selection;
+        if (card_selection < 1.0 && is_hovered && is_vertical) {
+            painter.setBrush(vertical_tab_hover_surface(Theme::chrome_palette(*this), hover_progress));
             painter.setPen(Qt::NoPen);
             painter.drawPath(tab_path);
-        } else if (selection < 1.0 && is_vertical && !is_collapsed_vertical && is_pinned_tile) {
+        } else if (card_selection < 1.0 && is_vertical && !is_collapsed_vertical && is_pinned_tile) {
             // The pinned tiles at the top of the sidebar are always filled, so they read as a grid of buttons. The fill
             // fades as they move into the collapsed sidebar's column, where they are not.
             painter.setBrush(vertical_tab_hover_surface(Theme::chrome_palette(*this), 1.0 - region.collapsedness));
             painter.setPen(Qt::NoPen);
             painter.drawPath(tab_path);
         }
-        if (selection > 0.0) {
+        if (card_selection > 0.0) {
             painter.save();
-            painter.setOpacity(selection);
+            painter.setOpacity(card_selection);
             if (is_vertical) {
                 paint_selected_vertical_tab(painter, Theme::chrome_palette(*this), shape_rect, vertical_tab_radius);
             } else {
