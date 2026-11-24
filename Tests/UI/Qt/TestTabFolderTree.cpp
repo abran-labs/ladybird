@@ -189,6 +189,24 @@ TEST_CASE(deleting_a_folder_returns_every_tab_in_its_tree_and_removes_descendant
     EXPECT(!tree.contains(tab(3)));
 }
 
+TEST_CASE(folder_deletion_waits_for_every_descendant_tab_to_close)
+{
+    TabFolderTree tree;
+    auto folder = tree.create_folder("Work"_string).value();
+    auto child = tree.create_folder("Notes"_string, TabFolderDestination::at_end_of(folder)).value();
+    EXPECT(tree.add_tab(1, TabFolderDestination::at_end_of(folder)));
+    EXPECT(tree.add_tab(2, TabFolderDestination::at_end_of(child)));
+    EXPECT(tree.remove_tab(1));
+
+    // Tab 2 declined its close. The folder, its child, and the tab stay intact.
+    EXPECT(!tree.delete_empty_folder(folder));
+    EXPECT(tree.folder(child).has_value());
+    EXPECT_EQ(tree.tabs_inside(folder), (Vector<i64> { 2 }));
+    EXPECT(tree.remove_tab(2));
+    EXPECT(tree.delete_empty_folder(folder));
+    EXPECT(!tree.folder(child).has_value());
+}
+
 TEST_CASE(removing_a_tab_leaves_its_folder)
 {
     auto tree = tree_with_tabs({ 1, 2 });

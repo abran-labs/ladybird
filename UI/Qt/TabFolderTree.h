@@ -153,6 +153,7 @@ public:
     bool unpack_folder(TabFolderId);
     // Removes the folder with every folder and tab inside it, and returns those tabs, in order, for the caller to close.
     Vector<TabKey> delete_folder(TabFolderId);
+    bool delete_empty_folder(TabFolderId);
     // The tree with only the tabs that keep says to, for a window that forgets the rest. A folder stays when it holds a
     // kept tab. A folder that holds no tab at all stays when the nearest folder around it that holds tabs holds a kept one,
     // so an empty folder stays in a kept branch, and goes with a group of only forgotten tabs, or at the root. A folder

@@ -440,6 +440,14 @@ Vector<TabFolderTree::TabKey> TabFolderTree::delete_folder(TabFolderId id)
     return tabs;
 }
 
+bool TabFolderTree::delete_empty_folder(TabFolderId id)
+{
+    if (!folder(id).has_value() || !tabs_inside(id).is_empty())
+        return false;
+    (void)delete_folder(id);
+    return true;
+}
+
 TabFolderTree TabFolderTree::with_only_tabs_kept(Function<bool(TabKey)> const& keep) const
 {
     // Classified against every tab the tree holds, before any is dropped, so a folder whose tabs are all forgotten never

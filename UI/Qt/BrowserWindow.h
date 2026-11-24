@@ -296,7 +296,7 @@ public slots:
     void exit_fullscreen();
 
 private:
-    bool close_tab(int index, SessionStore::KeepForReopening);
+    bool close_tab(int index, SessionStore::KeepForReopening, Optional<TabFolderId> approved_folder = {});
     virtual bool event(QEvent*) override;
     virtual bool eventFilter(QObject*, QEvent*) override;
     virtual void resizeEvent(QResizeEvent*) override;
@@ -317,7 +317,7 @@ private:
     void register_window_with_session_store();
     void sync_session_tab_order();
     void start_creating_tab_folder(TabFolderEditing::FolderCreation);
-    void begin_window_close_preflight(Function<void(bool approved)> on_complete = {});
+    void begin_window_close_preflight(Function<void(bool approved)> on_complete = {}, Optional<TabFolderId> folder_to_delete = {});
 
     void set_current_tab(Tab* tab);
     Qt::Edges resize_edges_for_position(QPoint const&) const;
@@ -395,8 +395,7 @@ private:
     Optional<i64> m_window_close_active_tab_index;
     bool m_window_was_fullscreen_before_page { false };
     QPointer<Tab> m_window_close_original_active_tab;
-    QPointer<Tab> m_window_close_current_preflight_tab;
-    Vector<QPointer<Tab>> m_window_close_approved_tabs;
+    Vector<QPointer<Tab>> m_tabs_under_close_preflight;
     WindowCloseCoordinator m_window_close_coordinator;
     Function<void(bool approved)> m_window_close_preflight_on_complete;
     bool m_window_close_approved { false };

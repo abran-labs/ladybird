@@ -1208,34 +1208,13 @@ void BrowserWindow::show_tab_folder_context_menu(TabFolderId id, QPoint global_p
         break;
     }
 
-    auto tabs_to_close = m_tab_folders.tabs_inside(id);
-    if (!tabs_to_close.is_empty()) {
-        auto text = tabs_to_close.size() == 1
-            ? QStringLiteral("Delete this folder and close its tab? Descendant folders will also be deleted.")
-            : qformatted("Delete this folder and close its {} tabs? Descendant folders will also be deleted.", tabs_to_close.size());
-        QMessageBox confirmation(QMessageBox::Warning, QStringLiteral("Delete Folder"), text, QMessageBox::Cancel, this);
-        auto* delete_button = confirmation.addButton(QStringLiteral("Delete Folder"), QMessageBox::DestructiveRole);
-        confirmation.exec();
-        if (confirmation.clickedButton() != delete_button)
-            return;
-    }
-
-    auto all_closed = true;
-    for (auto key : tabs_to_close) {
-        Tab* tab = nullptr;
-        for (int i = 0; i < m_tabs_container->count(); ++i) {
-            if (m_tabs_container->tab(i)->session_tab_id() == key) {
-                tab = m_tabs_container->tab(i);
-                break;
-            }
-        }
-        if (tab && !definitely_close_tab(tab_index(tab)))
-            all_closed = false;
-    }
-    if (all_closed && m_tab_folders.folder(id).has_value()) {
-        (void)m_tab_folders.delete_folder(id);
+    if (m_window_close_coordinator.is_running() || m_window_close_approved)
+        return;
+    if (m_tab_folders.delete_empty_folder(id)) {
         update_tab_folders();
+        return;
     }
+    begin_window_close_preflight({}, id);
 }
 
 void BrowserWindow::restore_tabs(Vector<RestoredSessionTab> const& tabs, i64 active_tab_index, Optional<TabFolderTree> tab_folders)
@@ -1678,18 +1657,22 @@ void BrowserWindow::close_tab_without_keeping_it(int index)
     (void)close_tab(index, SessionStore::KeepForReopening::No);
 }
 
-bool BrowserWindow::close_tab(int index, SessionStore::KeepForReopening keep_for_reopening)
+bool BrowserWindow::close_tab(int index, SessionStore::KeepForReopening keep_for_reopening, Optional<TabFolderId> approved_folder)
 {
     cancel_window_close_preflight();
 
-    if (m_tabs_container->count() == 1 && RemoteDownloads::the().has_active_downloads() && visible_browser_window_count() <= 1) {
+    if (!approved_folder.has_value() && m_tabs_container->count() == 1 && RemoteDownloads::the().has_active_downloads() && visible_browser_window_count() <= 1) {
         if (!Application::the().confirm_stop_active_downloads(this))
             return false;
     }
 
     auto* tab = m_tabs_container->tab(index);
+    if (approved_folder.has_value())
+        tab->prepare_for_window_close()();
     m_tabs_container->remove_tab(index);
     update_tab_folders();
+    if (approved_folder.has_value() && m_tab_folders.delete_empty_folder(*approved_folder))
+        update_tab_folders();
     if (auto session_tab_id = tab->session_tab_id(); session_tab_id.has_value()) {
         SessionStore::TabClosed closed {
             .tab_id = *session_tab_id,
@@ -1702,8 +1685,11 @@ bool BrowserWindow::close_tab(int index, SessionStore::KeepForReopening keep_for
     Application::the().update_reopen_recently_closed_actions();
     tab->deleteLater();
 
-    if (m_tabs_container->count() == 0)
+    if (m_tabs_container->count() == 0) {
+        if (approved_folder.has_value())
+            m_window_close_approved = true;
         close();
+    }
 
     return true;
 }
@@ -2752,25 +2738,29 @@ void BrowserWindow::report_session_window_geometry()
     session().window_geometry_changed(*m_session_window_id, window_geometry);
 }
 
-void BrowserWindow::begin_window_close_preflight(Function<void(bool approved)> on_complete)
+void BrowserWindow::begin_window_close_preflight(Function<void(bool approved)> on_complete, Optional<TabFolderId> folder_to_delete)
 {
     m_window_close_active_tab_index = static_cast<i64>(max(m_tabs_container->current_index(), 0));
     m_window_close_original_active_tab = m_current_tab;
-    m_window_close_current_preflight_tab = nullptr;
-    m_window_close_approved_tabs.clear();
+    m_tabs_under_close_preflight.clear();
 
     Vector<QPointer<Tab>> tabs;
-    if (m_current_tab)
+    auto keys = folder_to_delete.has_value() ? m_tab_folders.tabs_inside(*folder_to_delete) : Vector<TabFolderTree::TabKey> {};
+    auto in_scope = [&](Tab const& tab) {
+        auto key = tab.session_tab_id();
+        return !folder_to_delete.has_value() || (key.has_value() && keys.contains_slow(*key));
+    };
+    if (m_current_tab && in_scope(*m_current_tab))
         tabs.append(m_current_tab);
     for_each_tab([&](auto& tab) {
-        if (&tab != m_current_tab)
+        if (&tab != m_current_tab && in_scope(tab))
             tabs.append(&tab);
     });
 
     Vector<WindowCloseCoordinator::Preflight> preflights;
     preflights.ensure_capacity(tabs.size());
     for (auto tab : tabs) {
-        preflights.append([this, tab](Function<void(bool)> on_complete) mutable {
+        preflights.append([this, tab, folder_to_delete](Function<void(bool)> on_complete) mutable {
             if (!tab) {
                 on_complete(true);
                 return;
@@ -2782,19 +2772,34 @@ void BrowserWindow::begin_window_close_preflight(Function<void(bool approved)> o
                 return;
             }
 
-            activate_tab(index);
-            m_window_close_current_preflight_tab = tab;
+            // Deleting a folder shouldn't load deferred tabs just to ask whether they may close.
+            if (!folder_to_delete.has_value() || tab->is_loaded())
+                activate_tab(index);
+            m_tabs_under_close_preflight.append(tab);
             auto weak_this = QPointer<BrowserWindow>(this);
-            tab->request_window_close_preflight([weak_this, tab, on_complete = AK::move(on_complete)](bool approved) mutable {
+            tab->request_window_close_preflight([weak_this, on_complete = AK::move(on_complete)](bool approved) mutable {
                 // NB: The coordinator that would take this answer went away with the window.
                 if (!weak_this)
                     return;
-                if (weak_this->m_window_close_current_preflight_tab == tab)
-                    weak_this->m_window_close_current_preflight_tab = nullptr;
-                if (approved && tab && !weak_this->m_window_close_approved_tabs.contains([&](auto const& approved_tab) { return approved_tab == tab; }))
-                    weak_this->m_window_close_approved_tabs.append(tab);
                 on_complete(approved);
             });
+        });
+    }
+
+    if (folder_to_delete.has_value()) {
+        // Downloads get their normal last-window check, while navigation and tab changes can still cancel preflight.
+        preflights.append([weak_this = QPointer(this), keys, folder = *folder_to_delete](auto complete) {
+            if (!weak_this)
+                return;
+            if (static_cast<size_t>(weak_this->tab_count()) == keys.size() && RemoteDownloads::the().has_active_downloads() && visible_browser_window_count() <= 1) {
+                if (!Application::the().confirm_stop_active_downloads(weak_this)) {
+                    if (weak_this)
+                        complete(false);
+                    return;
+                }
+            }
+            if (weak_this)
+                complete(weak_this->m_tab_folders.folder(folder).has_value() && weak_this->m_tab_folders.tabs_inside(folder) == keys);
         });
     }
 
@@ -2805,9 +2810,28 @@ void BrowserWindow::begin_window_close_preflight(Function<void(bool approved)> o
     auto weak_this = QPointer<BrowserWindow>(this);
     m_window_close_coordinator.start(
         AK::move(preflights),
-        [weak_this] {
+        [weak_this, folder_to_delete, tabs] {
             if (!weak_this)
                 return;
+            if (folder_to_delete.has_value()) {
+                weak_this->m_window_close_active_tab_index.clear();
+                auto original = weak_this->m_window_close_original_active_tab;
+                weak_this->m_window_close_original_active_tab = nullptr;
+                weak_this->m_tabs_under_close_preflight.clear();
+                if (original && !tabs.contains_slow(original) && weak_this->tab_index(original) >= 0)
+                    weak_this->activate_tab(weak_this->tab_index(original));
+                for (auto const& tab : tabs.in_reverse()) {
+                    if (!weak_this)
+                        return;
+                    if (!tab)
+                        continue;
+                    auto index = weak_this->tab_index(tab);
+                    auto key = tab->session_tab_id();
+                    if (index >= 0 && key.has_value() && weak_this->m_tab_folders.is_inside(TabFolderTree::Item::tab(*key), *folder_to_delete))
+                        weak_this->close_tab(index, SessionStore::KeepForReopening::Yes, folder_to_delete);
+                }
+                return;
+            }
             weak_this->m_window_close_approved = true;
             if (auto on_complete = AK::move(weak_this->m_window_close_preflight_on_complete)) {
                 // The window stays open until the caller closes it, so it goes back to the tab it showed before the
@@ -2835,11 +2859,11 @@ void BrowserWindow::begin_window_close_preflight(Function<void(bool approved)> o
             }
             weak_this->m_window_close_active_tab_index.clear();
             weak_this->m_window_close_original_active_tab = nullptr;
-            weak_this->m_window_close_current_preflight_tab = nullptr;
-            weak_this->m_window_close_approved_tabs.clear();
-            weak_this->for_each_tab([](auto& tab) {
-                tab.cancel_window_close_preflight();
-            });
+            auto tabs = AK::move(weak_this->m_tabs_under_close_preflight);
+            for (auto const& tab : tabs) {
+                if (tab && weak_this->tab_index(tab) >= 0)
+                    tab->cancel_window_close_preflight();
+            }
             if (auto on_complete = AK::move(weak_this->m_window_close_preflight_on_complete))
                 on_complete(false);
         });
@@ -2863,8 +2887,7 @@ void BrowserWindow::cancel_window_close_preflight()
     m_window_close_approved = false;
     m_window_close_active_tab_index.clear();
     m_window_close_original_active_tab = nullptr;
-    m_window_close_current_preflight_tab = nullptr;
-    m_window_close_approved_tabs.clear();
+    m_tabs_under_close_preflight.clear();
     for_each_tab([](auto& tab) {
         tab.cancel_window_close_preflight();
     });
@@ -2882,7 +2905,7 @@ void BrowserWindow::on_tab_load_start(Tab& tab)
     if (!m_window_close_coordinator.is_running() && !m_window_close_approved)
         return;
 
-    if (m_window_close_current_preflight_tab == &tab || m_window_close_approved_tabs.contains([&](auto const& approved_tab) { return approved_tab == &tab; }))
+    if (m_tabs_under_close_preflight.contains_slow(&tab))
         cancel_window_close_preflight();
 }
 
