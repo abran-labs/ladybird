@@ -382,7 +382,7 @@ public:
             painter->save();
             painter->setRenderHint(QPainter::Antialiasing);
             painter->setPen(Qt::NoPen);
-            painter->setBrush(selected ? Theme::selected_row() : panel.control);
+            painter->setBrush(panel.control);
             painter->drawRoundedRect(QRectF(option.rect).adjusted(2, 2, -2, -2), 6, 6);
             painter->restore();
         }
@@ -390,7 +390,7 @@ public:
         // Render only the glyph. The model keeps its label for accessibility.
         QRect glyph_rect(0, 0, 18, 18);
         glyph_rect.moveCenter(option.rect.center());
-        paint_icon(*painter, glyph_rect, entry, FolderGlyph::Closed, selected ? QColor(Qt::white) : panel.text);
+        paint_icon(*painter, glyph_rect, entry, FolderGlyph::Closed, panel.text);
     }
 };
 
