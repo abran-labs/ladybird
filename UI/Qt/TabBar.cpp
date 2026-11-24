@@ -1034,6 +1034,14 @@ bool TabBar::edit_folder_name(Optional<TabFolderId> id, QString const& name, Fun
         }
     });
 
+    auto palette = Theme::chrome_palette(*this);
+    m_folder_name_editor->setPalette(palette);
+    m_folder_name_editor->setFont(ChromeStyle::chrome_title_font(font()));
+    m_folder_name_editor->setTextMargins(0, 0, 0, 0);
+    m_folder_name_editor->setStyleSheet(qformatted(
+        "QLineEdit {{ background: transparent; border: none; padding: 0; color: {}; }}",
+        ChromeStyle::style_sheet_color(Theme::chrome(*this).row_title)));
+
     // Recompute after the pending row has given the sidebar its new height.
     if (parentWidget()->layout())
         parentWidget()->layout()->activate();
