@@ -1078,6 +1078,25 @@ void BrowserWindow::show_tab_context_menu(Tab& tab, QPoint global_position)
             if (!destination)
                 break;
         }
+        if (destination && targets.size() > 1) {
+            TabFolderEditing::Selection moved_selection;
+            for (int index = 0; index < destination->tab_count(); ++index) {
+                auto* moved_tab = destination->tab_at(index);
+                if (!targets.contains_slow(QPointer<Tab>(moved_tab)))
+                    continue;
+                if (auto key = moved_tab->session_tab_id(); key.has_value()) {
+                    moved_selection.keys.append(*key);
+                    if (moved_tab == clicked)
+                        moved_selection.anchor = *key;
+                }
+            }
+            if (!moved_selection.anchor.has_value() && !moved_selection.keys.is_empty())
+                moved_selection.anchor = moved_selection.keys.first();
+            if (moved_selection.keys.size() > 1) {
+                destination->m_folder_selection = AK::move(moved_selection);
+                destination->update_tab_folders();
+            }
+        }
         return;
     }
     case Command::CreateFolder:
