@@ -126,6 +126,7 @@ public:
     private:
         enum class Kind {
             End,
+            EndOfRoot,
             AfterCurrentTab,
             AfterTab,
             AtIndex,
@@ -138,6 +139,8 @@ public:
         static TabLocation at_index(int index) { return { Kind::AtIndex, nullptr, index }; }
 
     private:
+        static TabLocation end_of_root() { return { Kind::EndOfRoot, nullptr }; }
+
         Kind kind() const { return m_kind; }
         Tab* tab() const { return m_tab; }
         int index() const { return m_index; }
@@ -190,7 +193,7 @@ public:
     TabFolderTree const& tab_folders() const { return m_tab_folders; }
     // Brings the folders in step with the window's tabs, the strip's order in step with the folders, and the sidebar's
     // rows in step with both.
-    void update_tab_folders();
+    void update_tab_folders(Optional<TabFolderTree::TabKey> new_tab_at_root = {});
     void toggle_tab_folder(TabFolderId);
     // A new folder in the place of the first of the tabs, holding them all. Nothing when that isn't allowed.
     Optional<TabFolderId> create_tab_folder_around(QString const& name, Vector<Tab*> const& tabs);

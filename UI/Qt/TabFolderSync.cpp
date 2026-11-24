@@ -46,7 +46,7 @@ static Optional<TabFolderDestination> destination_beside(TabFolderTree const& tr
     return position;
 }
 
-void reconcile(TabFolderTree& tree, Vector<WindowTab> const& tabs)
+void reconcile(TabFolderTree& tree, Vector<WindowTab> const& tabs, Optional<TabKey> new_tab_at_root)
 {
     // Without folders, nothing but the window's order is worth keeping.
     if (!tree.has_folders()) {
@@ -68,6 +68,10 @@ void reconcile(TabFolderTree& tree, Vector<WindowTab> const& tabs)
         auto key = tabs[i].key;
         if (tree.contains(Item::tab(key)))
             continue;
+        if (new_tab_at_root == key) {
+            (void)tree.add_tab(key, TabFolderDestination::at_end_of({}));
+            continue;
+        }
         TabFolderDestination destination;
         if (auto neighbor = neighbor_in_tree(tree, tabs, i); neighbor.has_value())
             destination = destination_beside(tree, *neighbor).value_or({});

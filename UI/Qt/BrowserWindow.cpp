@@ -724,7 +724,7 @@ void BrowserWindow::open_new_tab()
     // NB: With the focus already in the selected tab's address field, its focus ring moves to the new tab's field as it
     //     is, rather than fading in again.
     auto focus_ring_transition = focus_is_in_location_edit_of(*this) ? Tab::FocusRingTransition::Immediate : Tab::FocusRingTransition::FadeIn;
-    auto& tab = new_tab_from_url(Application::settings().new_tab_page_url(), Web::HTML::ActivateTab::Yes, TabLocation::end());
+    auto& tab = new_tab_from_url(Application::settings().new_tab_page_url(), Web::HTML::ActivateTab::Yes, TabLocation::end_of_root());
     tab.set_url_is_hidden(true);
     tab.focus_location_editor(focus_ring_transition);
 }
@@ -788,7 +788,7 @@ static Optional<QString> ask_for_folder_name(QWidget* parent, QString const& tit
     return dialog.textValue();
 }
 
-void BrowserWindow::update_tab_folders()
+void BrowserWindow::update_tab_folders(Optional<TabFolderTree::TabKey> new_tab_at_root)
 {
     Vector<TabFolderSync::WindowTab> tabs;
     auto all_tabs_have_keys = true;
@@ -799,7 +799,7 @@ void BrowserWindow::update_tab_folders()
         else
             all_tabs_have_keys = false;
     }
-    TabFolderSync::reconcile(m_tab_folders, tabs);
+    TabFolderSync::reconcile(m_tab_folders, tabs, new_tab_at_root);
 
     auto contains_tab = [&](TabFolderTree::TabKey key) {
         return tabs.contains([&](auto const& tab) { return tab.key == key; });
@@ -1223,6 +1223,7 @@ Tab& BrowserWindow::create_new_tab(Web::HTML::ActivateTab activate_tab, TabLocat
     auto insertion_index = m_tabs_container->count();
     switch (location.kind()) {
     case TabLocation::Kind::End:
+    case TabLocation::Kind::EndOfRoot:
         break;
     case TabLocation::Kind::AfterCurrentTab:
         insertion_index = constrain_insertion_index(m_tabs_container->current_index() + 1, false);
@@ -1251,7 +1252,7 @@ Tab& BrowserWindow::create_new_tab(Web::HTML::ActivateTab activate_tab, TabLocat
         m_background_tabs_from_current_tab.append(tab);
 
     initialize_tab(tab);
-    update_tab_folders();
+    update_tab_folders(location.kind() == TabLocation::Kind::EndOfRoot ? tab->session_tab_id() : Optional<TabFolderTree::TabKey> {});
 
     return *tab;
 }

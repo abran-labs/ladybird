@@ -83,6 +83,24 @@ TEST_CASE(a_new_tab_joins_the_folder_of_the_tab_before_it)
     EXPECT_EQ(TabFolderSync::window_order(tree, window({ unpinned(1), unpinned(2), unpinned(9), unpinned(3), unpinned(4) })), keys({ 1, 2, 9, 3, 4 }));
 }
 
+TEST_CASE(an_explicit_new_tab_goes_to_the_root_even_when_every_existing_tab_is_in_a_folder)
+{
+    TabFolderTree tree;
+    TabFolderSync::reconcile(tree, window({ unpinned(1), unpinned(2) }));
+    auto work = tree.create_folder_around("Work"_string, items({ tab(1), tab(2) })).release_value();
+    EXPECT(tree.set_folder_collapsed(work, true));
+
+    auto tabs = window({ unpinned(1), unpinned(2), unpinned(3) });
+    TabFolderSync::reconcile(tree, tabs, 3);
+    EXPECT_EQ(tree.children(), items({ folder(work), tab(3) }));
+    EXPECT_EQ(tree.children(work), items({ tab(1), tab(2) }));
+
+    // A later sync has no opening intent, and the active tab still has its own root row, not a folder preview.
+    TabFolderSync::reconcile(tree, tabs);
+    Vector<SidebarRow> expected_rows { { folder(work), 0, false, Glyph::Closed }, { tab(3), 0, false, Glyph::Open } };
+    EXPECT_EQ(TabFolderSync::sidebar_rows(tree, tabs, 3), expected_rows);
+}
+
 TEST_CASE(a_new_first_unpinned_tab_goes_before_the_next_unpinned_one_not_into_a_pinned_tabs_folder)
 {
     TabFolderTree tree;

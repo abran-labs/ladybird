@@ -36,8 +36,8 @@ struct SidebarRow {
 
 // Brings the tree in line with the window's tabs. A tab that's gone leaves, and the folders stay. A new tab goes right
 // after the tab before it of the same kind (pinned or not), in that tab's folder, or else right before the tab after it.
-// Without any folder, the tree simply takes the window's order.
-void reconcile(TabFolderTree&, Vector<WindowTab> const&);
+// An explicit New Tab instead goes at the end of the root. Without folders, the tree simply takes the window's order.
+void reconcile(TabFolderTree&, Vector<WindowTab> const&, Optional<TabKey> new_tab_at_root = {});
 
 // The window moved an unpinned tab, as the horizontal strip does: the tab follows to the unpinned tab now before it, or
 // else to the one now after it. A pinned tab keeps its place in the tree.
