@@ -46,6 +46,7 @@
 #include <QAbstractButton>
 #include <QActionGroup>
 #include <QApplication>
+#include <QClipboard>
 #include <QContextMenuEvent>
 #include <QCursor>
 #include <QGuiApplication>
@@ -947,39 +948,208 @@ void BrowserWindow::select_tab_for_folder(Tab& tab, Qt::KeyboardModifiers modifi
 
 void BrowserWindow::show_tab_context_menu(Tab& tab, QPoint global_position)
 {
-    auto& menu = *tab.context_menu();
-    auto key = tab.session_tab_id();
-    if (m_tabs_container->tab_bar()->tab_layout() == TabLayout::Horizontal || !key.has_value()) {
-        execute_context_menu(menu, global_position);
-        return;
+    bool horizontal = m_tabs_container->tab_bar()->tab_layout() == TabLayout::Horizontal;
+    Vector<TabFolderTree::TabKey> keys;
+    if (auto clicked_key = tab.session_tab_id(); !horizontal && clicked_key.has_value()) {
+        Vector<TabFolderTree::TabKey> order;
+        for (int i = 0; i < tab_count(); ++i) {
+            if (auto key = tab_at(i)->session_tab_id(); key.has_value())
+                order.append(*key);
+        }
+        keys = TabFolderEditing::context_tabs(m_folder_selection, *clicked_key, order);
+        if (!m_folder_selection.keys.contains_slow(*clicked_key)) {
+            m_folder_selection = { keys, clicked_key };
+            update_tab_folders();
+        }
     }
-
-    auto keys = TabFolderEditing::context_tabs(m_folder_selection, *key);
-    if (keys != m_folder_selection.keys) {
-        m_folder_selection = { keys, key };
-        update_tab_folders();
-    }
-
-    Vector<TabFolderTree::Item> items;
-    for (auto selected : keys)
-        items.append(TabFolderTree::Item::tab(selected));
 
     QPointer<BrowserWindow> window = this;
-    QPointer<QMenu> guarded_menu = &menu;
-    bool create_folder = false;
-    auto move_selection = [window, items = AK::move(items)](TabFolderId id) {
-        if (window)
-            window->move_tab_folder_items(items, TabFolderDestination::at_end_of(id));
-    };
-    TabFolderMenus::add_move_menu(menu, m_tab_folders, AK::move(move_selection), [&create_folder] { create_folder = true; });
-    QPointer<QMenu> move_menu = menu.actions().last()->menu();
-    execute_context_menu(menu, global_position);
-    if (guarded_menu && move_menu) {
-        guarded_menu->removeAction(move_menu->menuAction());
-        delete move_menu.data();
+    QPointer<Tab> clicked = &tab;
+    Vector<QPointer<Tab>> targets;
+    Vector<QPointer<Tab>> other_tabs;
+    Vector<QPointer<Tab>> following_tabs;
+    auto clicked_index = tab_index(clicked);
+    for (int i = 0; i < tab_count(); ++i) {
+        auto* candidate = tab_at(i);
+        auto key = candidate->session_tab_id();
+        if (candidate == clicked || (key.has_value() && keys.contains_slow(*key)))
+            targets.append(candidate);
+        else if (!candidate->is_pinned()) {
+            other_tabs.append(candidate);
+            if (i > clicked_index)
+                following_tabs.append(candidate);
+        }
     }
-    if (window && create_folder)
-        window->start_creating_tab_folder({ {}, AK::move(keys) });
+
+    // Record the command, then release the menu before any command can close its window.
+    enum class Command {
+        None,
+        NewTab,
+        Reload,
+        Duplicate,
+        Pin,
+        Unpin,
+        Mute,
+        Unmute,
+        Move,
+        Copy,
+        Close,
+        CloseOthers,
+        CloseFollowing,
+        MoveToFolder,
+        CreateFolder,
+    };
+    Command command = Command::None;
+    QPointer menu = new QMenu(this);
+    auto add = [&](QString const& label, Command choice) {
+        return menu->addAction(label, [&, choice] { command = choice; });
+    };
+    bool bulk = targets.size() > 1;
+    add(horizontal ? "New Tab to the &Right" : "New Tab &Below", Command::NewTab);
+    menu->addSeparator();
+    auto* reload = add(bulk ? "&Reload Tabs" : "&Reload", Command::Reload);
+    add(bulk ? "&Duplicate Tabs" : "&Duplicate Tab", Command::Duplicate);
+    if (targets.contains([](auto const& t) { return !t->is_pinned(); }))
+        add(bulk ? "&Pin Tabs" : "&Pin Tab", Command::Pin);
+    if (targets.contains([](auto const& t) { return t->is_pinned(); }))
+        add(bulk ? "Un&pin Tabs" : "Un&pin Tab", Command::Unpin);
+    auto muted = [](Tab const& t) { return t.view().page_mute_state() == Web::HTML::MuteState::Muted; };
+    bool can_mute = targets.contains([&](auto const& t) { return t->is_loaded() && !muted(*t); });
+    bool can_unmute = targets.contains([&](auto const& t) { return t->is_loaded() && muted(*t); });
+    if (can_mute || !can_unmute)
+        add(bulk ? "&Mute Tabs" : "&Mute Tab", Command::Mute)->setEnabled(can_mute);
+    if (can_unmute)
+        add(bulk ? "Un&mute Tabs" : "Un&mute Tab", Command::Unmute);
+    menu->addSeparator();
+    add("Move to New &Window", Command::Move)->setEnabled(tab_count() > 1);
+    add(bulk ? "Copy &Links" : "Copy &Link", Command::Copy);
+    menu->addSeparator();
+    auto* close_action = add(bulk ? "&Close Tabs" : "&Close Tab", Command::Close);
+    if (!bulk) {
+        reload->setShortcuts({ QKeySequence(Qt::CTRL | Qt::Key_R), QKeySequence(Qt::Key_F5) });
+        close_action->setShortcut(QKeySequence::Close);
+        for (auto* action : { reload, close_action }) {
+            action->setShortcutContext(Qt::WidgetShortcut);
+            action->setShortcutVisibleInContextMenu(true);
+        }
+    }
+    add("Cl&ose Other Tabs", Command::CloseOthers)->setEnabled(!other_tabs.is_empty());
+    add(horizontal ? "Close Tabs to the R&ight" : "Close Tabs B&elow", Command::CloseFollowing)->setEnabled(!following_tabs.is_empty());
+    menu->addSeparator();
+    menu->addAction(Application::the().reopen_recently_closed_tab_action());
+    Optional<TabFolderId> folder;
+    if (!keys.is_empty()) {
+        TabFolderMenus::add_move_menu(*menu, m_tab_folders, [&](TabFolderId id) {
+            command = Command::MoveToFolder;
+            folder = id; }, [&] { command = Command::CreateFolder; });
+    }
+
+    execute_context_menu(*menu, global_position);
+    delete menu.data();
+    if (!window)
+        return;
+    auto still_here = [&](QPointer<Tab> const& t) { return window && t && window->tab_index(t) >= 0; };
+    switch (command) {
+    case Command::None:
+        return;
+    case Command::NewTab:
+        if (still_here(clicked))
+            new_tab_from_url(Application::settings().new_tab_page_url(), Web::HTML::ActivateTab::Yes, TabLocation::after_tab(*clicked));
+        return;
+    case Command::Copy: {
+        QStringList links;
+        for (auto const& target : targets) {
+            if (still_here(target))
+                links.append(qstring_from_ak_string(target->url().serialize()));
+        }
+        if (!links.isEmpty())
+            QGuiApplication::clipboard()->setText(links.join('\n'));
+        return;
+    }
+    case Command::Move: {
+        QPointer<BrowserWindow> destination;
+        for (auto const& target : targets) {
+            if (!still_here(target))
+                continue;
+            if (!destination)
+                destination = &detach_tab_to_new_window(tab_index(target), mapToGlobal(QPoint(width() / 4, height() / 4)));
+            else
+                move_tab_to_window(tab_index(target), *destination, destination->tab_count());
+            if (!destination)
+                break;
+        }
+        return;
+    }
+    case Command::CreateFolder:
+    case Command::MoveToFolder: {
+        Vector<TabFolderTree::Item> items;
+        keys.clear();
+        for (auto const& target : targets) {
+            if (!still_here(target))
+                continue;
+            if (auto id = target->session_tab_id(); id.has_value()) {
+                items.append(TabFolderTree::Item::tab(*id));
+                keys.append(*id);
+            }
+        }
+        if (keys.is_empty())
+            return;
+        if (folder.has_value())
+            move_tab_folder_items(items, TabFolderDestination::at_end_of(*folder));
+        else
+            start_creating_tab_folder({ {}, AK::move(keys) });
+        return;
+    }
+    case Command::CloseOthers:
+    case Command::CloseFollowing:
+        if (!still_here(clicked))
+            return;
+        targets = command == Command::CloseOthers ? AK::move(other_tabs) : AK::move(following_tabs);
+        if (targets.contains_slow(current_tab()))
+            activate_tab(tab_index(clicked));
+        [[fallthrough]];
+    case Command::Close:
+        for (auto const& target : targets.in_reverse()) {
+            if (still_here(target) && (command == Command::Close || !target->is_pinned()))
+                target->request_close();
+        }
+        return;
+    case Command::Duplicate:
+    case Command::Unpin:
+        // Unpinned tabs and copies of pinned tabs insert at the start of the unpinned group.
+        targets.reverse();
+        break;
+    default:
+        break;
+    }
+    for (auto const& target : targets) {
+        if (!still_here(target))
+            continue;
+        switch (command) {
+        case Command::Reload:
+            if (target->is_loaded())
+                target->view().reload();
+            else
+                target->ensure_loaded();
+            break;
+        case Command::Duplicate:
+            duplicate_tab(*target, target == clicked ? Web::HTML::ActivateTab::Yes : Web::HTML::ActivateTab::No);
+            break;
+        case Command::Pin:
+            pin_tab(*target);
+            break;
+        case Command::Unpin:
+            unpin_tab(*target);
+            break;
+        case Command::Mute:
+        case Command::Unmute:
+            if (target->is_loaded() && muted(*target) != (command == Command::Mute))
+                target->view().toggle_page_mute_state();
+            break;
+        default:
+            VERIFY_NOT_REACHED();
+        }
+    }
 }
 
 void BrowserWindow::show_sidebar_context_menu(QPoint global_position)

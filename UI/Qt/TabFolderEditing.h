@@ -40,7 +40,7 @@ struct Selection {
 // another tab also takes in the active tab, as the tab already chosen, the way a browser's tab strip does.
 Selection toggled(Selection, TabKey clicked, Optional<TabKey> active);
 Selection extended(Selection, Vector<TabFolderSync::SidebarRow> const&, TabKey clicked, Optional<TabKey> active);
-Vector<TabKey> context_tabs(Selection const&, TabKey clicked);
+Vector<TabKey> context_tabs(Selection const&, TabKey clicked, Vector<TabKey> const& window_order);
 
 struct FolderCreation {
     Optional<TabFolderId> parent;

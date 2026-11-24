@@ -48,11 +48,16 @@ Selection extended(Selection selection, Vector<TabFolderSync::SidebarRow> const&
     return { move(keys), anchor };
 }
 
-Vector<TabKey> context_tabs(Selection const& selection, TabKey clicked)
+Vector<TabKey> context_tabs(Selection const& selection, TabKey clicked, Vector<TabKey> const& window_order)
 {
-    if (selection.keys.contains_slow(clicked))
-        return selection.keys;
-    return { clicked };
+    if (!selection.keys.contains_slow(clicked))
+        return { clicked };
+    Vector<TabKey> keys;
+    for (auto key : window_order) {
+        if (selection.keys.contains_slow(key))
+            keys.append(key);
+    }
+    return keys;
 }
 
 static void reveal_folder(TabFolderTree& tree, TabFolderId folder)

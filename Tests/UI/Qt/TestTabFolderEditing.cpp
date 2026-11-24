@@ -83,9 +83,10 @@ TEST_CASE(shift_replaces_the_range_without_moving_its_anchor)
 
 TEST_CASE(right_click_on_a_selected_tab_targets_the_whole_selection)
 {
-    Selection selection { { 1, 3, 5 }, 1 };
-    EXPECT_EQ(TabFolderEditing::context_tabs(selection, 3), (Vector<i64> { 1, 3, 5 }));
-    EXPECT_EQ(TabFolderEditing::context_tabs(selection, 2), (Vector<i64> { 2 }));
+    Selection selection { { 5, 1, 3, 9 }, 1 };
+    Vector<i64> window_order { 3, 2, 1, 5 };
+    EXPECT_EQ(TabFolderEditing::context_tabs(selection, 3, window_order), (Vector<i64> { 3, 1, 5 }));
+    EXPECT_EQ(TabFolderEditing::context_tabs(selection, 2, window_order), (Vector<i64> { 2 }));
 }
 
 TEST_CASE(provisional_folder_previews_placement_without_moving_tabs)

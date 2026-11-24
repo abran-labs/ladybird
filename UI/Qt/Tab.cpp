@@ -44,7 +44,6 @@
 #include <QAction>
 #include <QApplication>
 #include <QCalendarWidget>
-#include <QClipboard>
 #include <QColorDialog>
 #include <QCursor>
 #include <QDialogButtonBox>
@@ -195,8 +194,6 @@ void Tab::create_tab_shell()
     auto* tab_layout = new QBoxLayout(QBoxLayout::Direction::TopToBottom, this);
     tab_layout->setSpacing(0);
     tab_layout->setContentsMargins(0, 0, 0, 0);
-
-    create_tab_context_menu();
 }
 
 void Tab::initialize(Optional<u64> hub_view_id)
@@ -871,107 +868,6 @@ void Tab::initialize(Optional<u64> hub_view_id)
     };
 }
 
-void Tab::create_tab_context_menu()
-{
-    auto& application = ApplicationActions::the();
-
-    auto* duplicate_tab_action = new QAction("&Duplicate Tab", this);
-    QObject::connect(duplicate_tab_action, &QAction::triggered, this, [this]() {
-        m_window->duplicate_tab(*this);
-    });
-
-    m_pin_tab_action = new QAction("&Pin Tab", this);
-    QObject::connect(m_pin_tab_action, &QAction::triggered, this, [this]() {
-        if (m_is_pinned)
-            m_window->unpin_tab(*this);
-        else
-            m_window->pin_tab(*this);
-    });
-
-    auto* new_tab_action = new QAction(this);
-    QObject::connect(new_tab_action, &QAction::triggered, this, [this]() {
-        m_window->new_tab_from_url(Application::settings().new_tab_page_url(), Web::HTML::ActivateTab::Yes, BrowserWindow::TabLocation::after_tab(*this));
-    });
-
-    auto* mute_tab_action = new QAction("&Mute Tab", this);
-    QObject::connect(mute_tab_action, &QAction::triggered, this, [this]() {
-        if (is_loaded())
-            view().toggle_page_mute_state();
-    });
-
-    auto* move_to_new_window_action = new QAction("Move to New &Window", this);
-    QObject::connect(move_to_new_window_action, &QAction::triggered, this, [this]() {
-        m_window->detach_tab_to_new_window(tab_index(), m_window->mapToGlobal(QPoint(m_window->width() / 4, m_window->height() / 4)));
-    });
-
-    auto* copy_link_action = new QAction("Copy &Link", this);
-    QObject::connect(copy_link_action, &QAction::triggered, this, [this]() {
-        QGuiApplication::clipboard()->setText(qstring_from_ak_string(url().serialize()));
-    });
-
-    auto* close_tab_action = new QAction("&Close Tab", this);
-    // NB: The shortcuts belong to the application's actions. The menu only shows them.
-    close_tab_action->setShortcut(QKeySequence(QKeySequence::Close));
-    close_tab_action->setShortcutContext(Qt::WidgetShortcut);
-    close_tab_action->setShortcutVisibleInContextMenu(true);
-    QObject::connect(close_tab_action, &QAction::triggered, this, [this]() {
-        request_close();
-    });
-
-    auto* close_following_tabs_action = new QAction(this);
-    QObject::connect(close_following_tabs_action, &QAction::triggered, this, [this]() {
-        // Closing the current tab selects a neighbor, which may be a tab about to close too, and selecting a tab that
-        // hasn't loaded loads it. So, this tab, which stays open, becomes the current tab first.
-        if (auto* current = m_window->current_tab(); current && m_window->tab_index(current) > tab_index() && !current->is_pinned())
-            m_window->activate_tab(tab_index());
-        for (auto i = m_window->tab_count() - 1; i > tab_index(); i--) {
-            if (!m_window->tab_at(i)->is_pinned())
-                m_window->request_to_close_tab(i);
-        }
-    });
-
-    auto* close_other_tabs_action = new QAction("Cl&ose Other Tabs", this);
-    QObject::connect(close_other_tabs_action, &QAction::triggered, this, [this]() {
-        // As with closing the following tabs, activate this tab first if the current tab is among those closing.
-        if (auto* current = m_window->current_tab(); current && current != this && !current->is_pinned())
-            m_window->activate_tab(tab_index());
-        for (auto i = m_window->tab_count() - 1; i >= 0; i--) {
-            if (i == tab_index() || m_window->tab_at(i)->is_pinned())
-                continue;
-
-            m_window->request_to_close_tab(i);
-        }
-    });
-
-    m_context_menu = new QMenu("Context menu", this);
-    m_context_menu->addAction(new_tab_action);
-    m_context_menu->addSeparator();
-    m_context_menu->addAction(create_application_action(*this, application.reload_action(), IncludeActionIcon::No));
-    m_context_menu->addAction(duplicate_tab_action);
-    m_context_menu->addAction(m_pin_tab_action);
-    m_context_menu->addAction(mute_tab_action);
-    m_context_menu->addSeparator();
-    m_context_menu->addAction(move_to_new_window_action);
-    m_context_menu->addAction(copy_link_action);
-    m_context_menu->addSeparator();
-    m_context_menu->addAction(close_tab_action);
-    m_context_menu->addAction(close_other_tabs_action);
-    m_context_menu->addAction(close_following_tabs_action);
-    m_context_menu->addSeparator();
-    m_context_menu->addAction(Application::the().reopen_recently_closed_tab_action());
-
-    QObject::connect(m_context_menu, &QMenu::aboutToShow, this, [this, new_tab_action, close_following_tabs_action, mute_tab_action, move_to_new_window_action]() {
-        auto is_horizontal = m_window->tab_widget().tab_bar()->tab_layout() == TabLayout::Horizontal;
-        new_tab_action->setText(is_horizontal ? "New Tab to the &Right" : "New Tab &Below");
-        close_following_tabs_action->setText(is_horizontal ? "Close Tabs to the R&ight" : "Close Tabs B&elow");
-
-        // A tab that hasn't loaded has no page to mute yet.
-        mute_tab_action->setEnabled(is_loaded());
-        mute_tab_action->setText(is_loaded() && view().page_mute_state() == Web::HTML::MuteState::Muted ? "Un&mute Tab" : "&Mute Tab");
-        move_to_new_window_action->setEnabled(m_window->tab_count() > 1);
-    });
-}
-
 // The window's toolbar can hold the address field while the tab goes away with the window.
 Tab::~Tab()
 {
@@ -1067,12 +963,6 @@ void Tab::set_window(BrowserWindow& window)
     // The tab's pages hold the geometry of the window that hosted them until now.
     m_view->set_window_position({ window.x(), window.y() });
     m_view->set_window_size({ window.width(), window.height() });
-}
-
-void Tab::set_pinned(bool pinned)
-{
-    m_is_pinned = pinned;
-    m_pin_tab_action->setText(pinned ? "Un&pin Tab" : "&Pin Tab");
 }
 
 void Tab::navigate(URL::URL const& url)

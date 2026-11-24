@@ -138,8 +138,6 @@ public:
     void clear_attention() { m_needs_attention = false; }
     QString title() const;
 
-    QMenu* context_menu() const { return m_context_menu; }
-
     LocationEdit& location_edit() { return *m_location_edit; }
     WebView::TabPerformanceStats const& performance_stats() const { return m_performance_stats; }
 
@@ -150,7 +148,7 @@ public:
 
     bool is_pinned() const { return m_is_pinned; }
     // BrowserWindow pins and unpins tabs, since it keeps each window's pinned tabs at the start of its strip.
-    void set_pinned(bool);
+    void set_pinned(bool pinned) { m_is_pinned = pinned; }
 
     bool url_is_hidden() const { return m_location_edit->url_is_hidden(); }
     void set_url_is_hidden(bool url_is_hidden) { m_location_edit->set_url_is_hidden(url_is_hidden); }
@@ -181,7 +179,6 @@ signals:
 
 private:
     void create_tab_shell();
-    void create_tab_context_menu();
     void initialize(Optional<u64> hub_view_id);
 
     void location_edit_return_pressed(String, Optional<URL::URL>, WebView::OmniboxDestinationKind);
@@ -248,10 +245,8 @@ private:
     bool m_has_had_real_size { false };
     bool m_is_updating_chrome_style { false };
 
-    QMenu* m_context_menu { nullptr };
     QMenu* m_select_dropdown { nullptr };
 
-    QAction* m_pin_tab_action { nullptr };
     WebView::TabPerformanceStats m_performance_stats;
 
     JavaScriptDialog* m_javascript_dialog { nullptr };
