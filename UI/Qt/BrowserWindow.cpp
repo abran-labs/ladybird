@@ -37,6 +37,7 @@
 #endif
 #include <UI/Qt/TabBar.h>
 #include <UI/Qt/Theme.h>
+#include <UI/Qt/WaylandWindow.h>
 #include <UI/Qt/WebContentView.h>
 #include <UI/Qt/WindowControlButton.h>
 
@@ -1510,6 +1511,10 @@ void BrowserWindow::toggle_window_maximized()
 
 bool BrowserWindow::start_window_move()
 {
+    // Leave movement over client-side browser chrome to Hyprland's compositor binding.
+    if (is_hyprland_wayland_session())
+        return false;
+
     auto* handle = windowHandle();
     if (!handle)
         return false;

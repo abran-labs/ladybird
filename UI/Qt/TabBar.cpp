@@ -35,9 +35,7 @@
 #include <UI/Qt/SystemAppearance.h>
 #include <UI/Qt/TabBar.h>
 #include <UI/Qt/Theme.h>
-#if defined(LADYBIRD_HAS_WAYLAND_CLIENT)
-#    include <UI/Qt/WaylandWindow.h>
-#endif
+#include <UI/Qt/WaylandWindow.h>
 #include <UI/Qt/WindowControlButton.h>
 #include <UI/Qt/WindowControlsReveal.h>
 
@@ -3034,6 +3032,9 @@ void TabBar::toggle_window_maximized()
 
 bool TabBar::start_window_move()
 {
+    if (is_hyprland_wayland_session())
+        return false;
+
     auto* handle = window()->windowHandle();
     if (!handle)
         return false;
@@ -5404,6 +5405,9 @@ void TabWidget::toggle_window_maximized()
 
 bool TabWidget::start_window_move()
 {
+    if (is_hyprland_wayland_session())
+        return false;
+
     auto* handle = window()->windowHandle();
     if (!handle)
         return false;

@@ -17,4 +17,10 @@ wl_surface* wayland_surface_for_window(QWindow const&);
 // Whether the Wayland compositor can move a window with the pointer while it is dragged. It never can off Wayland.
 bool wayland_compositor_moves_dragged_windows();
 
+#if defined(LADYBIRD_HAS_WAYLAND_CLIENT)
+bool is_hyprland_wayland_session();
+#else
+inline bool is_hyprland_wayland_session() { return false; }
+#endif
+
 }
