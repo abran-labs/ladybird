@@ -216,7 +216,7 @@ private:
     QPoint tab_drag_hot_spot() const;
     void start_strip_drag(int index, QPoint position);
     void update_strip_drag(QPoint position);
-    void end_strip_drag();
+    void end_strip_drag(bool keep_vertical_card = false);
     void drag_tab_loose(Tab&, QPixmap card);
     void drag_tab_in_own_window(Tab&);
     void start_hover_animation(int tab_index, qreal target_progress);
@@ -323,6 +323,14 @@ private:
     void refresh_row_drag(bool allow_detach = false);
     void retarget_row_drag();
     void animate_rows_from(HashMap<u64, qreal> start_y);
+    bool vertical_drag_motion_enabled() const;
+    void set_vertical_drop_indicator(QRect);
+    QRectF displayed_vertical_drop_indicator() const;
+    void show_vertical_drag_card(QRect source, size_t item_count);
+    void move_vertical_drag_card(QPoint);
+    void land_vertical_drag_card(QRect);
+    void restore_vertical_drag_cursor();
+    void clear_vertical_drag_card();
     int sidebar_rows_origin_y() const;
     Vector<TabFolderTree::Item> selected_sidebar_items() const;
     bool is_selected_sidebar_tab(int index) const;
@@ -409,6 +417,13 @@ private:
     // Where the card a dragged tab is drawn as sits in the tab.
     QPoint m_tab_drag_card_offset;
     QObject* m_strip_drag_cancellation_filter { nullptr };
+
+    QVariantAnimation* m_vertical_drop_indicator_animation { nullptr };
+    QPointer<TabDragCard> m_vertical_drag_card;
+    bool m_vertical_drag_cursor_active { false };
+    Optional<TabFolderTree::Item> m_row_drag_grabbed;
+    QPoint m_vertical_drag_landing_start;
+    Optional<QPoint> m_vertical_drag_landing_end;
 };
 
 class TabWidget final : public QWidget {

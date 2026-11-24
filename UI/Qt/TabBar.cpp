@@ -177,6 +177,7 @@ static constexpr int TAB_DRAG_START_DISTANCE = 4;
 static constexpr int TAB_DETACH_DISTANCE = 40;
 // How far a card dragged along the sidebar's rows moves sideways to land one level deeper or shallower.
 static constexpr int ROW_DRAG_DEPTH_STEP = 12;
+static constexpr int VERTICAL_DRAG_PREVIEW_GAP = 18;
 // A closing tab fades out over this much of the time the other tabs take to close the gap it leaves.
 static constexpr qreal CLOSING_TAB_FADE_PORTION = 0.4;
 // The first and last tabs are this much wider, on the outer side, to make room for their feet at the ends of the tab bar.
@@ -687,7 +688,7 @@ private:
     bool m_was_canceled { false };
 };
 
-// The card a tab dragged within its strip is drawn as, above the rest of the window.
+// The image of a drag within the tab strip, drawn above the rest of the window.
 class TabDragCard final : public QWidget {
 public:
     AK_ALLOC_WITH_KMALLOC;
@@ -700,14 +701,22 @@ public:
         resize(m_pixmap.deviceIndependentSize().toSize());
     }
 
+    void set_opacity(qreal opacity)
+    {
+        m_opacity = opacity;
+        update();
+    }
+
 private:
     virtual void paintEvent(QPaintEvent*) override
     {
         QPainter painter(this);
+        painter.setOpacity(m_opacity);
         painter.drawPixmap(0, 0, m_pixmap);
     }
 
     QPixmap m_pixmap;
+    qreal m_opacity { 1.0 };
 };
 
 TabBar::TabBar(TabWidget* tab_widget)
@@ -852,6 +861,7 @@ TabBar::TabBar(TabWidget* tab_widget)
 
 TabBar::~TabBar()
 {
+    clear_vertical_drag_card();
     delete m_folder_name_editor.data();
 }
 
@@ -884,6 +894,8 @@ u64 TabBar::row_key(TabFolderTree::Item item)
 
 void TabBar::lay_out_sidebar_rows(bool animate)
 {
+    if (m_vertical_drag_landing_end.has_value())
+        clear_vertical_drag_card();
     if (m_rows_animation)
         m_rows_animation->stop();
     // The first usable view lays rows out directly. The animation pass can start from these settled positions.
@@ -1262,13 +1274,22 @@ void TabBar::animate_rows_from(HashMap<u64, qreal> start_y)
         m_rows_animation->setEndValue(1.0);
         connect(m_rows_animation, &QVariantAnimation::valueChanged, this, [this](QVariant const& value) {
             m_rows_progress = value.toReal();
+            if (m_vertical_drag_landing_end.has_value() && m_vertical_drag_card) {
+                auto offset = *m_vertical_drag_landing_end - m_vertical_drag_landing_start;
+                m_vertical_drag_card->move(m_vertical_drag_landing_start + offset * m_rows_progress);
+                m_vertical_drag_card->set_opacity(1.0 - m_rows_progress);
+            }
             update_tab_button_geometry();
             update();
+        });
+        connect(m_rows_animation, &QVariantAnimation::finished, this, [this] {
+            if (m_vertical_drag_landing_end.has_value())
+                clear_vertical_drag_card();
         });
     }
     m_rows_animation->stop();
     // With reduced motion, the rows jump into place.
-    if (SystemAppearance::prefers_reduced_motion() || start_y.is_empty()) {
+    if (!vertical_drag_motion_enabled() || (start_y.is_empty() && !m_vertical_drag_landing_end.has_value())) {
         m_row_start_y.clear();
         m_rows_progress = 1.0;
         rows_changed_layout();
@@ -1279,6 +1300,136 @@ void TabBar::animate_rows_from(HashMap<u64, qreal> start_y)
     m_rows_animation->setDuration(DROP_PREVIEW_DURATION_MS);
     m_rows_animation->start();
     rows_changed_layout();
+}
+
+bool TabBar::vertical_drag_motion_enabled() const
+{
+    return !SystemAppearance::prefers_reduced_motion()
+        && style()->styleHint(QStyle::SH_Widget_Animation_Duration, nullptr, this) > 0;
+}
+
+QRectF TabBar::displayed_vertical_drop_indicator() const
+{
+    if (m_vertical_drop_indicator_animation && m_vertical_drop_indicator_animation->state() == QAbstractAnimation::Running)
+        return m_vertical_drop_indicator_animation->currentValue().toRectF();
+    return m_vertical_drop_line;
+}
+
+void TabBar::set_vertical_drop_indicator(QRect line)
+{
+    if (m_vertical_drop_line == line)
+        return;
+
+    auto from = displayed_vertical_drop_indicator();
+    m_vertical_drop_line = line;
+    if (m_vertical_drop_indicator_animation)
+        m_vertical_drop_indicator_animation->stop();
+
+    // Only glide between nearby edges of the same orientation. A folder takes over immediately, and skipping
+    // several slots (or wrapping around a pinned row) shouldn't sweep across unrelated targets.
+    auto horizontal_edge = line.width() > line.height();
+    if (line.isValid() && from.isValid()
+        && horizontal_edge == (from.width() > from.height())
+        && abs(QRectF(line).center().y() - from.center().y()) <= (horizontal_edge ? VERTICAL_TAB_HEIGHT : 0)
+        && vertical_drag_motion_enabled()) {
+        if (!m_vertical_drop_indicator_animation) {
+            m_vertical_drop_indicator_animation = new QVariantAnimation(this);
+            m_vertical_drop_indicator_animation->setDuration(Motion::FAST);
+            m_vertical_drop_indicator_animation->setEasingCurve(Motion::move_easing());
+            connect(m_vertical_drop_indicator_animation, &QVariantAnimation::valueChanged, this, [this] { update(); });
+        }
+        m_vertical_drop_indicator_animation->setStartValue(from);
+        m_vertical_drop_indicator_animation->setEndValue(QRectF(line));
+        m_vertical_drop_indicator_animation->start();
+    }
+    update();
+}
+
+void TabBar::show_vertical_drag_card(QRect source, size_t item_count)
+{
+    clear_vertical_drag_card();
+    // Snapshot just the leading part of the grabbed row, so even a wide sidebar has a small pickup preview.
+    source.setWidth(min(source.width(), 144));
+    auto size = source.size() * 0.6;
+    auto stack_offset = static_cast<int>(min(item_count, 3uz) - 1) * 3;
+    auto dpr = devicePixelRatioF();
+    QPixmap pixmap((size + QSize(stack_offset, stack_offset)) * dpr);
+    pixmap.setDevicePixelRatio(dpr);
+    pixmap.fill(Qt::transparent);
+    {
+        QPainter painter(&pixmap);
+        painter.setRenderHint(QPainter::Antialiasing);
+        auto const& chrome = Theme::chrome(*this);
+        painter.setPen(chrome.muted);
+        painter.setBrush(chrome.toolbar);
+        for (int offset = stack_offset; offset >= 0; offset -= 3)
+            painter.drawRoundedRect(QRectF(QPoint(offset, offset), size).adjusted(0.5, 0.5, -0.5, -0.5), 4, 4);
+        QPainterPath clip;
+        clip.addRoundedRect(QRectF(QPointF(), size).adjusted(1, 1, -1, -1), 3, 3);
+        painter.setClipPath(clip);
+        painter.scale(0.6, 0.6);
+        render(&painter, QPoint(), QRegion(source), QWidget::DrawChildren);
+    }
+    m_vertical_drag_card = new TabDragCard(*window(), AK::move(pixmap));
+    QApplication::setOverrideCursor(Qt::ClosedHandCursor);
+    m_vertical_drag_cursor_active = true;
+}
+
+void TabBar::move_vertical_drag_card(QPoint position)
+{
+    if (!m_vertical_drag_card)
+        return;
+
+    auto size = m_vertical_drag_card->size();
+    // Keep the preview in the chrome even when the page is a separate native surface above the window's backing store.
+    auto below = position.y() + VERTICAL_DRAG_PREVIEW_GAP;
+    auto above = position.y() - VERTICAL_DRAG_PREVIEW_GAP - size.height();
+    if (m_row_drag.has_value() && m_hovered_folder.has_value()) {
+        if (auto folder = folder_row_rect(*m_hovered_folder); folder.has_value()) {
+            below = max(below, folder->bottom() + 3);
+            above = min(above, folder->top() - size.height() - 2);
+        }
+    }
+    auto x = position.x() + VERTICAL_DRAG_PREVIEW_GAP;
+    if (x + size.width() > width())
+        x = position.x() - VERTICAL_DRAG_PREVIEW_GAP - size.width();
+    x = clamp(x, 0, max(0, width() - size.width()));
+    if (m_vertical_drop_line.isValid()) {
+        auto sweep = displayed_vertical_drop_indicator().united(m_vertical_drop_line).toAlignedRect();
+        if (x < sweep.right() && x + size.width() > sweep.left()) {
+            below = max(below, sweep.bottom() + 3);
+            above = min(above, sweep.top() - size.height() - 2);
+        }
+    }
+    auto y = below + size.height() <= height() ? below : above;
+    auto top_left = QPoint(x, clamp(y, 0, max(0, height() - size.height())));
+    m_vertical_drag_card->move(mapTo(window(), top_left));
+    m_vertical_drag_card->show();
+    m_vertical_drag_card->raise();
+}
+
+void TabBar::land_vertical_drag_card(QRect destination)
+{
+    if (!m_vertical_drag_card || !vertical_drag_motion_enabled() || !rect().intersects(destination)) {
+        clear_vertical_drag_card();
+        return;
+    }
+    m_vertical_drag_landing_start = m_vertical_drag_card->pos();
+    auto offset = QPoint(0, (destination.height() - m_vertical_drag_card->height()) / 2);
+    m_vertical_drag_landing_end = mapTo(window(), destination.topLeft() + offset);
+}
+
+void TabBar::restore_vertical_drag_cursor()
+{
+    if (exchange(m_vertical_drag_cursor_active, false))
+        QApplication::restoreOverrideCursor();
+}
+
+void TabBar::clear_vertical_drag_card()
+{
+    restore_vertical_drag_cursor();
+    m_vertical_drag_landing_end.clear();
+    delete m_vertical_drag_card.data();
 }
 
 bool TabBar::start_row_drag(TabFolderTree::Item pressed, Vector<TabFolderTree::Item> items, QPoint position)
@@ -1299,6 +1450,9 @@ bool TabBar::start_row_drag(TabFolderTree::Item pressed, Vector<TabFolderTree::I
     drag.last_position = position;
     set_hovered_tab_index(-1);
     set_hovered_folder({});
+    auto source = sidebar_row_rect(m_laid_out_rows[*grabbed], pinned_region());
+    show_vertical_drag_card(source, drag.moving.size());
+    m_row_drag_grabbed = pressed;
     m_row_drag = AK::move(drag);
     m_row_drag_cancellation_filter = new TabDragCancellationFilter([this] { end_row_drag(false); });
     m_row_drag_cancellation_filter->setParent(this);
@@ -1342,7 +1496,13 @@ void TabBar::retarget_row_drag()
         drag.depth = target->depth;
         drag.destination = target->destination;
     }
-    update();
+    if (drag.destination.has_value() && !m_hovered_folder.has_value()) {
+        auto indent = sidebar_row_indent(drag.depth);
+        auto y = sidebar_rows_origin_y() + drag.indicator_slot * VERTICAL_TAB_HEIGHT;
+        set_vertical_drop_indicator({ vertical_tabs_left() + indent + 3, y - 1, vertical_bar_width() - indent - 6, 2 });
+    } else {
+        set_vertical_drop_indicator({});
+    }
 }
 
 void TabBar::update_row_drag(QPoint position, bool allow_detach)
@@ -1373,6 +1533,7 @@ void TabBar::update_row_drag(QPoint position, bool allow_detach)
     }
 
     retarget_row_drag();
+    move_vertical_drag_card(position);
 }
 
 void TabBar::refresh_row_drag(bool allow_detach)
@@ -1401,6 +1562,12 @@ void TabBar::end_row_drag(bool drop)
     if (!m_row_drag.has_value())
         return;
     auto drag = m_row_drag.release_value();
+    auto grabbed = m_row_drag_grabbed.release_value();
+    auto folder = m_hovered_folder;
+    auto* browser_window = qobject_cast<BrowserWindow*>(window());
+    auto old_position = browser_window ? browser_window->tab_folders().position_of(grabbed) : Optional<TabFolderDestination> {};
+    restore_vertical_drag_cursor();
+    set_vertical_drop_indicator({});
 
     // Animate the committed move from the unchanged row positions.
     HashMap<u64, qreal> start_y;
@@ -1419,7 +1586,7 @@ void TabBar::end_row_drag(bool drop)
     update_folder_glyphs();
 
     if (drop && drag.destination.has_value()) {
-        if (auto* browser_window = qobject_cast<BrowserWindow*>(window())) {
+        if (browser_window) {
             auto const& tree = browser_window->tab_folders();
             if (tree.has_folders()) {
                 browser_window->move_tab_folder_items(drag.moving, *drag.destination);
@@ -1436,6 +1603,21 @@ void TabBar::end_row_drag(bool drop)
     }
     // NB: A drop in the place the items started leaves the rows as they were, so they don't lay themselves out anew.
     lay_out_sidebar_rows(false);
+    // The real rows start at their old positions; the miniature lands at the committed row (or the folder that
+    // swallowed it) and fades into it on the same transition.
+    auto new_position = browser_window ? browser_window->tab_folders().position_of(grabbed) : Optional<TabFolderDestination> {};
+    if (drop && drag.destination.has_value() && old_position.has_value() && new_position.has_value()
+        && (old_position->index != new_position->index || old_position->parent != new_position->parent)) {
+        auto landed = m_laid_out_rows.find_first_index_if([&](auto const& row) { return row.row.row.item == grabbed; });
+        QRect destination;
+        if (landed.has_value())
+            destination = sidebar_row_rect(m_laid_out_rows[*landed], pinned_region());
+        else if (folder.has_value())
+            destination = folder_row_rect(*folder).value_or(QRect {});
+        land_vertical_drag_card(destination);
+    } else {
+        clear_vertical_drag_card();
+    }
     if (drop && drag.destination.has_value())
         animate_rows_from(AK::move(start_y));
 }
@@ -1454,6 +1636,12 @@ void TabBar::set_tab_layout(TabLayout tab_layout)
         return;
 
     end_row_drag(false);
+    if (m_vertical_drag_cursor_active && m_strip_drag_card) {
+        end_strip_drag();
+        clear_drop_preview();
+    }
+    clear_vertical_drag_card();
+    set_vertical_drop_indicator({});
     m_tab_layout = tab_layout;
     m_scroll_offset = 0;
     m_locked_tab_width = {};
@@ -1667,8 +1855,16 @@ bool TabBar::event(QEvent* event)
     if (event->type() == QEvent::Show)
         update_loading_ring_animation();
 
-    if (m_row_drag.has_value() && (event->type() == QEvent::Hide || event->type() == QEvent::WindowDeactivate || event->type() == QEvent::UngrabMouse))
-        end_row_drag(false);
+    if (event->type() == QEvent::Hide || event->type() == QEvent::WindowDeactivate || event->type() == QEvent::UngrabMouse) {
+        if (m_row_drag.has_value()) {
+            end_row_drag(false);
+        } else if (m_vertical_drag_cursor_active && m_strip_drag_card) {
+            end_strip_drag();
+            clear_drop_preview();
+        } else if (event->type() != QEvent::UngrabMouse && m_vertical_drag_landing_end.has_value()) {
+            clear_vertical_drag_card();
+        }
+    }
 
     return QTabBar::event(event);
 }
@@ -1702,7 +1898,7 @@ void TabBar::paintEvent(QPaintEvent*)
 
     auto is_vertical = tab_layout() != TabLayout::Horizontal;
     auto is_collapsed_vertical = tab_layout() == TabLayout::VerticalCollapsed;
-    auto dragged_index = dragged_tab_index();
+    auto dragged_index = m_vertical_drag_cursor_active ? Optional<int> {} : dragged_tab_index();
     auto hover_progress_of = [&](int index) {
         if (index == m_tab_painted_unselected)
             return 0.0;
@@ -2075,13 +2271,15 @@ void TabBar::paintEvent(QPaintEvent*)
     m_tabs_with_cut_titles = AK::move(tabs_with_cut_titles);
 
     painter.setClipping(false);
-    if (m_row_drag.has_value() && m_row_drag->destination.has_value() && !m_hovered_folder.has_value()) {
-        auto indent = sidebar_row_indent(m_row_drag->depth);
-        auto y = sidebar_rows_origin_y() + m_row_drag->indicator_slot * VERTICAL_TAB_HEIGHT;
-        QRect line { vertical_tabs_left() + indent + 3, y - 1, vertical_bar_width() - indent - 6, 2 };
-        painter.fillRect(line.intersected(unpinned_clip), Theme::accent());
-    } else if (is_vertical && m_drop_slot.has_value()) {
-        painter.fillRect(m_vertical_drop_line.intersected(dragging_pinned_tab() ? rect() : unpinned_clip), Theme::accent());
+    if (is_vertical && m_vertical_drop_line.isValid()) {
+        painter.save();
+        painter.setClipRect(!m_row_drag.has_value() && dragging_pinned_tab() ? rect() : unpinned_clip);
+        auto line = displayed_vertical_drop_indicator();
+        auto radius = min(line.width(), line.height()) / 2;
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(Theme::chrome(*this).muted);
+        painter.drawRoundedRect(line, radius, radius);
+        painter.restore();
     }
     // While the strip scrolls, it fades out at each end that has more tabs beyond it.
     if (!is_vertical) {
@@ -2264,7 +2462,12 @@ void TabBar::mousePressEvent(QMouseEvent* event)
 void TabBar::mouseMoveEvent(QMouseEvent* event)
 {
     if (m_strip_drag_card) {
-        update_strip_drag(event->pos());
+        if (m_vertical_drag_cursor_active && !event->buttons().testFlag(Qt::LeftButton)) {
+            end_strip_drag();
+            clear_drop_preview();
+        } else {
+            update_strip_drag(event->pos());
+        }
         event->accept();
         return;
     }
@@ -2363,10 +2566,23 @@ void TabBar::mouseReleaseEvent(QMouseEvent* event)
     if (m_strip_drag_card && event->button() == Qt::LeftButton) {
         auto dragged_tab = s_active_tab_dragged_tab;
         auto drop_index = drop_index_at(event->pos());
-        end_strip_drag();
+        auto vertical = m_vertical_drag_cursor_active;
+        end_strip_drag(vertical);
         if (auto* source_window = qobject_cast<BrowserWindow*>(window()); source_window && dragged_tab) {
-            if (auto current_index = source_window->tab_index(dragged_tab); current_index >= 0)
+            if (auto current_index = source_window->tab_index(dragged_tab); current_index >= 0) {
                 source_window->move_tab_to_window(current_index, *source_window, drop_index);
+                if (vertical) {
+                    auto new_index = source_window->tab_index(dragged_tab);
+                    if (new_index >= 0 && new_index != current_index)
+                        land_vertical_drag_card(visual_tab_rect(new_index));
+                }
+            }
+        }
+        if (vertical) {
+            if (m_vertical_drag_landing_end.has_value())
+                animate_rows_from({});
+            else
+                clear_vertical_drag_card();
         }
         clear_drop_preview();
         event->accept();
@@ -2543,9 +2759,8 @@ void TabBar::update_drop_preview(QPoint const& position)
 {
     if (tab_layout() != TabLayout::Horizontal) {
         auto drop = vertical_strip_drop_at(position);
-        m_vertical_drop_line = drop.line;
         m_drop_slot = drop.index;
-        update();
+        set_vertical_drop_indicator(drop.line);
         return;
     }
     set_drop_slot(drop_slot_at(position));
@@ -2582,7 +2797,7 @@ void TabBar::hide_drop_preview()
 {
     if (tab_layout() != TabLayout::Horizontal) {
         m_drop_slot.clear();
-        update();
+        set_vertical_drop_indicator({});
         return;
     }
     set_drop_slot({});
@@ -2605,6 +2820,8 @@ void TabBar::set_drop_slot(Optional<int> slot)
 
 void TabBar::clear_drop_preview()
 {
+    if (tab_layout() != TabLayout::Horizontal)
+        set_vertical_drop_indicator({});
     m_drop_preview_animation->stop();
     auto strip_had_grown = current_strip_growth() != 0;
     m_drop_slot = {};
@@ -3077,6 +3294,8 @@ void TabBar::start_strip_drag(int index, QPoint position)
     m_tab_drag_pixmap = render_tab_drag_pixmap(index);
     m_tab_drag_card_offset = tab_drag_card_rect(index).topLeft() - visual_tab_rect(index).topLeft();
     m_strip_drag_card = new TabDragCard(*window(), m_tab_drag_pixmap);
+    if (tab_layout() != TabLayout::Horizontal)
+        show_vertical_drag_card(visual_tab_rect(index), 1);
 
     s_active_tab_drag_source = m_tab_widget;
     s_active_tab_dragged_tab = m_tab_widget->tab(index);
@@ -3117,20 +3336,27 @@ void TabBar::update_strip_drag(QPoint position)
         return;
     }
 
-    // The tab stays in its strip, and only slides along it.
-    auto card_rect = tab_drag_card_rect(m_tab_widget->index_of(dragged_tab));
-    auto card_position = tab_layout() == TabLayout::Horizontal
-        ? QPoint(position.x() - m_position_in_selected_tab_while_dragging.x() + m_tab_drag_card_offset.x(), card_rect.top())
-        : QPoint(card_rect.left(), position.y() - m_position_in_selected_tab_while_dragging.y() + m_tab_drag_card_offset.y());
-    m_strip_drag_card->move(mapTo(window(), card_position) - QPoint(TAB_DRAG_IMAGE_MARGIN, TAB_DRAG_IMAGE_MARGIN));
+    if (tab_layout() == TabLayout::Horizontal) {
+        // The tab stays in its strip, and only slides along it.
+        auto card_rect = tab_drag_card_rect(m_tab_widget->index_of(dragged_tab));
+        auto card_position = QPoint(position.x() - m_position_in_selected_tab_while_dragging.x() + m_tab_drag_card_offset.x(), card_rect.top());
+        m_strip_drag_card->move(mapTo(window(), card_position) - QPoint(TAB_DRAG_IMAGE_MARGIN, TAB_DRAG_IMAGE_MARGIN));
+    }
     update_drop_preview(position);
+    if (m_vertical_drag_cursor_active)
+        move_vertical_drag_card(position);
 }
 
-void TabBar::end_strip_drag()
+void TabBar::end_strip_drag(bool keep_vertical_card)
 {
     if (!m_strip_drag_card)
         return;
 
+    if (m_vertical_drag_cursor_active) {
+        restore_vertical_drag_cursor();
+        if (!keep_vertical_card)
+            clear_vertical_drag_card();
+    }
     delete m_strip_drag_card;
     m_strip_drag_card = nullptr;
     m_tab_drag_pixmap = {};
@@ -3569,7 +3795,7 @@ void TabBar::update_tab_button_geometry()
         return qRound(card.center().y() - (button_height / 2.0));
     };
 
-    auto dragged_index = dragged_tab_index();
+    auto dragged_index = m_vertical_drag_cursor_active ? Optional<int> {} : dragged_tab_index();
 
     if (tab_layout() == TabLayout::Horizontal) {
         auto pinned_count = pinned_tab_count();
