@@ -9,6 +9,7 @@
 #include <LibTest/TestCase.h>
 #include <LibURL/Parser.h>
 #include <UI/Qt/SessionStore.h>
+#include <UI/Qt/TabFolderTree.h>
 
 #include <QTemporaryDir>
 
@@ -79,6 +80,7 @@ static SessionTabId open_tab(SessionStore& store, SessionWindowId window, String
 // Takes the schema back to SESSIONS_SCHEMA_DOCUMENT_POLICY_VERSION, so every migration after it runs again.
 static void rewind_sessions_schema_to_version_4(Database::Database& database)
 {
+    MUST(database.execute_raw("ALTER TABLE Sessions DROP COLUMN tab_folders;"sv));
     MUST(database.execute_raw("DROP TABLE SessionUpgradeInsecureNavigations;"sv));
     MUST(database.execute_raw("ALTER TABLE SessionPolicyContainers DROP COLUMN insecure_requests_policy;"sv));
     MUST(database.execute_raw("ALTER TABLE Sessions DROP COLUMN maximized;"sv));
@@ -110,7 +112,7 @@ TEST_CASE(fresh_database_migrates_to_the_latest_schema)
     for (auto table : { "Sessions"sv, "SessionTabs"sv, "SessionUsedSteps"sv, "SessionHistories"sv, "SessionNestedHistories"sv, "SessionEntries"sv, "SessionUpgradeInsecureNavigations"sv })
         EXPECT(TRY_OR_FAIL(database->table_exists(table)));
 
-    EXPECT_EQ(TRY_OR_FAIL(database->schema_version("Sessions"sv)), Optional<u32> { 10u });
+    EXPECT_EQ(TRY_OR_FAIL(database->schema_version("Sessions"sv)), Optional<u32> { 11u });
 }
 
 TEST_CASE(deleting_a_session_cascades_through_its_tabs)
@@ -157,7 +159,7 @@ TEST_CASE(version_4_database_migrates_to_the_latest_schema)
     rewind_sessions_schema_to_version_4(*database);
 
     EXPECT_EQ(TRY_OR_FAIL(SessionStore::migrate_schema(*database)), Database::MigrationOutcome::Success);
-    EXPECT_EQ(TRY_OR_FAIL(database->schema_version("Sessions"sv)), Optional<u32> { 10u });
+    EXPECT_EQ(TRY_OR_FAIL(database->schema_version("Sessions"sv)), Optional<u32> { 11u });
     EXPECT(TRY_OR_FAIL(database->table_exists("SessionUpgradeInsecureNavigations"sv)));
     EXPECT_EQ(select_i64(*database, "SELECT pinned FROM SessionTabs WHERE id = 2;"_string), 0);
     EXPECT_EQ(select_i64(*database, "SELECT COUNT(*) FROM Sessions WHERE id = 1 AND width IS NULL;"_string), 1);
@@ -2612,4 +2614,287 @@ TEST_CASE(exhausted_id_close_queues_the_discard_when_the_write_fails)
     TRY_OR_FAIL(database->execute_raw("DROP TRIGGER InjectedFailure;"sv));
     store->flush_dirty_state();
     EXPECT_EQ(select_i64(*database, MUST(String::formatted("SELECT COUNT(*) FROM SessionTabs WHERE id = {};", tab))), 0);
+}
+
+static TabFolderTree folder_tree_for(Vector<SessionTabId> const& tabs)
+{
+    TabFolderTree tree;
+    for (auto tab : tabs)
+        EXPECT(tree.add_tab(tab));
+    return tree;
+}
+
+TEST_CASE(a_database_without_tab_folders_migrates_and_restores_without_them)
+{
+    auto database = create_session_database();
+    EXPECT_EQ(TRY_OR_FAIL(database->schema_version("Sessions"sv)), Optional<u32> { 11u });
+
+    // What an older run leaves behind: a window and its tabs, with no folder column at all.
+    TRY_OR_FAIL(database->execute_raw("ALTER TABLE Sessions DROP COLUMN tab_folders;"sv));
+    TRY_OR_FAIL(database->execute_raw("UPDATE SchemaVersions SET version = 10 WHERE store = 'Sessions';"sv));
+    TRY_OR_FAIL(database->execute_raw("INSERT INTO Sessions (id, kind, closed_time, active_tab_index) VALUES (1, 0, 0, 0);"sv));
+    TRY_OR_FAIL(database->execute_raw("INSERT INTO SessionTabs (id, session_id, tab_ordinal, active_url, current_used_step_index) VALUES (2, 1, 0, 'https://a.example/', 0);"sv));
+
+    EXPECT_EQ(TRY_OR_FAIL(SessionStore::migrate_schema(*database)), Database::MigrationOutcome::Success);
+    EXPECT_EQ(TRY_OR_FAIL(database->schema_version("Sessions"sv)), Optional<u32> { 11u });
+    EXPECT_EQ(select_i64(*database, "SELECT COUNT(*) FROM Sessions WHERE id = 1 AND tab_folders IS NULL;"_string), 1);
+
+    auto store = TRY_OR_FAIL(SessionStore::create(*database, SessionLaunchPolicy::Everything));
+    auto plan = store->take_launch_plan();
+    EXPECT_EQ(plan.size(), 1uz);
+    EXPECT_EQ(plan[0].tabs.size(), 1uz);
+    EXPECT(!plan[0].tab_folders.has_value());
+}
+
+TEST_CASE(tab_folders_survive_a_restart_with_empty_folders_and_the_active_tab)
+{
+    auto database = create_session_database();
+    SessionWindowId window = 0;
+    SessionTabId a = 0;
+    SessionTabId b = 0;
+    SessionTabId c = 0;
+    TabFolderId outer = 0;
+    TabFolderId inner = 0;
+    TabFolderId empty = 0;
+    {
+        auto store = TRY_OR_FAIL(SessionStore::create(*database));
+        window = TRY_OR_FAIL(store->window_opened());
+        a = open_tab(*store, window, "https://a.example/"sv);
+        b = open_tab(*store, window, "https://b.example/"sv);
+        c = open_tab(*store, window, "https://c.example/"sv);
+        store->active_tab_changed(c);
+
+        auto tree = folder_tree_for({ a, b, c });
+        outer = tree.create_folder_around("Outer"_string, { TabFolderTree::Item::tab(b), TabFolderTree::Item::tab(c) }).release_value();
+        inner = tree.create_folder_around("Inner"_string, { TabFolderTree::Item::tab(c) }).release_value();
+        empty = tree.create_folder("Empty"_string).release_value();
+        EXPECT(tree.set_folder_icon(inner, "book"_string));
+        EXPECT(tree.set_folder_collapsed(outer, true));
+        TRY_OR_FAIL(store->tab_folders_changed(window, tree));
+        quit_cleanly(*store, { window });
+    }
+
+    auto store = TRY_OR_FAIL(SessionStore::create(*database, SessionLaunchPolicy::Everything));
+    auto plan = store->take_launch_plan();
+    EXPECT_EQ(plan.size(), 1uz);
+    EXPECT_EQ(plan[0].window_id, window);
+    EXPECT_EQ(plan[0].active_tab_index, 2);
+    EXPECT(plan[0].tab_folders.has_value());
+    auto const& tree = *plan[0].tab_folders;
+    using Item = TabFolderTree::Item;
+    EXPECT_EQ(tree.children(), (Vector<Item> { Item::tab(a), Item::folder(outer), Item::folder(empty) }));
+    EXPECT_EQ(tree.children(outer), (Vector<Item> { Item::tab(b), Item::folder(inner) }));
+    EXPECT_EQ(tree.children(inner), (Vector<Item> { Item::tab(c) }));
+    EXPECT(tree.folder(outer)->collapsed);
+    EXPECT_EQ(tree.folder(inner)->icon, Optional<String> { "book"_string });
+    EXPECT(tree.children(empty).is_empty());
+}
+
+TEST_CASE(a_window_whose_folders_are_all_gone_saves_no_folders)
+{
+    auto database = create_session_database();
+    auto store = TRY_OR_FAIL(SessionStore::create(*database));
+    auto window = TRY_OR_FAIL(store->window_opened());
+    auto a = open_tab(*store, window, "https://a.example/"sv);
+
+    auto tree = folder_tree_for({ a });
+    auto folder = tree.create_folder("A"_string).release_value();
+    TRY_OR_FAIL(store->tab_folders_changed(window, tree));
+    EXPECT_EQ(select_i64(*database, MUST(String::formatted("SELECT COUNT(*) FROM Sessions WHERE id = {} AND tab_folders IS NOT NULL;", window))), 1);
+
+    EXPECT(tree.unpack_folder(folder));
+    TRY_OR_FAIL(store->tab_folders_changed(window, tree));
+    EXPECT_EQ(select_i64(*database, MUST(String::formatted("SELECT COUNT(*) FROM Sessions WHERE id = {} AND tab_folders IS NULL;", window))), 1);
+}
+
+TEST_CASE(restored_tab_folders_drop_tabs_that_left_the_window)
+{
+    auto database = create_session_database();
+    SessionWindowId window = 0;
+    SessionTabId a = 0;
+    SessionTabId moved = 0;
+    SessionTabId closed = 0;
+    TabFolderId folder = 0;
+    {
+        auto store = TRY_OR_FAIL(SessionStore::create(*database));
+        window = TRY_OR_FAIL(store->window_opened());
+        auto other_window = TRY_OR_FAIL(store->window_opened());
+        a = open_tab(*store, window, "https://a.example/"sv);
+        moved = open_tab(*store, window, "https://b.example/"sv);
+        closed = open_tab(*store, window, "https://c.example/"sv);
+        auto tree = folder_tree_for({ a, moved, closed });
+        folder = tree.create_folder_around("F"_string, { TabFolderTree::Item::tab(a), TabFolderTree::Item::tab(moved), TabFolderTree::Item::tab(closed) }).release_value();
+        TRY_OR_FAIL(store->tab_folders_changed(window, tree));
+
+        // The frontend's tree would follow these, but a stale saved tree must not resurrect them.
+        store->tab_moved({ .tab_id = moved, .new_window_id = other_window, .ordinal = 0 });
+        TRY_OR_FAIL(store->tab_closed({ .tab_id = closed, .closed_at = UnixDateTime::now() }));
+        quit_cleanly(*store, { window, other_window });
+    }
+
+    auto store = TRY_OR_FAIL(SessionStore::create(*database, SessionLaunchPolicy::Everything));
+    auto plan = store->take_launch_plan();
+    Optional<RestoredSessionWindow> restored;
+    for (auto& entry : plan) {
+        if (entry.window_id == window)
+            restored = move(entry);
+    }
+    EXPECT(restored.has_value());
+    EXPECT(restored->tab_folders.has_value());
+    EXPECT_EQ(restored->tab_folders->children(folder), (Vector<TabFolderTree::Item> { TabFolderTree::Item::tab(a) }));
+    for (auto const& entry : plan) {
+        if (entry.window_id != window)
+            EXPECT(!entry.tab_folders.has_value());
+    }
+}
+
+TEST_CASE(corrupt_tab_folders_restore_the_window_without_folders)
+{
+    auto database = create_session_database();
+    SessionWindowId window = 0;
+    {
+        auto store = TRY_OR_FAIL(SessionStore::create(*database));
+        window = TRY_OR_FAIL(store->window_opened());
+        (void)open_tab(*store, window, "https://a.example/"sv);
+        quit_cleanly(*store, { window });
+    }
+    TRY_OR_FAIL(database->execute_raw("UPDATE Sessions SET tab_folders = '{\"version\":1,\"root\":[{\"bogus\":1}]}';"sv));
+
+    auto store = TRY_OR_FAIL(SessionStore::create(*database, SessionLaunchPolicy::Everything));
+    auto plan = store->take_launch_plan();
+    EXPECT_EQ(plan.size(), 1uz);
+    EXPECT_EQ(plan[0].tabs.size(), 1uz);
+    EXPECT(!plan[0].tab_folders.has_value());
+}
+
+TEST_CASE(restored_tab_folders_keep_writing_after_the_restore)
+{
+    auto database = create_session_database();
+    SessionWindowId window = 0;
+    SessionTabId a = 0;
+    TabFolderId folder = 0;
+    {
+        auto store = TRY_OR_FAIL(SessionStore::create(*database));
+        window = TRY_OR_FAIL(store->window_opened());
+        a = open_tab(*store, window, "https://a.example/"sv);
+        auto tree = folder_tree_for({ a });
+        folder = tree.create_folder_around("F"_string, { TabFolderTree::Item::tab(a) }).release_value();
+        TRY_OR_FAIL(store->tab_folders_changed(window, tree));
+        quit_cleanly(*store, { window });
+    }
+    {
+        // A run that restores the folders and changes nothing must not lose them.
+        auto store = TRY_OR_FAIL(SessionStore::create(*database, SessionLaunchPolicy::Everything));
+        auto plan = store->take_launch_plan();
+        EXPECT(plan[0].tab_folders.has_value());
+        // Opening a tab rewrites the window's metadata, which must carry the restored folders.
+        (void)open_tab(*store, window, "https://b.example/"sv);
+        quit_cleanly(*store, { window });
+    }
+
+    auto store = TRY_OR_FAIL(SessionStore::create(*database, SessionLaunchPolicy::Everything));
+    auto plan = store->take_launch_plan();
+    EXPECT(plan[0].tab_folders.has_value());
+    EXPECT(plan[0].tab_folders->folder(folder).has_value());
+}
+
+TEST_CASE(pinned_only_restores_folders_holding_pinned_tabs)
+{
+    auto database = create_session_database();
+    SessionWindowId window = 0;
+    SessionTabId pinned = 0;
+    SessionTabId unpinned = 0;
+    TabFolderId pinned_folder = 0;
+    TabFolderId unpinned_folder = 0;
+    TabFolderId empty_folder = 0;
+    {
+        auto store = TRY_OR_FAIL(SessionStore::create(*database));
+        window = TRY_OR_FAIL(store->window_opened());
+        pinned = open_tab(*store, window, "https://a.example/"sv);
+        unpinned = open_tab(*store, window, "https://b.example/"sv);
+        TRY_OR_FAIL(store->tab_pinned_changed(pinned, true));
+        auto tree = folder_tree_for({ pinned, unpinned });
+        pinned_folder = tree.create_folder_around("Pinned"_string, { TabFolderTree::Item::tab(pinned) }).release_value();
+        unpinned_folder = tree.create_folder_around("Unpinned"_string, { TabFolderTree::Item::tab(unpinned) }).release_value();
+        empty_folder = tree.create_folder("Empty"_string).release_value();
+        TRY_OR_FAIL(store->tab_folders_changed(window, tree));
+        quit_cleanly(*store, { window });
+    }
+
+    auto store = TRY_OR_FAIL(SessionStore::create(*database, SessionLaunchPolicy::PinnedOnly));
+    auto plan = store->take_launch_plan();
+    EXPECT_EQ(plan.size(), 1uz);
+    EXPECT(plan[0].tab_folders.has_value());
+    EXPECT_EQ(plan[0].tab_folders->children(pinned_folder), (Vector<TabFolderTree::Item> { TabFolderTree::Item::tab(pinned) }));
+    EXPECT(!plan[0].tab_folders->folder(unpinned_folder).has_value());
+    EXPECT(!plan[0].tab_folders->folder(empty_folder).has_value());
+
+    // The remainder reopens as a window with its own folders, keyed by its tabs' indices.
+    auto unit = TRY_OR_FAIL(store->take_most_recently_closed());
+    EXPECT(unit.has_value());
+    EXPECT_EQ(unit->tabs.size(), 1uz);
+    EXPECT(unit->tab_folders.has_value());
+    EXPECT_EQ(unit->tab_folders->children(unpinned_folder), (Vector<TabFolderTree::Item> { TabFolderTree::Item::tab(0) }));
+}
+
+TEST_CASE(a_reopened_closed_window_brings_back_its_folders_by_tab_index)
+{
+    auto database = create_session_database();
+    auto store = TRY_OR_FAIL(SessionStore::create(*database));
+    auto window = TRY_OR_FAIL(store->window_opened());
+    auto other_window = TRY_OR_FAIL(store->window_opened());
+    auto a = open_tab(*store, window, "https://a.example/"sv);
+    auto b = open_tab(*store, window, "https://b.example/"sv);
+    (void)open_tab(*store, other_window, "https://c.example/"sv);
+    auto tree = folder_tree_for({ a, b });
+    auto folder = tree.create_folder_around("F"_string, { TabFolderTree::Item::tab(b) }).release_value();
+    TRY_OR_FAIL(store->tab_folders_changed(window, tree));
+    TRY_OR_FAIL(store->window_closing({ .window_id = window, .active_tab_index = 0, .closed_at = UnixDateTime::now() }));
+
+    auto unit = TRY_OR_FAIL(store->take_most_recently_closed());
+    EXPECT(unit.has_value());
+    EXPECT(unit->was_window);
+    EXPECT(unit->tab_folders.has_value());
+    EXPECT_EQ(unit->tab_folders->children(), (Vector<TabFolderTree::Item> { TabFolderTree::Item::tab(0), TabFolderTree::Item::folder(folder) }));
+    EXPECT_EQ(unit->tab_folders->children(folder), (Vector<TabFolderTree::Item> { TabFolderTree::Item::tab(1) }));
+}
+
+TEST_CASE(a_transient_store_keeps_folders_for_a_reopened_window_without_writing_them)
+{
+    auto store = SessionStore::create();
+    auto window = TRY_OR_FAIL(store->window_opened());
+    auto other_window = TRY_OR_FAIL(store->window_opened());
+    auto a = open_tab(*store, window, "https://a.example/"sv);
+    (void)open_tab(*store, other_window, "https://b.example/"sv);
+    auto tree = folder_tree_for({ a });
+    auto folder = tree.create_folder_around("Private"_string, { TabFolderTree::Item::tab(a) }).release_value();
+    TRY_OR_FAIL(store->tab_folders_changed(window, tree));
+    TRY_OR_FAIL(store->window_closing({ .window_id = window, .active_tab_index = 0, .closed_at = UnixDateTime::now() }));
+
+    EXPECT(!store->is_persistent());
+    auto unit = TRY_OR_FAIL(store->take_most_recently_closed());
+    EXPECT(unit.has_value());
+    EXPECT(unit->tab_folders.has_value());
+    EXPECT_EQ(unit->tab_folders->children(folder), (Vector<TabFolderTree::Item> { TabFolderTree::Item::tab(0) }));
+}
+
+TEST_CASE(an_exit_that_keeps_pinned_tabs_forgets_folders_without_pinned_tabs)
+{
+    auto database = create_session_database();
+    {
+        auto store = TRY_OR_FAIL(SessionStore::create(*database));
+        auto window = TRY_OR_FAIL(store->window_opened());
+        auto pinned = open_tab(*store, window, "https://a.example/"sv);
+        auto unpinned = open_tab(*store, window, "https://b.example/"sv);
+        TRY_OR_FAIL(store->tab_pinned_changed(pinned, true));
+        auto tree = folder_tree_for({ pinned, unpinned });
+        (void)tree.create_folder_around("Kept"_string, { TabFolderTree::Item::tab(pinned) });
+        (void)tree.create_folder_around("Secret project"_string, { TabFolderTree::Item::tab(unpinned) });
+        (void)tree.create_folder("Empty secret"_string);
+        TRY_OR_FAIL(store->tab_folders_changed(window, tree));
+        quit_cleanly(*store, { window }, SessionStore::AfterExit::KeepPinnedTabs);
+    }
+
+    EXPECT_EQ(select_i64(*database, "SELECT COUNT(*) FROM Sessions WHERE tab_folders LIKE '%Kept%';"_string), 1);
+    EXPECT_EQ(select_i64(*database, "SELECT COUNT(*) FROM Sessions WHERE tab_folders LIKE '%ecret%';"_string), 0);
 }

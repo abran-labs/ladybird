@@ -28,6 +28,7 @@ static constexpr u32 SESSIONS_SCHEMA_LAUNCH_RESTORE_VERSION = 7u;
 static constexpr u32 SESSIONS_SCHEMA_WINDOW_GEOMETRY_VERSION = 8u;
 static constexpr u32 SESSIONS_SCHEMA_UPGRADE_INSECURE_REQUESTS_VERSION = 9u;
 static constexpr u32 SESSIONS_SCHEMA_RESTART_VERSION = 10u;
+static constexpr u32 SESSIONS_SCHEMA_TAB_FOLDERS_VERSION = 11u;
 
 // After this many unclean exits in a row, launch restore stops, so a session that crashes the browser doesn't restore
 // into the same crash every time.
@@ -35,6 +36,7 @@ static constexpr u32 UNCLEAN_EXITS_THAT_STOP_LAUNCH_RESTORE = 2;
 static constexpr u32 MAX_CLOSED_TABS = 25;
 static constexpr u32 MAX_CLOSED_WINDOWS = 5;
 static constexpr size_t MAX_ACTIVE_URL_BYTES = 8uz * 1024 * 1024;
+static constexpr size_t MAX_TAB_FOLDERS_BYTES = 4uz * 1024 * 1024;
 static constexpr int FLUSH_TIMER_INTERVAL_MILLISECONDS = 30'000;
 
 static i64 index_as_i64(size_t index)
@@ -48,6 +50,41 @@ static Optional<size_t> index_as_size(i64 index)
     if (index < 0 || !AK::is_within_range<size_t>(index))
         return {};
     return static_cast<size_t>(index);
+}
+
+// A tree without folders is saved as none, so a window that never had folders and one whose folders are gone look the
+// same, and like a window from before folders.
+static Optional<String> serialized_tab_folders(Optional<TabFolderTree> const& tree)
+{
+    if (!tree.has_value() || !tree->has_folders())
+        return {};
+    return tree->serialize();
+}
+
+static Optional<TabFolderTree> parse_tab_folders(Optional<String> const& serialized, HashTable<TabFolderTree::TabKey> const& allowed_tabs)
+{
+    if (!serialized.has_value())
+        return {};
+    auto tree = TabFolderTree::deserialize(*serialized, allowed_tabs);
+    if (tree.is_error()) {
+        if (WebView::history_debug_enabled())
+            dbgln("[History] Saved tab folders are unreadable, so the window has none: {}", tree.error());
+        return {};
+    }
+    if (!tree.value().has_folders())
+        return {};
+    return tree.release_value();
+}
+
+// A closed window's folders keyed by its tabs' indices, the way the frontend reopens them.
+static Optional<TabFolderTree> tab_folders_by_index(Optional<TabFolderTree> const& tree, Vector<SessionTabId> const& tab_ids)
+{
+    if (!tree.has_value())
+        return {};
+    HashMap<SessionTabId, i64> indices;
+    for (size_t i = 0; i < tab_ids.size(); ++i)
+        indices.set(tab_ids[i], static_cast<i64>(i));
+    return tree->with_remapped_tabs([&](auto key) { return indices.get(key); });
 }
 
 // A row whose geometry is missing, or isn't a usable size, has none.
@@ -298,6 +335,12 @@ ErrorOr<Database::MigrationOutcome> SessionStore::PersistedStorage::migrate_sche
                 ALTER TABLE SessionLifecycle ADD COLUMN restart INTEGER NOT NULL DEFAULT 0;
             )#"sv,
         },
+        {
+            .version = SESSIONS_SCHEMA_TAB_FOLDERS_VERSION,
+            .sql = R"#(
+                ALTER TABLE Sessions ADD COLUMN tab_folders TEXT;
+            )#"sv,
+        },
     });
 
     return database.migrate("Sessions"sv, migrations, mode);
@@ -331,7 +374,7 @@ ErrorOr<SessionStore::PersistedStorage> SessionStore::PersistedStorage::create(D
     statements.select_max_session_id = TRY(database.prepare_statement("SELECT MAX(id) AS maximum_id FROM Sessions;"sv));
     statements.select_max_tab_id = TRY(database.prepare_statement("SELECT MAX(id) AS maximum_id FROM SessionTabs;"sv));
     statements.select_max_close_sequence = TRY(database.prepare_statement("SELECT MAX(close_sequence) AS maximum_id FROM Sessions;"sv));
-    statements.select_closed_sessions = TRY(database.prepare_statement("SELECT id, closed_time, close_sequence, source_window_id, source_tab_index, origin, active_tab_index, x, y, width, height, maximized FROM Sessions WHERE kind = :kind ORDER BY close_sequence DESC, closed_time DESC, id DESC LIMIT :max_units;"sv));
+    statements.select_closed_sessions = TRY(database.prepare_statement("SELECT id, closed_time, close_sequence, source_window_id, source_tab_index, origin, active_tab_index, x, y, width, height, maximized, tab_folders FROM Sessions WHERE kind = :kind ORDER BY close_sequence DESC, closed_time DESC, id DESC LIMIT :max_units;"sv));
     statements.select_session_tabs = TRY(database.prepare_statement("SELECT id, tab_ordinal, active_url, current_used_step_index, pinned FROM SessionTabs WHERE session_id = :session_id ORDER BY tab_ordinal;"sv));
     statements.select_max_activation_sequence = TRY(database.prepare_statement("SELECT MAX(activation_sequence) AS maximum_id FROM Sessions;"sv));
     statements.update_session_geometry = TRY(database.prepare_statement("UPDATE Sessions SET x = :x, y = :y, width = :width, height = :height, maximized = :maximized WHERE id = :id;"sv));
@@ -347,6 +390,9 @@ ErrorOr<SessionStore::PersistedStorage> SessionStore::PersistedStorage::create(D
     statements.delete_empty_sessions = TRY(database.prepare_statement("DELETE FROM Sessions WHERE NOT EXISTS (SELECT 1 FROM SessionTabs WHERE session_id = Sessions.id);"sv));
     statements.select_lifecycle = TRY(database.prepare_statement("SELECT clean_exit, consecutive_unclean_exits, restart FROM SessionLifecycle WHERE id = 1;"sv));
     statements.write_lifecycle = TRY(database.prepare_statement("INSERT INTO SessionLifecycle (id, clean_exit, consecutive_unclean_exits, restart) VALUES (1, :clean_exit, :consecutive_unclean_exits, :restart) ON CONFLICT (id) DO UPDATE SET clean_exit = excluded.clean_exit, consecutive_unclean_exits = excluded.consecutive_unclean_exits, restart = excluded.restart;"sv));
+    statements.update_session_tab_folders = TRY(database.prepare_statement("UPDATE Sessions SET tab_folders = :tab_folders WHERE id = :id;"sv));
+    statements.select_session_tab_folders = TRY(database.prepare_statement("SELECT tab_folders FROM Sessions WHERE id = :id;"sv));
+    statements.select_sessions_with_tab_folders = TRY(database.prepare_statement("SELECT id FROM Sessions WHERE tab_folders IS NOT NULL;"sv));
     statements.snapshot_statements = TRY(prepare_session_history_snapshot_statements(database));
 
     return PersistedStorage { database, move(statements) };
@@ -496,6 +542,20 @@ void SessionStore::TransientStorage::set_geometry(SessionWindowId window_id, Ses
 
     window->value.geometry = geometry;
     window->value.metadata_dirty = true;
+}
+
+bool SessionStore::TransientStorage::set_tab_folders(SessionWindowId window_id, Optional<TabFolderTree> tree)
+{
+    auto window = m_windows.find(window_id);
+    if (window == m_windows.end())
+        return false;
+    if (tree.has_value() && !tree->has_folders())
+        tree.clear();
+    if (serialized_tab_folders(window->value.tab_folders) == serialized_tab_folders(tree))
+        return true;
+    window->value.tab_folders = move(tree);
+    window->value.metadata_dirty = true;
+    return true;
 }
 
 void SessionStore::TransientStorage::set_tab_order(SessionWindowId window_id, Vector<SessionTabId> const& ordered_tabs)
@@ -697,6 +757,13 @@ ErrorOr<void> SessionStore::PersistedStorage::apply_window_metadata(WindowMetada
     // A write for a window that's already closing carries no geometry, and leaves its saved one as it is.
     if (write.geometry.has_value())
         TRY(write_session_geometry(write.id, *write.geometry));
+    if (write.tab_folders.has_value()) {
+        TRY(database->try_execute_bound_statement(statements.update_session_tab_folders, [&](auto& bind) -> ErrorOr<void> {
+            TRY(bind("tab_folders"sv, *write.tab_folders));
+            TRY(bind("id"sv, write.id));
+            return {};
+        }));
+    }
     return {};
 }
 
@@ -877,6 +944,57 @@ ErrorOr<void> SessionStore::PersistedStorage::write_session_geometry(SessionWind
         TRY(bind("id"sv, window_id));
         return {};
     });
+}
+
+ErrorOr<void> SessionStore::PersistedStorage::write_session_tab_folders(SessionWindowId window_id, Optional<TabFolderTree> const& tree)
+{
+    return database->try_execute_bound_statement(statements.update_session_tab_folders, [&](auto& bind) -> ErrorOr<void> {
+        TRY(bind("tab_folders"sv, serialized_tab_folders(tree)));
+        TRY(bind("id"sv, window_id));
+        return {};
+    });
+}
+
+// Unreadable folders read as none, rather than failing what reads them.
+ErrorOr<Optional<TabFolderTree>> SessionStore::PersistedStorage::read_session_tab_folders(SessionWindowId window_id, HashTable<SessionTabId> const& allowed_tabs)
+{
+    Optional<String> serialized;
+    TRY(database->try_execute_bound_statement(
+        statements.select_session_tab_folders,
+        [&](auto& bind) -> ErrorOr<void> {
+            return bind("id"sv, window_id);
+        },
+        [&](Database::ResultRow& row) -> ErrorOr<void> {
+            auto text = row.read_optional_text("tab_folders"sv, MAX_TAB_FOLDERS_BYTES);
+            if (!text.is_error())
+                serialized = text.release_value();
+            return {};
+        }));
+    return parse_tab_folders(serialized, allowed_tabs);
+}
+
+// After the tabs that aren't kept are gone, so are the folders that held none of the kept ones, names and all.
+ErrorOr<void> SessionStore::PersistedStorage::forget_folders_without_kept_tabs()
+{
+    Vector<SessionWindowId> sessions;
+    TRY(database->try_execute_bound_statement(
+        statements.select_sessions_with_tab_folders,
+        [](auto&) -> ErrorOr<void> { return {}; },
+        [&](Database::ResultRow& row) -> ErrorOr<void> {
+            sessions.append(TRY(row.read_integer<SessionWindowId>("id"sv)));
+            return {};
+        }));
+
+    for (auto session_id : sessions) {
+        HashTable<SessionTabId> kept_tabs;
+        for (auto const& tab : TRY(read_recovered_tabs(session_id)))
+            kept_tabs.set(tab.id);
+        auto tree = TRY(read_session_tab_folders(session_id, kept_tabs));
+        if (tree.has_value())
+            tree->remove_folders_without_tabs();
+        TRY(write_session_tab_folders(session_id, tree));
+    }
+    return {};
 }
 
 ErrorOr<void> SessionStore::PersistedStorage::clear_restore_at_launch()
@@ -1068,8 +1186,46 @@ ErrorOr<SessionStore::RecoveryResult> SessionStore::PersistedStorage::recover_op
                 window_tabs.extend(move(unpinned_tabs));
                 TRY(reparent_tabs(candidate.id, window_tabs));
                 TRY(write_session_metadata(candidate.id, active_tab_index, candidate.activation_sequence));
-                result.windows.append({ .id = candidate.id, .tabs = move(window_tabs), .active_tab_index = active_tab_index, .activation_sequence = candidate.activation_sequence, .geometry = candidate.geometry });
+                HashTable<SessionTabId> window_tab_ids;
+                for (auto const& tab : window_tabs)
+                    window_tab_ids.set(tab.id);
+                auto tab_folders = TRY(read_session_tab_folders(candidate.id, window_tab_ids));
+                result.windows.append({ .id = candidate.id, .tabs = move(window_tabs), .active_tab_index = active_tab_index, .activation_sequence = candidate.activation_sequence, .geometry = candidate.geometry, .tab_folders = move(tab_folders) });
                 continue;
+            }
+
+            // The pinned tabs come back in a window of their own with the folders that hold them, and the remainder keeps
+            // the rest, without the folders that held only pinned tabs.
+            HashTable<SessionTabId> pinned_tab_ids;
+            for (auto const& tab : pinned_tabs)
+                pinned_tab_ids.set(tab.id);
+            HashTable<SessionTabId> unpinned_tab_ids;
+            for (auto const& tab : unpinned_tabs)
+                unpinned_tab_ids.set(tab.id);
+            HashTable<SessionTabId> all_tab_ids;
+            for (auto id : pinned_tab_ids)
+                all_tab_ids.set(id);
+            for (auto id : unpinned_tab_ids)
+                all_tab_ids.set(id);
+            auto all_tab_folders = TRY(read_session_tab_folders(candidate.id, all_tab_ids));
+            Optional<TabFolderTree> pinned_tab_folders;
+            Optional<TabFolderTree> unpinned_tab_folders;
+            if (all_tab_folders.has_value()) {
+                pinned_tab_folders = all_tab_folders->with_remapped_tabs([&](auto key) -> Optional<SessionTabId> {
+                    return pinned_tab_ids.contains(key) ? Optional<SessionTabId> { key } : Optional<SessionTabId> {};
+                });
+                pinned_tab_folders->remove_folders_without_tabs();
+                unpinned_tab_folders = all_tab_folders->with_remapped_tabs([&](auto key) -> Optional<SessionTabId> {
+                    return unpinned_tab_ids.contains(key) ? Optional<SessionTabId> { key } : Optional<SessionTabId> {};
+                });
+                for (auto const& entry : all_tab_folders->folders_in_order()) {
+                    if (unpinned_tab_folders->folder(entry.id).has_value() && unpinned_tab_folders->tabs_inside(entry.id).is_empty() && !all_tab_folders->tabs_inside(entry.id).is_empty())
+                        (void)unpinned_tab_folders->delete_folder(entry.id);
+                }
+                if (!pinned_tab_folders->has_folders())
+                    pinned_tab_folders.clear();
+                if (!unpinned_tab_folders->has_folders())
+                    unpinned_tab_folders.clear();
             }
 
             if (!pinned_tabs.is_empty()) {
@@ -1080,7 +1236,8 @@ ErrorOr<SessionStore::RecoveryResult> SessionStore::PersistedStorage::recover_op
                 TRY(write_session_metadata(pinned_window_id, pinned_active_tab_index, candidate.activation_sequence));
                 if (candidate.geometry.has_value())
                     TRY(write_session_geometry(pinned_window_id, *candidate.geometry));
-                result.windows.append({ .id = pinned_window_id, .tabs = move(pinned_tabs), .active_tab_index = pinned_active_tab_index, .activation_sequence = candidate.activation_sequence, .geometry = candidate.geometry });
+                TRY(write_session_tab_folders(pinned_window_id, pinned_tab_folders));
+                result.windows.append({ .id = pinned_window_id, .tabs = move(pinned_tabs), .active_tab_index = pinned_active_tab_index, .activation_sequence = candidate.activation_sequence, .geometry = candidate.geometry, .tab_folders = move(pinned_tab_folders) });
             }
 
             if (unpinned_tabs.is_empty()) {
@@ -1089,6 +1246,7 @@ ErrorOr<SessionStore::RecoveryResult> SessionStore::PersistedStorage::recover_op
             } else {
                 TRY(reparent_tabs(candidate.id, unpinned_tabs));
                 TRY(write_session_metadata(candidate.id, index_as_i64(active_unpinned_tab.value_or(0)), candidate.activation_sequence));
+                TRY(write_session_tab_folders(candidate.id, unpinned_tab_folders));
                 if (candidate.was_open)
                     TRY(demote_to_startup_recovery_unit(candidate.id, write.recovered_at, close_sequence_allocator));
             }
@@ -1127,7 +1285,7 @@ ErrorOr<void> SessionStore::PersistedStorage::forget_all_but_pinned_tabs()
         }));
         TRY(database->try_execute_bound_statement(statements.delete_unpinned_tabs, [](auto&) -> ErrorOr<void> { return {}; }));
         TRY(database->try_execute_bound_statement(statements.delete_empty_sessions, [](auto&) -> ErrorOr<void> { return {}; }));
-        return {};
+        return forget_folders_without_kept_tabs();
     }));
 
     // A deleted row stays in the files, in the space that it took up and in the write-ahead log, until something writes
@@ -1231,6 +1389,7 @@ ErrorOr<Vector<SessionStore::ClosedUnit>> SessionStore::PersistedStorage::load_c
         // Empty when the stored index is not a usable one, which retires only this unit.
         Optional<i64> active_tab_index;
         Optional<SessionWindowGeometry> geometry;
+        Optional<String> tab_folders;
     };
 
     Vector<ClosedUnit> units;
@@ -1252,6 +1411,7 @@ ErrorOr<Vector<SessionStore::ClosedUnit>> SessionStore::PersistedStorage::load_c
                 auto session_id = row.read_integer<i64>("id"sv);
                 auto closed_time = row.read_integer<i64>("closed_time"sv);
                 auto geometry = read_window_geometry(row);
+                auto tab_folders = row.read_optional_text("tab_folders"sv, MAX_TAB_FOLDERS_BYTES);
 
                 Optional<ClosedSessionUnit::Origin> validated_origin;
                 if (!origin.is_error()) {
@@ -1270,6 +1430,7 @@ ErrorOr<Vector<SessionStore::ClosedUnit>> SessionStore::PersistedStorage::load_c
                     .origin = validated_origin,
                     .active_tab_index = !active_tab_index.is_error() && active_tab_index.value() >= 0 ? Optional<i64> { active_tab_index.value() } : Optional<i64> {},
                     .geometry = geometry.is_error() ? Optional<SessionWindowGeometry> {} : geometry.release_value(),
+                    .tab_folders = tab_folders.is_error() ? Optional<String> {} : tab_folders.release_value(),
                 });
                 return {};
             }));
@@ -1320,6 +1481,14 @@ ErrorOr<Vector<SessionStore::ClosedUnit>> SessionStore::PersistedStorage::load_c
                 continue;
             }
 
+            Optional<TabFolderTree> tab_folders;
+            if (kind == UnitKind::ClosedWindow) {
+                HashTable<SessionTabId> unit_tab_ids;
+                for (auto const& tab : tabs)
+                    unit_tab_ids.set(tab.tab_id);
+                tab_folders = parse_tab_folders(session_row.tab_folders, unit_tab_ids);
+            }
+
             units.append({
                 .session_id = *session_row.session_id,
                 .kind = kind,
@@ -1332,6 +1501,7 @@ ErrorOr<Vector<SessionStore::ClosedUnit>> SessionStore::PersistedStorage::load_c
                 .origin = *session_row.origin,
                 .tabs = move(tabs),
                 .geometry = session_row.geometry,
+                .tab_folders = move(tab_folders),
             });
         }
     }
@@ -1346,7 +1516,7 @@ ErrorOr<Vector<SessionStore::ClosedUnit>> SessionStore::PersistedStorage::load_c
     return units;
 }
 
-ErrorOr<Vector<ClosedSessionTab>> SessionStore::PersistedStorage::take_closed_unit(SessionWindowId unit_id)
+ErrorOr<Vector<ClosedSessionTab>> SessionStore::PersistedStorage::take_closed_unit(SessionWindowId unit_id, Vector<SessionTabId>& tab_ids)
 {
     Vector<ClosedSessionTab> tabs;
     TRY(database->transaction([&]() -> ErrorOr<void> {
@@ -1384,6 +1554,7 @@ ErrorOr<Vector<ClosedSessionTab>> SessionStore::PersistedStorage::take_closed_un
 
         for (auto const& tab_row : tab_rows) {
             auto history = load_session_history_snapshot(database, statements.snapshot_statements, tab_row.tab_id, tab_row.current_used_step_index);
+            tab_ids.append(tab_row.tab_id);
             tabs.append({
                 .active_url = tab_row.active_url,
                 .history = history.is_error() ? Optional<WebView::SessionHistorySnapshot> {} : Optional<WebView::SessionHistorySnapshot> { history.release_value() },
@@ -1570,7 +1741,7 @@ ErrorOr<void> SessionStore::run_startup_recovery(UnixDateTime recovered_at, Sess
 
     for (auto& window : recovery.windows) {
         m_transient_storage.open_window(window.id);
-        RestoredSessionWindow restored { .window_id = window.id, .tabs = {}, .active_tab_index = window.active_tab_index, .geometry = window.geometry };
+        RestoredSessionWindow restored { .window_id = window.id, .tabs = {}, .active_tab_index = window.active_tab_index, .geometry = window.geometry, .tab_folders = {} };
         for (auto& tab : window.tabs) {
             restored.tabs.append({ .tab_id = tab.id, .url = tab.url, .pinned = tab.pinned });
             (void)m_transient_storage.open_tab(window.id, tab.id,
@@ -1581,6 +1752,9 @@ ErrorOr<void> SessionStore::run_startup_recovery(UnixDateTime recovered_at, Sess
         m_transient_storage.set_activation_sequence(window.id, window.activation_sequence);
         if (window.geometry.has_value())
             m_transient_storage.set_geometry(window.id, *window.geometry);
+        // Kept here too, so the next write of the window's metadata writes them back rather than clearing them.
+        (void)m_transient_storage.set_tab_folders(window.id, window.tab_folders);
+        restored.tab_folders = move(window.tab_folders);
         // Recovery already wrote these windows' rows as they stand.
         m_transient_storage.mark_window_metadata_clean(window.id);
         m_launch_plan.append(move(restored));
@@ -1592,7 +1766,7 @@ ErrorOr<void> SessionStore::run_startup_recovery(UnixDateTime recovered_at, Sess
 
 SessionStore::WindowMetadataWrite SessionStore::window_metadata_write(SessionWindowId window_id, OpenWindow const& window) const
 {
-    WindowMetadataWrite write { .id = window_id, .tabs_in_order = window.tabs, .pinned_tabs = {}, .active_tab_index = 0, .activation_sequence = window.activation_sequence, .geometry = window.geometry };
+    WindowMetadataWrite write { .id = window_id, .tabs_in_order = window.tabs, .pinned_tabs = {}, .active_tab_index = 0, .activation_sequence = window.activation_sequence, .geometry = window.geometry, .tab_folders = serialized_tab_folders(window.tab_folders) };
     for (auto tab_id : window.tabs) {
         if (auto const* tab = m_transient_storage.find_tab(tab_id); tab && tab->pinned)
             write.pinned_tabs.set(tab_id);
@@ -1622,7 +1796,7 @@ Optional<SessionStore::WindowMetadataWrite> SessionStore::remaining_window_write
     for (auto const& pending : m_pending_window_closes) {
         if (pending.window_id != window_id)
             continue;
-        WindowMetadataWrite write { .id = window_id, .tabs_in_order = {}, .pinned_tabs = {}, .active_tab_index = 0, .activation_sequence = pending.activation_sequence, .geometry = {} };
+        WindowMetadataWrite write { .id = window_id, .tabs_in_order = {}, .pinned_tabs = {}, .active_tab_index = 0, .activation_sequence = pending.activation_sequence, .geometry = {}, .tab_folders = {} };
         for (auto const& member : pending.members) {
             if (member.tab_id == closing_tab)
                 continue;
@@ -1748,6 +1922,7 @@ void SessionStore::window_detached(SessionWindowId window_id)
             .closed_at = {},
             .discard = true,
             .geometry = {},
+            .tab_folders = {},
         });
     }
 
@@ -1859,6 +2034,13 @@ ErrorOr<void> SessionStore::tab_pinned_changed(SessionTabId tab_id, bool pinned)
     return drain_window_metadata();
 }
 
+ErrorOr<void> SessionStore::tab_folders_changed(SessionWindowId window_id, TabFolderTree const& tree)
+{
+    if (!m_transient_storage.set_tab_folders(window_id, tree))
+        return {};
+    return drain_window_metadata();
+}
+
 void SessionStore::tab_moved(TabMoved moved)
 {
     auto ordinal = index_as_size(moved.ordinal);
@@ -1900,6 +2082,7 @@ void SessionStore::append_closed_tab_unit(PendingTabClose const& pending)
         .origin = ClosedSessionUnit::Origin::CloseAction,
         .tabs = {},
         .geometry = {},
+        .tab_folders = {},
     };
     unit.tabs.append({
         .active_url = pending.tab.url,
@@ -1924,6 +2107,7 @@ void SessionStore::append_closed_window_unit(PendingWindowClose const& pending)
         .origin = ClosedSessionUnit::Origin::CloseAction,
         .tabs = {},
         .geometry = pending.geometry,
+        .tab_folders = pending.tab_folders,
     };
     for (auto const& member : pending.members) {
         size_t mirror_step_index = member.tab.current_used_step_index;
@@ -2179,6 +2363,7 @@ ErrorOr<void> SessionStore::window_closing(WindowClosing closing)
             .restore_at_launch = restore_at_launch,
             .activation_sequence = window->activation_sequence,
             .geometry = window->geometry,
+            .tab_folders = window->tab_folders,
         };
         for (auto member_id : window->tabs) {
             if (auto const* tab = m_transient_storage.find_tab(member_id))
@@ -2366,15 +2551,23 @@ ErrorOr<Optional<ClosedSessionUnit>> SessionStore::take_closed_unit(SessionWindo
         .source_tab_index = unit->source_tab_index,
         .origin = unit->origin,
         .geometry = unit->geometry,
+        .tab_folders = {},
     };
 
+    Vector<SessionTabId> tab_ids;
     if (m_persisted_storage.has_value()) {
-        result.tabs = TRY(m_persisted_storage->take_closed_unit(unit_id));
+        result.tabs = TRY(m_persisted_storage->take_closed_unit(unit_id, tab_ids));
+        if (unit->kind == UnitKind::ClosedWindow)
+            result.tab_folders = tab_folders_by_index(unit->tab_folders, tab_ids);
         (void)m_transient_storage.take_closed_unit(unit_id);
     } else {
         auto taken = m_transient_storage.take_closed_unit(unit_id).release_value();
-        for (auto& tab : taken.tabs)
+        for (auto& tab : taken.tabs) {
+            tab_ids.append(tab.tab_id);
             result.tabs.append({ .active_url = move(tab.active_url), .history = move(tab.history), .pinned = tab.pinned });
+        }
+        if (taken.kind == UnitKind::ClosedWindow)
+            result.tab_folders = tab_folders_by_index(taken.tab_folders, tab_ids);
     }
 
     if (result.tabs.is_empty())

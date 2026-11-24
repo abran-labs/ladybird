@@ -565,6 +565,7 @@ TEST_CASE(snapshot_entries_saved_before_the_user_agent_initiated_column_load_as_
 
     // Take the database back to the baseline schema, keeping the entry's row.
     TRY_OR_FAIL(database->execute_raw(R"#(
+        ALTER TABLE Sessions DROP COLUMN tab_folders;
         DROP TABLE SessionUpgradeInsecureNavigations;
         ALTER TABLE SessionPolicyContainers DROP COLUMN insecure_requests_policy;
         ALTER TABLE Sessions DROP COLUMN maximized;
@@ -585,7 +586,7 @@ TEST_CASE(snapshot_entries_saved_before_the_user_agent_initiated_column_load_as_
     )#"sv));
 
     auto migrated_statements = prepare_snapshot_tables(*database);
-    EXPECT_EQ(TRY_OR_FAIL(database->schema_version("Sessions"sv)), Optional<u32> { 10u });
+    EXPECT_EQ(TRY_OR_FAIL(database->schema_version("Sessions"sv)), Optional<u32> { 11u });
 
     auto loaded = TRY_OR_FAIL(load_session_history_snapshot(*database, migrated_statements, 42, 0));
     EXPECT_EQ(loaded.entries.size(), 1uz);
@@ -614,6 +615,7 @@ TEST_CASE(snapshot_policy_containers_saved_before_the_insecure_requests_policy_l
 
     // Take the database back to the schema before the insecure requests policy, keeping the container's row.
     TRY_OR_FAIL(database->execute_raw(R"#(
+        ALTER TABLE Sessions DROP COLUMN tab_folders;
         DROP TABLE SessionUpgradeInsecureNavigations;
         ALTER TABLE SessionPolicyContainers DROP COLUMN insecure_requests_policy;
         ALTER TABLE SessionLifecycle DROP COLUMN restart;
@@ -621,7 +623,7 @@ TEST_CASE(snapshot_policy_containers_saved_before_the_insecure_requests_policy_l
     )#"sv));
 
     auto migrated_statements = prepare_snapshot_tables(*database);
-    EXPECT_EQ(TRY_OR_FAIL(database->schema_version("Sessions"sv)), Optional<u32> { 10u });
+    EXPECT_EQ(TRY_OR_FAIL(database->schema_version("Sessions"sv)), Optional<u32> { 11u });
 
     auto loaded = TRY_OR_FAIL(load_session_history_snapshot(*database, migrated_statements, 27, 0));
     auto const* container = loaded.entries[0].document_state.history_policy_container.get_pointer<Web::HTML::SerializedPolicyContainer>();

@@ -18,6 +18,7 @@
 #include <LibURL/URL.h>
 #include <LibWebView/SessionHistory.h>
 #include <UI/Qt/SessionHistorySnapshotStorage.h>
+#include <UI/Qt/TabFolderTree.h>
 
 namespace Ladybird {
 
@@ -55,6 +56,8 @@ struct ClosedSessionUnit {
     Optional<i64> source_tab_index;
     Origin origin { Origin::CloseAction };
     Optional<SessionWindowGeometry> geometry;
+    // A closed window's folders, with each tab keyed by its index in tabs.
+    Optional<TabFolderTree> tab_folders;
 };
 
 // A closed tab or window as a list of them shows it: the page its active tab was on, and when it closed.
@@ -90,6 +93,9 @@ struct RestoredSessionWindow {
     Vector<RestoredSessionTab> tabs;
     i64 active_tab_index { 0 };
     Optional<SessionWindowGeometry> geometry;
+    // The window's folders, with each tab keyed by its session tab id. Nothing when it has none, or when the saved ones
+    // couldn't be read, so the window comes back as it would without folders.
+    Optional<TabFolderTree> tab_folders;
 };
 
 // Persists live windows and tabs plus a bounded recently-closed stack. State updates coalesce; lifecycle mutations
@@ -172,6 +178,10 @@ public:
     // dirty, for the next flush to retry.
     ErrorOr<void> tab_pinned_changed(SessionTabId, bool pinned);
     void active_tab_changed(SessionTabId);
+
+    // The window's folders, with each tab keyed by its session tab id, written at once like a pin. A tree without folders
+    // clears them. A transient store keeps them only for reopening a closed window in this run.
+    ErrorOr<void> tab_folders_changed(SessionWindowId, TabFolderTree const&);
     void application_quitting();
     void application_quit_aborted();
 
@@ -263,6 +273,9 @@ private:
         Database::StatementID delete_unpinned_tabs;
         Database::StatementID delete_empty_sessions;
         Database::StatementID select_lifecycle;
+        Database::StatementID update_session_tab_folders;
+        Database::StatementID select_session_tab_folders;
+        Database::StatementID select_sessions_with_tab_folders;
         Database::StatementID write_lifecycle;
         SessionHistorySnapshotStatements snapshot_statements;
     };
@@ -290,6 +303,8 @@ private:
         bool metadata_dirty { false };
         i64 activation_sequence { 0 };
         Optional<SessionWindowGeometry> geometry;
+        // Keyed by session tab id. It may still name a tab that has since left the window; reading it back drops those.
+        Optional<TabFolderTree> tab_folders;
     };
 
     struct ClosedTab {
@@ -312,6 +327,8 @@ private:
         ClosedSessionUnit::Origin origin { ClosedSessionUnit::Origin::CloseAction };
         Vector<ClosedTab> tabs;
         Optional<SessionWindowGeometry> geometry;
+        // Keyed by ClosedTab::tab_id.
+        Optional<TabFolderTree> tab_folders;
     };
 
     enum class SnapshotDisposition {
@@ -340,6 +357,9 @@ private:
         i64 active_tab_index { 0 };
         i64 activation_sequence { 0 };
         Optional<SessionWindowGeometry> geometry;
+        // A write for a window that's already closing carries no folders, and leaves its saved ones as they are. One
+        // that carries an empty value clears them.
+        Optional<Optional<String>> tab_folders;
     };
 
     struct OpenTabWrite {
@@ -412,6 +432,7 @@ private:
         i64 active_tab_index { 0 };
         i64 activation_sequence { 0 };
         Optional<SessionWindowGeometry> geometry;
+        Optional<TabFolderTree> tab_folders;
     };
 
     struct RecoveryResult {
@@ -444,7 +465,8 @@ private:
         ErrorOr<IdAllocators> create_id_allocators();
         ErrorOr<WebView::SessionHistorySnapshot> load_tab_snapshot(SessionTabId, size_t current_used_step_index);
         ErrorOr<Vector<ClosedUnit>> load_closed_units();
-        ErrorOr<Vector<ClosedSessionTab>> take_closed_unit(SessionWindowId);
+        // Also gives the session tab id of each tab it returns, in the same order.
+        ErrorOr<Vector<ClosedSessionTab>> take_closed_unit(SessionWindowId, Vector<SessionTabId>& tab_ids);
 
         NonnullRefPtr<Database::Database> database;
         Statements statements;
@@ -463,6 +485,9 @@ private:
         ErrorOr<void> reparent_tabs(SessionWindowId, Vector<RecoveredTab> const&);
         ErrorOr<void> write_session_metadata(SessionWindowId, i64 active_tab_index, i64 activation_sequence);
         ErrorOr<void> write_session_geometry(SessionWindowId, SessionWindowGeometry const&);
+        ErrorOr<void> write_session_tab_folders(SessionWindowId, Optional<TabFolderTree> const&);
+        ErrorOr<Optional<TabFolderTree>> read_session_tab_folders(SessionWindowId, HashTable<SessionTabId> const& allowed_tabs);
+        ErrorOr<void> forget_folders_without_kept_tabs();
         ErrorOr<void> demote_to_startup_recovery_unit(SessionWindowId, UnixDateTime recovered_at, IdAllocator& close_sequence_allocator);
         ErrorOr<void> reopen_session(SessionWindowId);
     };
@@ -489,6 +514,7 @@ private:
         bool restore_at_launch { false };
         i64 activation_sequence { 0 };
         Optional<SessionWindowGeometry> geometry;
+        Optional<TabFolderTree> tab_folders;
     };
 
     // Owns in-memory membership, ordering, and dirty state.
@@ -507,6 +533,7 @@ private:
         void set_active_tab(SessionTabId);
         void set_activation_sequence(SessionWindowId, i64);
         void set_geometry(SessionWindowId, SessionWindowGeometry);
+        bool set_tab_folders(SessionWindowId, Optional<TabFolderTree>);
         void set_tab_order(SessionWindowId, Vector<SessionTabId> const&);
         Optional<SessionWindowId> move_tab(SessionTabId, SessionWindowId, size_t ordinal);
         void remove_tab(SessionTabId);
