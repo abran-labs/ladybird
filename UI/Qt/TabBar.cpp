@@ -706,12 +706,26 @@ public:
         resize(m_pixmap.deviceIndependentSize().toSize());
     }
 
+    virtual ~TabDragCard() override
+    {
+        if (m_page_view)
+            m_page_view->remove_floating_surface(*this);
+    }
+
     QPoint hot_spot() const { return m_hot_spot; }
 
     void set_opacity(qreal opacity)
     {
         m_opacity = opacity;
         update();
+    }
+
+    // The page can be presented above whatever Qt paints, such as by a Wayland subsurface, and it steps aside for the
+    // card while the card floats over it.
+    void float_over(WebContentView& page_view)
+    {
+        m_page_view = &page_view;
+        page_view.add_floating_surface(*this);
     }
 
 private:
@@ -725,6 +739,7 @@ private:
     QPixmap m_pixmap;
     QPoint m_hot_spot;
     qreal m_opacity { 1.0 };
+    QPointer<WebContentView> m_page_view;
 };
 
 TabBar::TabBar(TabWidget* tab_widget)
@@ -1458,6 +1473,8 @@ void TabBar::show_vertical_drag_card(QRect source, int tab_index, SidebarRow con
     auto* host = parentWidget()->testAttribute(Qt::WA_NativeWindow) ? parentWidget() : window();
     m_vertical_drag_card = new TabDragCard(*host, AK::move(pixmap), hot_spot);
     m_vertical_drag_card->set_opacity(VERTICAL_DRAG_CARD_OPACITY);
+    if (auto* tab = m_tab_widget->tab(m_tab_widget->current_index()); tab && tab->is_loaded())
+        m_vertical_drag_card->float_over(tab->view());
     QApplication::setOverrideCursor(Qt::ClosedHandCursor);
     m_vertical_drag_cursor_active = true;
 }
