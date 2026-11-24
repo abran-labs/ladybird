@@ -65,6 +65,19 @@ static bool drop(TabFolderTree& tree, Vector<Item> const& moving, size_t gap, si
     return tree.move_items(moving, *destination);
 }
 
+TEST_CASE(visual_gaps_skip_dragged_subtrees_and_nonadjacent_selected_rows)
+{
+    TabFolderId work = 0;
+    auto tree = work_tree(work);
+    auto tabs = unpinned_tabs({ 1, 2, 3, 4, 5 });
+    TabFolderSync::reconcile(tree, tabs);
+    auto rows = TabFolderSync::sidebar_rows(tree, tabs, {});
+    auto moving = items({ folder(work), tab(5) });
+    auto remaining = TabFolderSync::rows_without(tree, rows, moving);
+    EXPECT_EQ(row_items(remaining), items({ tab(1), tab(4) }));
+    EXPECT_EQ(TabFolderDrag::gaps_for_visible_slots(rows, remaining), (Vector<size_t> { 0, 1, 1, 1, 1, 2, 2 }));
+}
+
 TEST_CASE(a_gap_offers_the_depths_between_the_row_below_and_one_inside_the_row_above)
 {
     TabFolderId work = 0;

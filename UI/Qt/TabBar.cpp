@@ -177,8 +177,6 @@ static constexpr int TAB_DRAG_START_DISTANCE = 4;
 static constexpr int TAB_DETACH_DISTANCE = 40;
 // How far a card dragged along the sidebar's rows moves sideways to land one level deeper or shallower.
 static constexpr int ROW_DRAG_DEPTH_STEP = 12;
-// The most rows a card of several dragged rows shows; the rest land with them.
-static constexpr size_t ROW_DRAG_CARD_MAX_ROWS = 3;
 // A closing tab fades out over this much of the time the other tabs take to close the gap it leaves.
 static constexpr qreal CLOSING_TAB_FADE_PORTION = 0.4;
 // The first and last tabs are this much wider, on the outer side, to make room for their feet at the ends of the tab bar.
@@ -702,25 +700,14 @@ public:
         resize(m_pixmap.deviceIndependentSize().toSize());
     }
 
-    void set_over_folder(bool over)
-    {
-        if (m_over_folder == over)
-            return;
-        m_over_folder = over;
-        update();
-    }
-
 private:
     virtual void paintEvent(QPaintEvent*) override
     {
         QPainter painter(this);
-        if (m_over_folder)
-            painter.setOpacity(0.22);
         painter.drawPixmap(0, 0, m_pixmap);
     }
 
     QPixmap m_pixmap;
-    bool m_over_folder { false };
 };
 
 TabBar::TabBar(TabWidget* tab_widget)
@@ -866,7 +853,6 @@ TabBar::TabBar(TabWidget* tab_widget)
 TabBar::~TabBar()
 {
     delete m_folder_name_editor.data();
-    delete m_row_drag_card.data();
 }
 
 void TabBar::set_sidebar_rows(Vector<SidebarRow> rows, bool has_folders, Vector<TabFolderTree::TabKey> selection)
@@ -882,6 +868,8 @@ void TabBar::set_sidebar_rows(Vector<SidebarRow> rows, bool has_folders, Vector<
     m_has_sidebar_rows = use_rows;
     update_folder_glyphs();
     lay_out_sidebar_rows(false);
+    if (m_row_drag.has_value())
+        refresh_row_drag();
 }
 
 bool TabBar::uses_sidebar_rows() const
@@ -896,11 +884,8 @@ u64 TabBar::row_key(TabFolderTree::Item item)
 
 void TabBar::lay_out_sidebar_rows(bool animate)
 {
-    // A drag lays the rows out around its gap, and carries on with whatever rows are left.
-    if (m_row_drag.has_value()) {
-        refresh_row_drag();
-        return;
-    }
+    if (m_rows_animation)
+        m_rows_animation->stop();
     // The first usable view lays rows out directly. The animation pass can start from these settled positions.
     (void)animate;
     m_laid_out_rows.clear();
@@ -1296,115 +1281,31 @@ void TabBar::animate_rows_from(HashMap<u64, qreal> start_y)
     rows_changed_layout();
 }
 
-// The rows that stay, laid out with room for the card at the drag's gap. The rows that move have no place, so neither
-// they nor their tabs' buttons are drawn; the card shows them instead.
-void TabBar::lay_out_row_drag()
-{
-    VERIFY(m_row_drag.has_value());
-    HashMap<u64, qreal> start_y;
-    for (auto const& row : m_laid_out_rows)
-        start_y.set(row_key(row.row.row.item), displayed_row_y(row));
-
-    m_laid_out_rows.clear();
-    m_laid_out_row_of_tab.clear();
-    auto const& drag = *m_row_drag;
-    for (size_t i = 0; i < drag.remaining.size(); ++i) {
-        auto const& row = drag.remaining[i];
-        auto slot = i < drag.gap ? i : i + drag.card_rows;
-        LaidOutRow laid_out { row, static_cast<qreal>(slot * VERTICAL_TAB_HEIGHT) };
-        if (row.tab)
-            m_laid_out_row_of_tab.set(row.tab.data(), m_laid_out_rows.size());
-        m_laid_out_rows.append(AK::move(laid_out));
-    }
-
-    animate_rows_from(AK::move(start_y));
-}
-
 bool TabBar::start_row_drag(TabFolderTree::Item pressed, Vector<TabFolderTree::Item> items, QPoint position)
 {
     auto* browser_window = qobject_cast<BrowserWindow*>(window());
     if (!browser_window || !uses_sidebar_rows() || items.is_empty() || m_row_drag.has_value() || m_strip_drag_card)
         return false;
-    auto const& tree = browser_window->tab_folders();
-
-    auto grabbed = m_laid_out_rows.find_first_index_if([&](auto const& row) {
-        return row.row.row.item == pressed && !row.leaving;
-    });
+    auto grabbed = m_laid_out_rows.find_first_index_if([&](auto const& row) { return row.row.row.item == pressed && !row.leaving; });
     if (!grabbed.has_value())
         return false;
 
     RowDrag drag;
     drag.moving = AK::move(items);
-    auto remaining_rows = TabFolderSync::rows_without(tree, plain_rows(m_sidebar_rows), drag.moving);
-    for (auto const& row : m_sidebar_rows) {
-        if (drag.remaining.size() < remaining_rows.size() && row.row == remaining_rows[drag.remaining.size()]) {
-            drag.remaining.append(row);
-            continue;
-        }
-        if (row.row.item == pressed) {
-            drag.gap = drag.remaining.size();
-            continue;
-        }
-        drag.moving_keys.append(row_key(row.row.item));
-    }
-    drag.moving_keys.prepend(row_key(pressed));
-
-    auto const& grabbed_row = m_laid_out_rows[*grabbed];
-    drag.first_depth = grabbed_row.row.row.depth;
-    drag.depth = drag.first_depth;
-    if (drag.moving.size() == 1 && drag.moving.first().is_tab())
-        drag.single_tab = grabbed_row.row.tab;
-
-    // Keep the row that was grabbed under the pointer, even if the rest of the selection is far away or offscreen.
-    auto region = pinned_region();
-    auto first_rect = sidebar_row_rect(grabbed_row, region);
-    Vector<QRect> card_row_rects { first_rect };
-    for (size_t i = 1; i < drag.moving_keys.size() && card_row_rects.size() < ROW_DRAG_CARD_MAX_ROWS; ++i) {
-        auto index = m_laid_out_rows.find_first_index_if([&](auto const& row) {
-            return row_key(row.row.row.item) == drag.moving_keys[i] && !row.leaving;
-        });
-        if (!index.has_value())
-            continue;
-        auto rect = sidebar_row_rect(m_laid_out_rows[*index], region);
-        if (rect.top() >= VERTICAL_TAB_BAR_END_ROOM + region.fixed_height() && rect.bottom() < height())
-            card_row_rects.append(rect);
-    }
-    drag.card_rows = card_row_rects.size();
-    QRect rows_rect { first_rect.left(), first_rect.top(), first_rect.width(), static_cast<int>(drag.card_rows) * VERTICAL_TAB_HEIGHT };
-    QRect card_rect;
-    switch (tab_layout()) {
-    case TabLayout::Horizontal:
-        VERIFY_NOT_REACHED();
-    case TabLayout::VerticalCollapsed:
-        card_rect = collapsed_vertical_tab_shape_rect(rows_rect);
-        break;
-    case TabLayout::VerticalExpanded:
-        card_rect = tab_card_shape_rect(rows_rect);
-        break;
-    }
+    auto const& row = m_laid_out_rows[*grabbed].row;
+    drag.first_depth = row.row.depth;
+    if (drag.moving.size() == 1 && pressed.is_tab())
+        drag.single_tab = row.tab;
+    drag.last_position = position;
     set_hovered_tab_index(-1);
     set_hovered_folder({});
-    drag.card = lift_drag_card(card_rect.size(), tab_drag_card_radius(), [&](QPainter& painter) {
-        for (size_t i = 0; i < card_row_rects.size(); ++i) {
-            auto const& source = card_row_rects[i];
-            auto target = QPoint(max(source.left(), first_rect.left()) - card_rect.left(), first_rect.top() - card_rect.top() + (static_cast<int>(i) * VERTICAL_TAB_HEIGHT));
-            render(&painter, target, QRegion(source), QWidget::DrawChildren);
-        }
-    });
-    drag.card_left = card_rect.left();
-    m_tab_drag_card_offset = card_rect.topLeft() - first_rect.topLeft();
-    drag.press_offset_y = m_position_in_selected_tab_while_dragging.y();
-
     m_row_drag = AK::move(drag);
-    m_row_drag_card = new TabDragCard(*window(), m_row_drag->card);
-    m_row_drag_card->show();
-    m_row_drag_card->raise();
     m_row_drag_cancellation_filter = new TabDragCancellationFilter([this] { end_row_drag(false); });
     m_row_drag_cancellation_filter->setParent(this);
     QApplication::instance()->installEventFilter(m_row_drag_cancellation_filter);
 
-    lay_out_row_drag();
-    update_row_drag(position);
+    lay_out_sidebar_rows(false);
+    refresh_row_drag(true);
     return true;
 }
 
@@ -1418,62 +1319,35 @@ void TabBar::retarget_row_drag()
     auto const& tree = browser_window->tab_folders();
     auto position = drag.last_position;
     auto region = pinned_region();
-    bool hit_folder = false;
+    // Count only stationary rows for the tree destination, but keep the indicator on the actual edge hit.
+    auto row_position = (position.y() - sidebar_rows_origin_y()) / static_cast<double>(VERTICAL_TAB_HEIGHT);
+    drag.indicator_slot = clamp(qFloor(row_position + 0.5), 0, static_cast<int>(m_sidebar_rows.size()));
+    auto gap = drag.gaps[drag.indicator_slot];
+    auto depth = drag.first_depth + ((position.x() - m_drag_start_position.x()) / static_cast<double>(ROW_DRAG_DEPTH_STEP));
     Optional<TabFolderDrag::Target> target;
-    if (rect().contains(position) && position.y() >= VERTICAL_TAB_BAR_END_ROOM + region.fixed_height()) {
-        for (size_t i = 0; i < m_laid_out_rows.size(); ++i) {
-            auto const& row = m_laid_out_rows[i];
-            if (!row.row.row.item.is_folder() || row.row.provisional)
-                continue;
-            auto rect = sidebar_row_rect(row, region);
-            auto shape = sidebar_folder_shape(rect, tab_layout() == TabLayout::VerticalCollapsed);
-            // The leading edge of a tall card can reach the next gap before the pointer reaches its folder. Do not let
-            // that folder move out of the way before the pointer has had a chance to enter it.
-            if (position.x() >= shape.left() && position.x() <= shape.right()) {
-                if (i >= drag.gap && position.y() < rect.top())
-                    drag.wanted_gap = min(drag.wanted_gap, static_cast<double>(i));
-                if (i < drag.gap && position.y() > rect.bottom())
-                    drag.wanted_gap = max(drag.wanted_gap, static_cast<double>(i + 1));
-            }
-            if (!rect.contains(position))
-                continue;
-            if (shape.contains(position)) {
-                hit_folder = true;
-                target = TabFolderDrag::target_for_folder(tree, row.row.row, drag.moving, drag.gap);
-            } else if (position.y() < shape.top()) {
-                drag.wanted_gap = i;
-            } else if (position.y() > shape.bottom()) {
-                drag.wanted_gap = i + 1;
-            }
-            break;
+    Optional<TabFolderId> folder;
+    auto index = qFloor(row_position);
+    if (rect().contains(position) && position.y() >= VERTICAL_TAB_BAR_END_ROOM + region.fixed_height() && index >= 0 && static_cast<size_t>(index) < m_laid_out_rows.size()) {
+        auto const& row = m_laid_out_rows[index];
+        if (row.row.row.item.is_folder() && !row.row.provisional && sidebar_folder_shape(sidebar_row_rect(row, region), tab_layout() == TabLayout::VerticalCollapsed).contains(position)) {
+            folder = row.row.row.item.id;
+            target = TabFolderDrag::target_for_folder(tree, row.row.row, drag.moving, gap);
         }
     }
-    // Freeze an in-flight reflow on the frame the pointer actually hit. A release or slight movement on that same
-    // card must not hit a different row because the layout continued moving underneath it.
-    if (m_rows_animation) {
-        if (hit_folder && m_rows_animation->state() == QAbstractAnimation::Running)
-            m_rows_animation->pause();
-        else if (!hit_folder && m_rows_animation->state() == QAbstractAnimation::Paused)
-            m_rows_animation->resume();
-    }
-    if (!hit_folder)
-        target = TabFolderDrag::target_for(tree, plain_rows(drag.remaining), drag.moving, drag.wanted_gap, drag.wanted_depth);
-    set_hovered_folder(hit_folder && target.has_value() ? target->destination.parent : Optional<TabFolderId> {});
-    m_row_drag_card->set_over_folder(m_hovered_folder.has_value());
+    if (!folder.has_value())
+        target = TabFolderDrag::target_for(tree, drag.remaining, drag.moving, gap, depth);
+    set_hovered_folder(target.has_value() ? folder : Optional<TabFolderId> {});
+    drag.destination.clear();
     if (target.has_value()) {
-        drag.gap = target->gap;
         drag.depth = target->depth;
         drag.destination = target->destination;
-    } else {
-        // Nowhere near takes the items, such as a folder too deep to nest anywhere about, so they stay where they are.
-        drag.gap = min(drag.gap, drag.remaining.size());
-        drag.destination.clear();
     }
+    update();
 }
 
 void TabBar::update_row_drag(QPoint position, bool allow_detach)
 {
-    if (!m_row_drag.has_value() || !m_row_drag_card)
+    if (!m_row_drag.has_value())
         return;
     auto& drag = *m_row_drag;
     drag.last_position = position;
@@ -1481,7 +1355,13 @@ void TabBar::update_row_drag(QPoint position, bool allow_detach)
     // A tab dragged on its own can leave for another window or a window of its own, as from the plain list.
     if (allow_detach && drag.single_tab && !m_tab_widget->tab_drop_area_contains(*this, position)) {
         QPointer<Tab> tab = drag.single_tab;
-        auto card = drag.card;
+        auto index = m_tab_widget->index_of(tab);
+        if (index < 0) {
+            end_row_drag(false);
+            return;
+        }
+        auto card = render_tab_drag_pixmap(index);
+        m_tab_drag_card_offset = tab_drag_card_rect(index).topLeft() - visual_tab_rect(index).topLeft();
         end_row_drag(false);
         if (!tab || m_tab_widget->index_of(tab) < 0)
             return;
@@ -1492,24 +1372,10 @@ void TabBar::update_row_drag(QPoint position, bool allow_detach)
         return;
     }
 
-    auto origin = sidebar_rows_origin_y();
-    auto top = position.y() - drag.press_offset_y;
-    top = clamp(top, origin, origin + (static_cast<int>(drag.remaining.size()) * VERTICAL_TAB_HEIGHT));
-    drag.wanted_gap = (top - origin) / static_cast<double>(VERTICAL_TAB_HEIGHT);
-    // The rail doesn't draw indentation, but the same sideways gesture selects a depth between rows.
-    drag.wanted_depth = drag.first_depth + ((position.x() - m_drag_start_position.x()) / static_cast<double>(ROW_DRAG_DEPTH_STEP));
-
-    auto old_gap = drag.gap;
     retarget_row_drag();
-    if (drag.gap != old_gap)
-        lay_out_row_drag();
-
-    auto indent_shift = sidebar_row_indent(drag.depth) - sidebar_row_indent(drag.first_depth);
-    auto card_top_left = QPoint(drag.card_left + indent_shift, top + m_tab_drag_card_offset.y());
-    m_row_drag_card->move(mapTo(window(), card_top_left) - QPoint(TAB_DRAG_IMAGE_MARGIN, TAB_DRAG_IMAGE_MARGIN));
 }
 
-void TabBar::refresh_row_drag()
+void TabBar::refresh_row_drag(bool allow_detach)
 {
     VERIFY(m_row_drag.has_value());
     auto* browser_window = qobject_cast<BrowserWindow*>(window());
@@ -1524,15 +1390,10 @@ void TabBar::refresh_row_drag()
         end_row_drag(false);
         return;
     }
-    auto remaining_rows = TabFolderSync::rows_without(tree, plain_rows(m_sidebar_rows), drag.moving);
-    drag.remaining.clear();
-    for (auto const& row : m_sidebar_rows) {
-        if (drag.remaining.size() < remaining_rows.size() && row.row == remaining_rows[drag.remaining.size()])
-            drag.remaining.append(row);
-    }
-    drag.gap = min(drag.gap, drag.remaining.size());
-    lay_out_row_drag();
-    update_row_drag(drag.last_position, false);
+    auto rows = plain_rows(m_sidebar_rows);
+    drag.remaining = TabFolderSync::rows_without(tree, rows, drag.moving);
+    drag.gaps = TabFolderDrag::gaps_for_visible_slots(rows, drag.remaining);
+    update_row_drag(drag.last_position, allow_detach);
 }
 
 void TabBar::end_row_drag(bool drop)
@@ -1541,19 +1402,10 @@ void TabBar::end_row_drag(bool drop)
         return;
     auto drag = m_row_drag.release_value();
 
-    // The rows settle from where they're drawn now; the moving ones from the card's rows.
+    // Animate the committed move from the unchanged row positions.
     HashMap<u64, qreal> start_y;
     for (auto const& row : m_laid_out_rows)
         start_y.set(row_key(row.row.row.item), displayed_row_y(row));
-    if (m_row_drag_card) {
-        auto card_top = mapFrom(window(), m_row_drag_card->pos() + QPoint(TAB_DRAG_IMAGE_MARGIN, TAB_DRAG_IMAGE_MARGIN)).y() - m_tab_drag_card_offset.y();
-        auto first_y = static_cast<qreal>(card_top - sidebar_rows_origin_y());
-        for (size_t i = 0; i < drag.moving_keys.size(); ++i)
-            start_y.set(drag.moving_keys[i], first_y + (static_cast<qreal>(min(i, drag.card_rows - 1)) * VERTICAL_TAB_HEIGHT));
-    }
-
-    delete m_row_drag_card.data();
-    m_row_drag_card = nullptr;
     // NB: This can run from within the filter itself, as Escape cancels the drag.
     if (m_row_drag_cancellation_filter) {
         QApplication::instance()->removeEventFilter(m_row_drag_cancellation_filter);
@@ -1567,12 +1419,25 @@ void TabBar::end_row_drag(bool drop)
     update_folder_glyphs();
 
     if (drop && drag.destination.has_value()) {
-        if (auto* browser_window = qobject_cast<BrowserWindow*>(window()))
-            browser_window->move_tab_folder_items(drag.moving, *drag.destination);
+        if (auto* browser_window = qobject_cast<BrowserWindow*>(window())) {
+            auto const& tree = browser_window->tab_folders();
+            if (tree.has_folders()) {
+                browser_window->move_tab_folder_items(drag.moving, *drag.destination);
+            } else {
+                // Without folders, the window owns the order: reconciliation rebuilds the tree from its tabs.
+                auto reordered = tree;
+                auto current = tree.tabs_in_order();
+                if (current.size() == static_cast<size_t>(count()) && reordered.move_items(drag.moving, *drag.destination)) {
+                    for (auto move : TabFolderSync::moves_to_reorder(current, reordered.tabs_in_order()))
+                        moveTab(static_cast<int>(move.from), static_cast<int>(move.to));
+                }
+            }
+        }
     }
     // NB: A drop in the place the items started leaves the rows as they were, so they don't lay themselves out anew.
     lay_out_sidebar_rows(false);
-    animate_rows_from(AK::move(start_y));
+    if (drop && drag.destination.has_value())
+        animate_rows_from(AK::move(start_y));
 }
 
 void TabBar::set_available_width(int width)
@@ -2210,6 +2075,14 @@ void TabBar::paintEvent(QPaintEvent*)
     m_tabs_with_cut_titles = AK::move(tabs_with_cut_titles);
 
     painter.setClipping(false);
+    if (m_row_drag.has_value() && m_row_drag->destination.has_value() && !m_hovered_folder.has_value()) {
+        auto indent = sidebar_row_indent(m_row_drag->depth);
+        auto y = sidebar_rows_origin_y() + m_row_drag->indicator_slot * VERTICAL_TAB_HEIGHT;
+        QRect line { vertical_tabs_left() + indent + 3, y - 1, vertical_bar_width() - indent - 6, 2 };
+        painter.fillRect(line.intersected(unpinned_clip), Theme::accent());
+    } else if (is_vertical && m_drop_slot.has_value()) {
+        painter.fillRect(m_vertical_drop_line.intersected(dragging_pinned_tab() ? rect() : unpinned_clip), Theme::accent());
+    }
     // While the strip scrolls, it fades out at each end that has more tabs beyond it.
     if (!is_vertical) {
         auto strip = ChromeStyle::chrome_tab_strip_background(Theme::chrome_palette(*this));
@@ -2663,6 +2536,8 @@ int TabBar::drop_slot_at(QPoint const& position) const
 // moving it out of the way comes first.
 int TabBar::drop_index_at(QPoint const& position) const
 {
+    if (tab_layout() != TabLayout::Horizontal)
+        return vertical_strip_drop_at(position).index;
     auto drop_slot = drop_slot_at(position);
     auto dragged_index = dragged_tab_index();
     return dragged_index.has_value() && drop_slot > *dragged_index ? drop_slot + 1 : drop_slot;
@@ -2670,11 +2545,50 @@ int TabBar::drop_index_at(QPoint const& position) const
 
 void TabBar::update_drop_preview(QPoint const& position)
 {
+    if (tab_layout() != TabLayout::Horizontal) {
+        auto drop = vertical_strip_drop_at(position);
+        m_vertical_drop_line = drop.line;
+        m_drop_slot = drop.index;
+        update();
+        return;
+    }
     set_drop_slot(drop_slot_at(position));
+}
+
+// Native drags (pinned tiles and tabs arriving from another window) use the edge of the nearest visible tab.
+TabBar::VerticalStripDrop TabBar::vertical_strip_drop_at(QPoint const& position) const
+{
+    auto pinned = dragging_pinned_tab();
+    auto region = pinned_region();
+    auto first = pinned ? 0 : region.count;
+    auto end = pinned ? region.count : count();
+    VerticalStripDrop result { end, { vertical_tabs_left() + 3, pinned ? VERTICAL_TAB_BAR_END_ROOM : sidebar_rows_origin_y(), vertical_bar_width() - 6, 2 } };
+    auto best_distance = NumericLimits<qreal>::max();
+    for (int i = first; i < end; ++i) {
+        auto row = vertical_tab_rect(i, region);
+        if (row.isEmpty())
+            continue;
+        auto offset = QRectF(row).center() - QPointF(position);
+        auto distance = QPointF::dotProduct(offset, offset);
+        if (distance >= best_distance)
+            continue;
+        best_distance = distance;
+        bool tile = pinned && pinned_tabs_are_tiles();
+        bool after = tile ? position.x() > row.center().x() : position.y() > row.center().y();
+        result.index = i + (after ? 1 : 0);
+        result.line = tile ? QRect(after ? row.right() : row.left(), row.top() + 3, 2, row.height() - 6)
+                           : QRect(row.left() + 3, (after ? row.bottom() + 1 : row.top()) - 1, row.width() - 6, 2);
+    }
+    return result;
 }
 
 void TabBar::hide_drop_preview()
 {
+    if (tab_layout() != TabLayout::Horizontal) {
+        m_drop_slot.clear();
+        update();
+        return;
+    }
     set_drop_slot({});
 }
 
@@ -3080,7 +2994,7 @@ void TabBar::start_tab_drag(int index, QPoint position)
         }
     }
 
-    start_strip_drag(index);
+    start_strip_drag(index, position);
 }
 
 // The tab comes loose from its strip and follows the pointer freely, until it is dropped on a tab strip or, anywhere
@@ -3153,7 +3067,7 @@ QPoint TabBar::tab_drag_hot_spot() const
     return m_position_in_selected_tab_while_dragging - m_tab_drag_card_offset + QPoint(TAB_DRAG_IMAGE_MARGIN, TAB_DRAG_IMAGE_MARGIN);
 }
 
-void TabBar::start_strip_drag(int index)
+void TabBar::start_strip_drag(int index, QPoint position)
 {
     // NB: The card is drawn once, before the tab is dragged, since the strip leaves a gap where the dragged tab is, and
     //     the other tabs move about it from then on. It shows the tab fully selected, even if the drag started while
@@ -3173,8 +3087,10 @@ void TabBar::start_strip_drag(int index)
     s_pending_tab_drop_target = nullptr;
     s_pending_tab_drop_index = -1;
 
-    m_strip_drag_card->show();
-    m_strip_drag_card->raise();
+    if (tab_layout() == TabLayout::Horizontal) {
+        m_strip_drag_card->show();
+        m_strip_drag_card->raise();
+    }
     m_strip_drag_cancellation_filter = new TabDragCancellationFilter([this] {
         end_strip_drag();
         clear_drop_preview();
@@ -3183,7 +3099,7 @@ void TabBar::start_strip_drag(int index)
 
     update_tab_button_geometry();
     update();
-    update_strip_drag(mapFromGlobal(QCursor::pos()));
+    update_strip_drag(tab_layout() == TabLayout::Horizontal ? mapFromGlobal(QCursor::pos()) : position);
 }
 
 void TabBar::update_strip_drag(QPoint position)

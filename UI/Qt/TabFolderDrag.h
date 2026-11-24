@@ -11,14 +11,15 @@
 #include <UI/Qt/TabFolderSync.h>
 #include <UI/Qt/TabFolderTree.h>
 
-// Where tabs and folders dragged along the vertical sidebar's rows land. The rows that stay make way for the ones moving
-// at a gap between two of them, and how far the dragged card sits to the right picks the depth there: below a folder's
-// last row, a card held to the left leaves the folder, and one held to the right stays in it. Nothing here knows about
-// pixels; the tab bar turns the card's place into a fractional gap and depth.
+// Where tabs and folders dragged along the vertical sidebar land. The pointer picks a gap between stationary rows;
+// its sideways motion picks a depth there. Below a folder's last row, moving left can take an item out of the folder.
 namespace Ladybird::TabFolderDrag {
 
 using Item = TabFolderTree::Item;
 using TabFolderSync::SidebarRow;
+
+// The indicator uses all visible slots, but a destination counts only rows outside the moving items and their subtrees.
+Vector<size_t> gaps_for_visible_slots(Vector<SidebarRow> const&, Vector<SidebarRow> const& remaining);
 
 // The depths that items dropped in the gap before rows[gap] can take, of rows that leave out the items moving. The
 // deepest is inside the row above when that's a folder, or beside it otherwise; the shallowest is beside the row below,

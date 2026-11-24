@@ -190,6 +190,11 @@ private:
     Optional<int> dragged_tab_index() const;
     bool dragging_pinned_tab() const;
     QRect incoming_drop_layout_rect(int position) const;
+    struct VerticalStripDrop {
+        int index;
+        QRect line;
+    };
+    VerticalStripDrop vertical_strip_drop_at(QPoint const&) const;
     int drop_slot_at(QPoint const&) const;
     void set_drop_slot(Optional<int>);
     void clear_drop_preview();
@@ -209,7 +214,7 @@ private:
     bool start_window_move();
     void start_tab_drag(int index, QPoint position);
     QPoint tab_drag_hot_spot() const;
-    void start_strip_drag(int index);
+    void start_strip_drag(int index, QPoint position);
     void update_strip_drag(QPoint position);
     void end_strip_drag();
     void drag_tab_loose(Tab&, QPixmap card);
@@ -299,41 +304,24 @@ private:
     QPointer<TabFolderEditing::FolderNameEditor> m_folder_name_editor;
     Optional<TabFolderId> m_edited_folder;
 
-    // A drag along the sidebar's rows: the rows that stay make way for the ones moving, which follow the pointer as a card.
-    // How far the card is held to the left or right picks how deep the rows land in the gap (see TabFolderDrag).
+    // The pointer chooses an edge in the unchanged layout. The corresponding gap ignores rows that will move on drop.
     struct RowDrag {
         Vector<TabFolderTree::Item> moving;
-        // The rows that stay, laid out around the gap the moving ones leave.
-        Vector<SidebarRow> remaining;
-        // Where the moving rows land: before this many of the rows that stay, this deep, which is this place in the tree.
-        size_t gap { 0 };
+        Vector<TabFolderSync::SidebarRow> remaining;
+        Vector<size_t> gaps;
+        int indicator_slot { 0 };
         size_t depth { 0 };
-        Optional<TabFolderDestination> destination;
-        // Where the card was last asked to land, before rounding, so the drag can find its place again when rows change.
-        double wanted_gap { 0 };
-        double wanted_depth { 0 };
-        // How many rows the card shows, which is how many rows of room the gap takes.
-        size_t card_rows { 1 };
-        // The rows the moving items showed, by row_key(), with the grabbed row first.
-        Vector<u64> moving_keys;
-        // The depth the card's first row started at, from which the card moves aside as the depth changes.
         size_t first_depth { 0 };
-        // Where the pointer holds the grabbed row.
-        int press_offset_y { 0 };
-        // The tab being dragged when it's one tab on its own, which, as from the plain list, can leave for another window.
+        Optional<TabFolderDestination> destination;
         QPointer<Tab> single_tab;
-        // Where the card's left edge is, at the first row's starting depth.
-        int card_left { 0 };
         QPoint last_position;
-        QPixmap card;
     };
     bool start_row_drag(TabFolderTree::Item pressed, Vector<TabFolderTree::Item>, QPoint position);
     void update_row_drag(QPoint position, bool allow_detach = true);
     void end_row_drag(bool drop);
     // The rows changed under a drag, as when a tab closes: the drag carries on with what's left of it.
-    void refresh_row_drag();
+    void refresh_row_drag(bool allow_detach = false);
     void retarget_row_drag();
-    void lay_out_row_drag();
     void animate_rows_from(HashMap<u64, qreal> start_y);
     int sidebar_rows_origin_y() const;
     Vector<TabFolderTree::Item> selected_sidebar_items() const;
@@ -351,7 +339,6 @@ private:
     qreal m_rows_progress { 1.0 };
     QVariantAnimation* m_rows_animation { nullptr };
     Optional<RowDrag> m_row_drag;
-    QPointer<TabDragCard> m_row_drag_card;
     QObject* m_row_drag_cancellation_filter { nullptr };
     // A press on a tab of a selection keeps the selection, for a drag to carry it, until the press ends without one.
     bool m_clear_folder_selection_on_release { false };
@@ -379,6 +366,7 @@ private:
     QVariantAnimation* m_selection_animation { nullptr };
 
     Optional<int> m_drop_slot;
+    QRect m_vertical_drop_line;
     DropPreview m_drop_preview_start;
     DropPreview m_drop_preview_target;
     qreal m_drop_preview_progress { 1.0 };

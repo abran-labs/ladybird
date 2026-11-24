@@ -9,6 +9,20 @@
 
 namespace Ladybird::TabFolderDrag {
 
+Vector<size_t> gaps_for_visible_slots(Vector<SidebarRow> const& rows, Vector<SidebarRow> const& remaining)
+{
+    Vector<size_t> gaps;
+    gaps.ensure_capacity(rows.size() + 1);
+    size_t gap = 0;
+    gaps.append(gap);
+    for (auto const& row : rows) {
+        if (gap < remaining.size() && row == remaining[gap])
+            ++gap;
+        gaps.append(gap);
+    }
+    return gaps;
+}
+
 static Optional<TabFolderDestination> visible_position(TabFolderTree const& tree, Vector<SidebarRow> const& rows, size_t index)
 {
     auto item = rows[index].item;
