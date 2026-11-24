@@ -240,6 +240,54 @@ TEST_CASE(a_gap_below_a_collapsed_header_lands_inside_that_folder)
     EXPECT_EQ(destination.index, 0u);
 }
 
+// Carries out a plan of moves the way a tab bar's moveTab(from, to) does: each one applies to the order the one before
+// it left.
+static Vector<i64> after_moves(Vector<i64> order, Vector<TabFolderSync::Move> const& moves)
+{
+    for (auto const& move : moves) {
+        EXPECT(move.from < order.size());
+        EXPECT(move.to < order.size());
+        if (move.from >= order.size() || move.to >= order.size())
+            continue;
+        auto key = order[move.from];
+        order.remove(move.from);
+        order.insert(move.to, key);
+    }
+    return order;
+}
+
+TEST_CASE(reordering_the_strip_takes_the_wanted_order_with_one_move_at_a_time)
+{
+    // Tabs 2 and 3 moved into a folder that now sits before tab 1, and tab 4 stayed after it.
+    auto moves = TabFolderSync::moves_to_reorder(keys({ 1, 2, 3, 4 }), keys({ 2, 3, 1, 4 }));
+    EXPECT_EQ(after_moves(keys({ 1, 2, 3, 4 }), moves), keys({ 2, 3, 1, 4 }));
+
+    // Tabs cross in pairs: 1 and 3 each step over the tab after them.
+    moves = TabFolderSync::moves_to_reorder(keys({ 1, 2, 3, 4 }), keys({ 2, 4, 1, 3 }));
+    EXPECT_EQ(after_moves(keys({ 1, 2, 3, 4 }), moves), keys({ 2, 4, 1, 3 }));
+    EXPECT_EQ(moves.size(), 2u);
+}
+
+static Vector<TabFolderSync::Move> moves_list(std::initializer_list<TabFolderSync::Move> list)
+{
+    Vector<TabFolderSync::Move> result;
+    for (auto move : list)
+        result.append(move);
+    return result;
+}
+
+TEST_CASE(reordering_the_strip_leaves_every_tab_that_is_already_in_order_alone)
+{
+    // A folder at the top goes to the bottom: only its tab moves, to the end, however many tabs follow it.
+    EXPECT_EQ(TabFolderSync::moves_to_reorder(keys({ 1, 2, 3, 4, 5 }), keys({ 2, 3, 4, 5, 1 })), moves_list({ { 0, 4 } }));
+
+    // The same folder comes back from the bottom, and again only its tab moves.
+    EXPECT_EQ(TabFolderSync::moves_to_reorder(keys({ 2, 3, 4, 5, 1 }), keys({ 1, 2, 3, 4, 5 })), moves_list({ { 4, 0 } }));
+
+    // The tab in the middle goes to the end; the others never move.
+    EXPECT_EQ(TabFolderSync::moves_to_reorder(keys({ 1, 2, 3, 4 }), keys({ 1, 3, 4, 2 })), moves_list({ { 1, 3 } }));
+}
+
 TEST_CASE(a_noncontiguous_selection_keeps_its_order_wherever_it_lands)
 {
     TabFolderId work = 0;

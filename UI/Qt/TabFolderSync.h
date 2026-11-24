@@ -46,6 +46,17 @@ void follow_window_move(TabFolderTree&, Vector<WindowTab> const&, TabKey moved);
 // The order the native strip should have: the pinned tabs as the window has them, then the unpinned ones in tree order.
 Vector<TabKey> window_order(TabFolderTree const&, Vector<WindowTab> const&);
 
+// One move of a tab within the strip, from the index it has to the one it takes.
+struct Move {
+    size_t from { 0 };
+    size_t to { 0 };
+
+    bool operator==(Move const&) const = default;
+};
+// The moves, in order, that bring the strip from the order it has to the wanted one, which lists the same tabs. Each
+// move is from the index its tab has once the moves before it are done, the way a strip's own moves are.
+Vector<Move> moves_to_reorder(Vector<TabKey> const& current, Vector<TabKey> const& wanted);
+
 // The sidebar's rows below the pinned tiles. Pinned tabs have no row, and only an unpinned active tab previews.
 Vector<SidebarRow> sidebar_rows(TabFolderTree const&, Vector<WindowTab> const&, Optional<TabKey> active);
 

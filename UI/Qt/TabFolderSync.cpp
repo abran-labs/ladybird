@@ -111,6 +111,71 @@ Vector<TabKey> window_order(TabFolderTree const& tree, Vector<WindowTab> const& 
     return order;
 }
 
+Vector<Move> moves_to_reorder(Vector<TabKey> const& current, Vector<TabKey> const& wanted)
+{
+    // A tab that already comes after the same tabs as it will at the end never has to move, whatever is around it: the
+    // other tabs go around it. Those that stay form the longest run whose places in the wanted order rise.
+    auto const none = NumericLimits<size_t>::max();
+    auto place_in_wanted = [&](TabKey key) {
+        auto index = wanted.find_first_index(key);
+        return index.has_value() ? *index : none;
+    };
+    auto tab_count = current.size();
+    Vector<size_t> places;
+    for (auto key : current)
+        places.append(place_in_wanted(key));
+
+    Vector<size_t> longest_ending_at;
+    longest_ending_at.resize(tab_count);
+    size_t longest = 0;
+    for (size_t i = 0; i < tab_count; ++i) {
+        if (places[i] == none)
+            continue;
+        longest_ending_at[i] = 1;
+        for (size_t before = 0; before < i; ++before) {
+            if (places[before] < places[i])
+                longest_ending_at[i] = max(longest_ending_at[i], longest_ending_at[before] + 1);
+        }
+        longest = max(longest, longest_ending_at[i]);
+    }
+    // A tab that's in its place for good never moves again. Those that stay are there from the start.
+    HashTable<TabKey> in_place_for_good;
+    for (size_t i = tab_count; i > 0 && longest > 0; --i) {
+        if (longest_ending_at[i - 1] == longest) {
+            in_place_for_good.set(current[i - 1]);
+            --longest;
+        }
+    }
+
+    // Each other tab goes in turn, in the order it ends up in, right behind the tab before it there that's in place for
+    // good. Everything that ends up before it is there by then, and nothing later passes it, so it moves this once.
+    auto order = current;
+    Vector<Move> moves;
+    for (auto key : wanted) {
+        auto from = order.find_first_index(key);
+        if (!from.has_value())
+            break;
+        if (in_place_for_good.contains(key))
+            continue;
+        auto place = place_in_wanted(key);
+        size_t to = 0;
+        for (size_t i = 0; i < order.size(); ++i) {
+            if (in_place_for_good.contains(order[i]) && place_in_wanted(order[i]) < place)
+                to = i + 1;
+        }
+        // The tab leaves its place first, as a strip's own move takes it.
+        if (*from < to)
+            --to;
+        if (*from != to) {
+            order.remove(*from);
+            order.insert(to, key);
+            moves.append({ *from, to });
+        }
+        in_place_for_good.set(key);
+    }
+    return moves;
+}
+
 Vector<SidebarRow> sidebar_rows(TabFolderTree const& tree, Vector<WindowTab> const& tabs, Optional<TabKey> active)
 {
     HashTable<TabKey> pinned;
