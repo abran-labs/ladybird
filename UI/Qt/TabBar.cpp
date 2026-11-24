@@ -40,9 +40,7 @@
 #include <UI/Qt/TabFolderDrag.h>
 #include <UI/Qt/TabFolderMenus.h>
 #include <UI/Qt/Theme.h>
-#if defined(LADYBIRD_HAS_WAYLAND_CLIENT)
-#    include <UI/Qt/WaylandWindow.h>
-#endif
+#include <UI/Qt/WaylandWindow.h>
 #include <UI/Qt/WindowControlButton.h>
 #include <UI/Qt/WindowControlsReveal.h>
 
@@ -4554,6 +4552,9 @@ void TabBar::toggle_window_maximized()
 
 bool TabBar::start_window_move()
 {
+    if (is_hyprland_wayland_session())
+        return false;
+
     auto* handle = window()->windowHandle();
     if (!handle)
         return false;
@@ -5726,6 +5727,17 @@ bool TabWidget::tab_drop_area_contains(QWidget const& widget, QPoint position) c
         ? drag_area->rect().adjusted(0, -TAB_DETACH_DISTANCE, 0, TAB_DETACH_DISTANCE)
         : drag_area->rect().adjusted(-TAB_DETACH_DISTANCE, 0, TAB_DETACH_DISTANCE, 0);
     return drop_area.contains(position_in_drag_area);
+}
+
+bool TabWidget::tab_chrome_contains(QWidget const& widget) const
+{
+    auto includes_widget = [&](QWidget const& chrome) { return &chrome == &widget || chrome.isAncestorOf(&widget); };
+    if (includes_widget(*tab_drag_area_widget()))
+        return true;
+
+    // Some sidebar controls sit outside the column when arranged beside the toolbar.
+    return m_tab_bar->tab_layout() != TabLayout::Horizontal
+        && (includes_widget(m_toolbar->sidebar_slot()) || includes_widget(m_toolbar->trailing_sidebar_slot()) || includes_widget(m_toolbar->sidebar_footer()));
 }
 
 QWidget* TabWidget::tab_drag_area_widget() const
@@ -6948,6 +6960,9 @@ void TabWidget::toggle_window_maximized()
 
 bool TabWidget::start_window_move()
 {
+    if (is_hyprland_wayland_session())
+        return false;
+
     auto* handle = window()->windowHandle();
     if (!handle)
         return false;

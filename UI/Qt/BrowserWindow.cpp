@@ -40,6 +40,7 @@
 #include <UI/Qt/TabBar.h>
 #include <UI/Qt/TabFolderMenus.h>
 #include <UI/Qt/Theme.h>
+#include <UI/Qt/WaylandWindow.h>
 #include <UI/Qt/WebContentView.h>
 #include <UI/Qt/WindowControlButton.h>
 
@@ -2582,7 +2583,8 @@ bool BrowserWindow::eventFilter(QObject* object, QEvent* event)
             return true;
         }
 
-        if (start_window_move())
+        auto is_hyprland_tab_chrome = is_hyprland_wayland_session() && m_tabs_container && m_tabs_container->tab_chrome_contains(*widget);
+        if (!is_hyprland_tab_chrome && start_window_move())
             return true;
     }
 
