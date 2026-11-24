@@ -107,6 +107,16 @@ Optional<Target> target_for(TabFolderTree const& tree, Vector<SidebarRow> const&
     return {};
 }
 
+Optional<Target> target_for_folder(TabFolderTree const& tree, SidebarRow const& row, Vector<Item> const& moving, size_t preview_gap)
+{
+    if (!row.item.is_folder())
+        return {};
+    auto place = TabFolderDestination::at_end_of(row.item.id);
+    if (!tree.can_move_items(moving, place))
+        return {};
+    return Target { preview_gap, row.depth + 1, place };
+}
+
 Vector<Item> items_to_drag(Item pressed, Vector<Item> const& selection)
 {
     if (selection.contains_slow(pressed))

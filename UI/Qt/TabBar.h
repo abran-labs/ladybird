@@ -62,6 +62,7 @@ class ChromeHeaderButton;
 class LadybirdButton;
 
 class TabMicrophoneIndicator;
+class TabDragCard;
 class TabWidget;
 class WindowControlsReveal;
 
@@ -283,6 +284,15 @@ private:
     void paint_sidebar_folder_rows(QPainter&, QRect const& clip);
     int sidebar_tab_index_at(QPoint const&, PinnedRegion const&) const;
     void set_hovered_folder(Optional<TabFolderId>);
+    void update_folder_glyphs();
+    struct FolderIconState {
+        QString icon;
+        TabFolderTree::FolderGlyph glyph;
+        bool operator==(FolderIconState const&) const = default;
+    };
+    QHash<TabFolderId, FolderIconState> m_folder_glyphs;
+    QHash<TabFolderId, FolderIconState> m_previous_folder_glyphs;
+    QVariantAnimation* m_glyph_animation { nullptr };
     Optional<QRect> edited_folder_row_rect() const;
     void ensure_edited_folder_visible();
     void update_folder_name_editor_geometry();
@@ -341,7 +351,7 @@ private:
     qreal m_rows_progress { 1.0 };
     QVariantAnimation* m_rows_animation { nullptr };
     Optional<RowDrag> m_row_drag;
-    QPointer<QWidget> m_row_drag_card;
+    QPointer<TabDragCard> m_row_drag_card;
     QObject* m_row_drag_cancellation_filter { nullptr };
     // A press on a tab of a selection keeps the selection, for a drag to carry it, until the press ends without one.
     bool m_clear_folder_selection_on_release { false };

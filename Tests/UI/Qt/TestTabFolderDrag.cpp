@@ -247,6 +247,23 @@ TEST_CASE(a_folder_too_deep_to_nest_falls_back_to_a_shallower_depth)
     EXPECT_EQ(target.depth, range.max - 1);
 }
 
+TEST_CASE(a_direct_folder_target_preserves_the_visual_gap_and_never_falls_back_to_a_sibling)
+{
+    TabFolderId work = 0;
+    auto tree = work_tree(work);
+    auto empty = tree.create_folder("Empty"_string).release_value();
+    EXPECT(tree.set_folder_collapsed(empty, true));
+    auto moving = items({ folder(work) });
+    auto rows = rows_while_dragging(tree, moving);
+    auto target = TabFolderDrag::target_for_folder(tree, rows.last(), moving, 1).release_value();
+    EXPECT_EQ(target.gap, 1u);
+    EXPECT_EQ(target.depth, 1u);
+    EXPECT_EQ(target.destination.parent, Optional<TabFolderId> { empty });
+    EXPECT(tree.move_items(moving, target.destination));
+    EXPECT(tree.folder(empty)->collapsed);
+    EXPECT(!TabFolderDrag::target_for_folder(tree, { folder(work), 1 }, items({ folder(empty) }), 0).has_value());
+}
+
 TEST_CASE(a_press_on_a_selected_tab_drags_the_whole_selection)
 {
     auto selected = items({ tab(1), tab(3), tab(4) });

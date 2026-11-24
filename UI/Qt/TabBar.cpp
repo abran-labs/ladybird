@@ -702,14 +702,25 @@ public:
         resize(m_pixmap.deviceIndependentSize().toSize());
     }
 
+    void set_over_folder(bool over)
+    {
+        if (m_over_folder == over)
+            return;
+        m_over_folder = over;
+        update();
+    }
+
 private:
     virtual void paintEvent(QPaintEvent*) override
     {
         QPainter painter(this);
+        if (m_over_folder)
+            painter.setOpacity(0.22);
         painter.drawPixmap(0, 0, m_pixmap);
     }
 
     QPixmap m_pixmap;
+    bool m_over_folder { false };
 };
 
 TabBar::TabBar(TabWidget* tab_widget)
@@ -869,6 +880,7 @@ void TabBar::set_sidebar_rows(Vector<SidebarRow> rows, bool has_folders, Vector<
     m_sidebar_rows = AK::move(rows);
     m_sidebar_selection = AK::move(selection);
     m_has_sidebar_rows = use_rows;
+    update_folder_glyphs();
     lay_out_sidebar_rows(false);
 }
 
@@ -1113,7 +1125,50 @@ void TabBar::set_hovered_folder(Optional<TabFolderId> folder)
     if (m_hovered_folder == folder)
         return;
     m_hovered_folder = folder;
+    if (m_row_drag.has_value())
+        update_folder_glyphs();
     update();
+}
+
+void TabBar::update_folder_glyphs()
+{
+    QHash<TabFolderId, FolderIconState> glyphs;
+    bool changed = false;
+    for (auto const& row : m_sidebar_rows) {
+        if (!row.row.item.is_folder())
+            continue;
+        auto id = row.row.item.id;
+        auto direct = m_row_drag.has_value() && m_hovered_folder == id;
+        FolderIconState state = direct ? FolderIconState { {}, TabFolderTree::FolderGlyph::Open } : FolderIconState { row.icon, row.row.glyph };
+        auto old = m_folder_glyphs.constFind(id);
+        changed |= old != m_folder_glyphs.constEnd() && old.value() != state;
+        glyphs.insert(id, state);
+    }
+    if (changed && isVisible() && !SystemAppearance::prefers_reduced_motion()
+        && style()->styleHint(QStyle::SH_Widget_Animation_Duration, nullptr, this) > 0) {
+        if (!m_glyph_animation) {
+            m_glyph_animation = new QVariantAnimation(this);
+            m_glyph_animation->setDuration(Motion::FAST);
+            m_glyph_animation->setEasingCurve(Motion::enter_easing());
+            m_glyph_animation->setStartValue(0.0);
+            m_glyph_animation->setEndValue(1.0);
+            connect(m_glyph_animation, &QVariantAnimation::valueChanged, this, [this] { update(); });
+            connect(m_glyph_animation, &QVariantAnimation::finished, this, [this] { m_previous_folder_glyphs.clear(); });
+        }
+        m_glyph_animation->stop();
+        m_previous_folder_glyphs = AK::move(m_folder_glyphs);
+        m_glyph_animation->start();
+    } else if (changed && m_glyph_animation) {
+        m_glyph_animation->stop();
+        m_previous_folder_glyphs.clear();
+    }
+    m_folder_glyphs = AK::move(glyphs);
+}
+
+// Leave a little room between folder cards for a sibling drop; the entire painted card accepts a direct drop.
+static QRect sidebar_folder_shape(QRect const& row, bool collapsed)
+{
+    return (collapsed ? collapsed_vertical_tab_shape_rect(row) : tab_card_shape_rect(row)).adjusted(0, 2, 0, -1);
 }
 
 void TabBar::paint_sidebar_folder_rows(QPainter& painter, QRect const& clip)
@@ -1141,8 +1196,11 @@ void TabBar::paint_sidebar_folder_rows(QPainter& painter, QRect const& clip)
 
         painter.save();
         painter.setOpacity(opacity);
-        auto shape = collapsed ? collapsed_vertical_tab_shape_rect(rect) : tab_card_shape_rect(rect);
-        if (m_hovered_folder == row.row.row.item.id || m_pressed_folder == row.row.row.item.id) {
+        auto shape = sidebar_folder_shape(rect, collapsed);
+        auto id = row.row.row.item.id;
+        if (m_row_drag.has_value() && m_hovered_folder == id) {
+            paint_selected_vertical_tab(painter, Theme::chrome_palette(*this), shape, collapsed ? COLLAPSED_VERTICAL_TAB_RADIUS : VERTICAL_TAB_RADIUS);
+        } else if (m_hovered_folder == id || m_pressed_folder == id) {
             painter.setPen(Qt::NoPen);
             painter.setBrush(vertical_tab_hover_surface(Theme::chrome_palette(*this), m_pressed_folder == row.row.row.item.id ? 1.0 : 0.65));
             painter.drawRoundedRect(shape, collapsed ? COLLAPSED_VERTICAL_TAB_RADIUS : VERTICAL_TAB_RADIUS, collapsed ? COLLAPSED_VERTICAL_TAB_RADIUS : VERTICAL_TAB_RADIUS);
@@ -1155,7 +1213,16 @@ void TabBar::paint_sidebar_folder_rows(QPainter& painter, QRect const& clip)
         } else {
             icon_rect = { shape.left() + VERTICAL_TAB_CONTENT_LEADING_INSET, shape.top() + ((shape.height() - TAB_ICON_SIZE) / 2), TAB_ICON_SIZE, TAB_ICON_SIZE };
         }
-        FolderIcons::icon(row.row.icon, row.row.row.glyph, text_color).paint(&painter, icon_rect);
+        auto glyph = m_folder_glyphs.value(id, { row.row.icon, row.row.row.glyph });
+        auto previous = m_previous_folder_glyphs.constFind(id);
+        if (previous != m_previous_folder_glyphs.constEnd() && previous.value() != glyph && !SystemAppearance::prefers_reduced_motion()) {
+            auto progress = m_glyph_animation->currentValue().toReal();
+            painter.setOpacity(opacity * (1 - progress));
+            FolderIcons::icon(previous->icon, previous->glyph, text_color).paint(&painter, icon_rect);
+            painter.setOpacity(opacity * progress);
+        }
+        FolderIcons::icon(glyph.icon, glyph.glyph, text_color).paint(&painter, icon_rect);
+        painter.setOpacity(opacity);
         auto editing = m_folder_name_editor && (row.row.provisional || m_edited_folder == row.row.row.item.id);
         if (!collapsed && !editing) {
             auto title_rect = shape.adjusted(VERTICAL_TAB_CONTENT_LEADING_INSET + TAB_ICON_SIZE + HORIZONTAL_TAB_CONTENT_GAP, 0, -TAB_CONTENT_HORIZONTAL_INSET, 0);
@@ -1348,8 +1415,52 @@ void TabBar::retarget_row_drag()
     if (!browser_window)
         return;
     auto& drag = *m_row_drag;
-    auto rows = plain_rows(drag.remaining);
-    if (auto target = TabFolderDrag::target_for(browser_window->tab_folders(), rows, drag.moving, drag.wanted_gap, drag.wanted_depth); target.has_value()) {
+    auto const& tree = browser_window->tab_folders();
+    auto position = drag.last_position;
+    auto region = pinned_region();
+    bool hit_folder = false;
+    Optional<TabFolderDrag::Target> target;
+    if (rect().contains(position) && position.y() >= VERTICAL_TAB_BAR_END_ROOM + region.fixed_height()) {
+        for (size_t i = 0; i < m_laid_out_rows.size(); ++i) {
+            auto const& row = m_laid_out_rows[i];
+            if (!row.row.row.item.is_folder() || row.row.provisional)
+                continue;
+            auto rect = sidebar_row_rect(row, region);
+            auto shape = sidebar_folder_shape(rect, tab_layout() == TabLayout::VerticalCollapsed);
+            // The leading edge of a tall card can reach the next gap before the pointer reaches its folder. Do not let
+            // that folder move out of the way before the pointer has had a chance to enter it.
+            if (position.x() >= shape.left() && position.x() <= shape.right()) {
+                if (i >= drag.gap && position.y() < rect.top())
+                    drag.wanted_gap = min(drag.wanted_gap, static_cast<double>(i));
+                if (i < drag.gap && position.y() > rect.bottom())
+                    drag.wanted_gap = max(drag.wanted_gap, static_cast<double>(i + 1));
+            }
+            if (!rect.contains(position))
+                continue;
+            if (shape.contains(position)) {
+                hit_folder = true;
+                target = TabFolderDrag::target_for_folder(tree, row.row.row, drag.moving, drag.gap);
+            } else if (position.y() < shape.top()) {
+                drag.wanted_gap = i;
+            } else if (position.y() > shape.bottom()) {
+                drag.wanted_gap = i + 1;
+            }
+            break;
+        }
+    }
+    // Freeze an in-flight reflow on the frame the pointer actually hit. A release or slight movement on that same
+    // card must not hit a different row because the layout continued moving underneath it.
+    if (m_rows_animation) {
+        if (hit_folder && m_rows_animation->state() == QAbstractAnimation::Running)
+            m_rows_animation->pause();
+        else if (!hit_folder && m_rows_animation->state() == QAbstractAnimation::Paused)
+            m_rows_animation->resume();
+    }
+    if (!hit_folder)
+        target = TabFolderDrag::target_for(tree, plain_rows(drag.remaining), drag.moving, drag.wanted_gap, drag.wanted_depth);
+    set_hovered_folder(hit_folder && target.has_value() ? target->destination.parent : Optional<TabFolderId> {});
+    m_row_drag_card->set_over_folder(m_hovered_folder.has_value());
+    if (target.has_value()) {
         drag.gap = target->gap;
         drag.depth = target->depth;
         drag.destination = target->destination;
@@ -1385,15 +1496,13 @@ void TabBar::update_row_drag(QPoint position, bool allow_detach)
     auto top = position.y() - drag.press_offset_y;
     top = clamp(top, origin, origin + (static_cast<int>(drag.remaining.size()) * VERTICAL_TAB_HEIGHT));
     drag.wanted_gap = (top - origin) / static_cast<double>(VERTICAL_TAB_HEIGHT);
-    // The rail doesn't draw indentation, but the same sideways gesture selects a depth and highlights its parent.
+    // The rail doesn't draw indentation, but the same sideways gesture selects a depth between rows.
     drag.wanted_depth = drag.first_depth + ((position.x() - m_drag_start_position.x()) / static_cast<double>(ROW_DRAG_DEPTH_STEP));
 
     auto old_gap = drag.gap;
     retarget_row_drag();
     if (drag.gap != old_gap)
         lay_out_row_drag();
-    // The folder the rows would land in shows as hovered, which is how a drop into a folder differs from one beside it.
-    set_hovered_folder(drag.destination.has_value() ? drag.destination->parent : Optional<TabFolderId> {});
 
     auto indent_shift = sidebar_row_indent(drag.depth) - sidebar_row_indent(drag.first_depth);
     auto card_top_left = QPoint(drag.card_left + indent_shift, top + m_tab_drag_card_offset.y());
@@ -1455,6 +1564,7 @@ void TabBar::end_row_drag(bool drop)
     m_pressed_folder.clear();
     m_clear_folder_selection_on_release = false;
     set_hovered_folder({});
+    update_folder_glyphs();
 
     if (drop && drag.destination.has_value()) {
         if (auto* browser_window = qobject_cast<BrowserWindow*>(window()))

@@ -45,6 +45,9 @@ struct Target {
 // that the items may move to, or nothing when no depth there takes them.
 Optional<Target> target_for(TabFolderTree const&, Vector<SidebarRow> const& rows, Vector<Item> const& moving, double gap, double depth);
 
+// A hit on the folder itself keeps the preview gap still and appends to that folder, or rejects the drop.
+Optional<Target> target_for_folder(TabFolderTree const&, SidebarRow const&, Vector<Item> const& moving, size_t preview_gap);
+
 // What a drag that starts on an item carries: the whole selection when the item is part of it, the item alone otherwise.
 Vector<Item> items_to_drag(Item pressed, Vector<Item> const& selection);
 
