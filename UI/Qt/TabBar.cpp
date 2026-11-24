@@ -1861,7 +1861,8 @@ void TabBar::paintEvent(QPaintEvent*)
 
         // NB: The hovered horizontal tabs were filled before any tab was painted.
         if (selection < 1.0 && (is_hovered || is_folder_selected) && is_vertical) {
-            painter.setBrush(vertical_tab_hover_surface(Theme::chrome_palette(*this), is_folder_selected ? 1.0 : hover_progress));
+            auto palette = Theme::chrome_palette(*this);
+            painter.setBrush(is_folder_selected ? ChromeStyle::chrome_active_tab_surface(palette) : vertical_tab_hover_surface(palette, hover_progress));
             painter.setPen(Qt::NoPen);
             painter.drawPath(tab_path);
         } else if (selection < 1.0 && is_vertical && !is_collapsed_vertical && is_pinned_tile) {
@@ -1883,12 +1884,6 @@ void TabBar::paintEvent(QPaintEvent*)
             }
             painter.restore();
         }
-        if (is_folder_selected) {
-            painter.setBrush(Qt::NoBrush);
-            painter.setPen(Theme::focus_edge());
-            painter.drawRoundedRect(shape_rect.adjusted(0.5, 0.5, -0.5, -0.5), vertical_tab_radius, vertical_tab_radius);
-        }
-
         auto ring_opacity = loading_ring_opacity(index);
 
         auto icon = tabIcon(index);
