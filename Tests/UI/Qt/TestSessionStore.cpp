@@ -3102,3 +3102,89 @@ TEST_CASE(an_exit_that_keeps_pinned_tabs_leaves_no_forgotten_folder_name_in_the_
         EXPECT(!contents.contains("ConfidentialFolderName"sv));
     }
 }
+
+TEST_CASE(an_exit_that_keeps_pinned_tabs_forgets_folders_whose_tabs_have_broken_or_missing_rows)
+{
+    // Work holds the pinned tab, Ideas (empty, with Sketches), Confidential (an unpinned tab whose row gets an unparseable
+    // URL), Ghost (a tab that has no row at all), and Mixed: Deep (a pinned tab) and Secret (another unpinned tab with an
+    // unparseable URL).
+    auto database = create_session_database();
+    using Item = TabFolderTree::Item;
+    SessionTabId pinned = 0;
+    SessionTabId deep_pinned = 0;
+    TabFolderId work = 0, ideas = 0, sketches = 0, mixed = 0, deep = 0;
+    {
+        auto store = TRY_OR_FAIL(SessionStore::create(*database));
+        auto window = TRY_OR_FAIL(store->window_opened());
+        pinned = open_tab(*store, window, "https://kept.example/"sv);
+        deep_pinned = open_tab(*store, window, "https://kept-deep.example/"sv);
+        auto confidential_tab = open_tab(*store, window, "https://c.example/"sv);
+        auto secret_tab = open_tab(*store, window, "https://s.example/"sv);
+        TRY_OR_FAIL(store->tab_pinned_changed(pinned, true));
+        TRY_OR_FAIL(store->tab_pinned_changed(deep_pinned, true));
+        SessionTabId const ghost_tab = 999'999;
+
+        auto tree = folder_tree_for({ pinned, deep_pinned, confidential_tab, secret_tab, ghost_tab });
+        work = tree.create_folder_around("Work"_string, { Item::tab(pinned) }).release_value();
+        ideas = tree.create_folder("Ideas"_string, TabFolderTree::Destination::at_end_of(work)).release_value();
+        sketches = tree.create_folder("Sketches"_string, TabFolderTree::Destination::at_end_of(ideas)).release_value();
+        auto confidential = tree.create_folder("Confidential"_string, TabFolderTree::Destination::at_end_of(work)).release_value();
+        EXPECT(tree.move_items({ Item::tab(confidential_tab) }, TabFolderTree::Destination::at_end_of(confidential)));
+        auto ghost = tree.create_folder("Ghost"_string, TabFolderTree::Destination::at_end_of(work)).release_value();
+        EXPECT(tree.move_items({ Item::tab(ghost_tab) }, TabFolderTree::Destination::at_end_of(ghost)));
+        mixed = tree.create_folder("Mixed"_string, TabFolderTree::Destination::at_end_of(work)).release_value();
+        deep = tree.create_folder("Deep"_string, TabFolderTree::Destination::at_end_of(mixed)).release_value();
+        EXPECT(tree.move_items({ Item::tab(deep_pinned) }, TabFolderTree::Destination::at_end_of(deep)));
+        auto secret = tree.create_folder("Secret Plans"_string, TabFolderTree::Destination::at_end_of(mixed)).release_value();
+        EXPECT(tree.move_items({ Item::tab(secret_tab) }, TabFolderTree::Destination::at_end_of(secret)));
+        TRY_OR_FAIL(store->tab_folders_changed(window, tree));
+
+        // The rows of the two unpinned tabs go bad on disk, the way a damaged or tampered file would leave them.
+        TRY_OR_FAIL(database->execute_raw(MUST(String::formatted("UPDATE SessionTabs SET active_url = 'not a url' WHERE id IN ({}, {});", confidential_tab, secret_tab)).to_byte_string()));
+        EXPECT_EQ(select_i64(*database, MUST(String::formatted("SELECT COUNT(*) FROM SessionTabs WHERE id = {};", ghost_tab))), 0);
+        EXPECT(saved_tab_folders_text(*database).contains("Confidential"sv));
+        EXPECT(saved_tab_folders_text(*database).contains("Ghost"sv));
+
+        quit_cleanly(*store, { window }, SessionStore::AfterExit::KeepPinnedTabs);
+    }
+
+    auto saved = saved_tab_folders_text(*database);
+    for (auto kept : { "Work"sv, "Ideas"sv, "Sketches"sv, "Mixed"sv, "Deep"sv })
+        EXPECT(saved.contains(kept));
+    for (auto forgotten : { "Confidential"sv, "Ghost"sv, "Secret Plans"sv })
+        EXPECT(!saved.contains(forgotten));
+
+    auto store = TRY_OR_FAIL(SessionStore::create(*database, SessionLaunchPolicy::PinnedOnly));
+    auto plan = store->take_launch_plan();
+    EXPECT_EQ(plan.size(), 1uz);
+    EXPECT(plan[0].tab_folders.has_value());
+    auto const& tree = *plan[0].tab_folders;
+    EXPECT_EQ(tree.children(work), (Vector<Item> { Item::tab(pinned), Item::folder(ideas), Item::folder(mixed) }));
+    EXPECT_EQ(tree.children(ideas), (Vector<Item> { Item::folder(sketches) }));
+    EXPECT_EQ(tree.children(mixed), (Vector<Item> { Item::folder(deep) }));
+    EXPECT_EQ(tree.children(deep), (Vector<Item> { Item::tab(deep_pinned) }));
+    EXPECT_EQ(tree.folders_in_order().size(), 5uz);
+}
+
+TEST_CASE(an_exit_that_keeps_pinned_tabs_classifies_folders_from_the_saved_rows_alone)
+{
+    // Rows and folders written straight into the file after startup, so no recovery has validated them: tab 11 is pinned,
+    // tab 12 unpinned with a URL that doesn't parse, tab 13 pinned with a URL that doesn't parse, and tab 14 has no row.
+    auto database = create_session_database();
+    auto store = TRY_OR_FAIL(SessionStore::create(*database));
+    TRY_OR_FAIL(database->execute_raw("INSERT INTO Sessions (id, kind, closed_time, active_tab_index) VALUES (1000, 0, 0, 0);"sv));
+    TRY_OR_FAIL(database->execute_raw("INSERT INTO SessionTabs (id, session_id, tab_ordinal, active_url, current_used_step_index, pinned) VALUES (11, 1000, 0, 'https://kept.example/', 0, 1), (12, 1000, 1, 'not a url', 0, 0), (13, 1000, 2, 'not a url either', 0, 1);"sv));
+    TRY_OR_FAIL(database->execute_raw(R"#(UPDATE Sessions SET tab_folders = '{"version":1,"root":[{"folder":{"id":1,"name":"Work","collapsed":false,"children":[{"tab":11},{"folder":{"id":2,"name":"EmptyIdeas","collapsed":false,"children":[]}},{"folder":{"id":3,"name":"Confidential","collapsed":false,"children":[{"tab":12}]}},{"folder":{"id":4,"name":"Ghost","collapsed":false,"children":[{"tab":14}]}},{"folder":{"id":5,"name":"BrokenButPinned","collapsed":false,"children":[{"tab":13}]}}]}}]}' WHERE id = 1000;)#"sv));
+
+    store->mark_clean_exit(SessionStore::AfterExit::KeepPinnedTabs);
+
+    auto saved = saved_tab_folders_text(*database);
+    EXPECT(saved.contains("Work"sv));
+    EXPECT(saved.contains("EmptyIdeas"sv));
+    // The delete keeps a pinned row however broken its URL, so its folder stays along with it.
+    EXPECT(saved.contains("BrokenButPinned"sv));
+    EXPECT(!saved.contains("Confidential"sv));
+    EXPECT(!saved.contains("Ghost"sv));
+    EXPECT_EQ(select_i64(*database, "SELECT COUNT(*) FROM SessionTabs WHERE id IN (11, 13);"_string), 2);
+    EXPECT_EQ(select_i64(*database, "SELECT COUNT(*) FROM SessionTabs WHERE id = 12;"_string), 0);
+}

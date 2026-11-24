@@ -279,6 +279,7 @@ private:
         Database::StatementID update_session_tab_folders;
         Database::StatementID select_session_tab_folders;
         Database::StatementID select_sessions_with_tab_folders;
+        Database::StatementID select_pinned_tab_ids_of_session;
         Database::StatementID write_lifecycle;
         SessionHistorySnapshotStatements snapshot_statements;
     };
@@ -490,6 +491,7 @@ private:
         ErrorOr<void> write_session_geometry(SessionWindowId, SessionWindowGeometry const&);
         ErrorOr<void> write_session_tab_folders(SessionWindowId, Optional<TabFolderTree> const&);
         ErrorOr<Optional<TabFolderTree>> read_session_tab_folders(SessionWindowId, HashTable<SessionTabId> const& allowed_tabs);
+        ErrorOr<Optional<TabFolderTree>> read_session_tab_folders(SessionWindowId, Function<bool(SessionTabId)> const& is_allowed_tab);
         ErrorOr<void> forget_folders_of_forgotten_tabs();
         ErrorOr<void> demote_to_startup_recovery_unit(SessionWindowId, UnixDateTime recovered_at, IdAllocator& close_sequence_allocator);
         ErrorOr<void> reopen_session(SessionWindowId);

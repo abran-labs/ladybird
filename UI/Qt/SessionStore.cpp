@@ -60,11 +60,11 @@ static Optional<String> serialized_tab_folders(Optional<TabFolderTree> const& tr
     return tree->serialize();
 }
 
-static Optional<TabFolderTree> parse_tab_folders(Optional<String> const& serialized, HashTable<TabFolderTree::TabKey> const& allowed_tabs)
+static Optional<TabFolderTree> parse_tab_folders(Optional<String> const& serialized, Function<bool(TabFolderTree::TabKey)> const& is_allowed_tab)
 {
     if (!serialized.has_value())
         return {};
-    auto tree = TabFolderTree::deserialize(*serialized, allowed_tabs);
+    auto tree = TabFolderTree::deserialize_with(*serialized, is_allowed_tab);
     if (tree.is_error()) {
         if (WebView::history_debug_enabled())
             dbgln("[History] Saved tab folders are unreadable, so the window has none: {}", tree.error());
@@ -392,6 +392,7 @@ ErrorOr<SessionStore::PersistedStorage> SessionStore::PersistedStorage::create(D
     statements.update_session_tab_folders = TRY(database.prepare_statement("UPDATE Sessions SET tab_folders = :tab_folders WHERE id = :id;"sv));
     statements.select_session_tab_folders = TRY(database.prepare_statement("SELECT tab_folders FROM Sessions WHERE id = :id;"sv));
     statements.select_sessions_with_tab_folders = TRY(database.prepare_statement("SELECT id FROM Sessions WHERE tab_folders IS NOT NULL;"sv));
+    statements.select_pinned_tab_ids_of_session = TRY(database.prepare_statement("SELECT id FROM SessionTabs WHERE session_id = :session_id AND pinned != 0;"sv));
     statements.snapshot_statements = TRY(prepare_session_history_snapshot_statements(database));
 
     return PersistedStorage { database, move(statements) };
@@ -957,6 +958,11 @@ ErrorOr<void> SessionStore::PersistedStorage::write_session_tab_folders(SessionW
 // Unreadable folders read as none, rather than failing what reads them.
 ErrorOr<Optional<TabFolderTree>> SessionStore::PersistedStorage::read_session_tab_folders(SessionWindowId window_id, HashTable<SessionTabId> const& allowed_tabs)
 {
+    return read_session_tab_folders(window_id, [&](auto key) { return allowed_tabs.contains(key); });
+}
+
+ErrorOr<Optional<TabFolderTree>> SessionStore::PersistedStorage::read_session_tab_folders(SessionWindowId window_id, Function<bool(SessionTabId)> const& is_allowed_tab)
+{
     Optional<String> serialized;
     TRY(database->try_execute_bound_statement(
         statements.select_session_tab_folders,
@@ -969,7 +975,7 @@ ErrorOr<Optional<TabFolderTree>> SessionStore::PersistedStorage::read_session_ta
                 serialized = text.release_value();
             return {};
         }));
-    return parse_tab_folders(serialized, allowed_tabs);
+    return parse_tab_folders(serialized, is_allowed_tab);
 }
 
 // Folders forget the tabs that aren't kept: a folder holding only those goes with them, names and all, while an empty
@@ -987,16 +993,21 @@ ErrorOr<void> SessionStore::PersistedStorage::forget_folders_of_forgotten_tabs()
         }));
 
     for (auto session_id : sessions) {
-        // Every tab row of the window, kept or not, so membership is classified before any row is removed. A row that
-        // fails validation is gone already, and its tab is neither kept nor anywhere to forget.
-        HashTable<SessionTabId> all_tabs;
+        // What decides a tab's fate is the raw pinned flag of its row, the same one the delete below goes by, read before
+        // any row is validated or removed. A tab that the folders reference without a pinned row, because its row is
+        // unpinned, can't be read, or is missing altogether, is forgotten, so its folder can't pass for an empty one.
         HashTable<SessionTabId> kept_tabs;
-        for (auto const& tab : TRY(read_recovered_tabs(session_id))) {
-            all_tabs.set(tab.id);
-            if (tab.pinned)
-                kept_tabs.set(tab.id);
-        }
-        auto tree = TRY(read_session_tab_folders(session_id, all_tabs));
+        TRY(database->try_execute_bound_statement(
+            statements.select_pinned_tab_ids_of_session,
+            [&](auto& bind) -> ErrorOr<void> {
+                return bind("session_id"sv, session_id);
+            },
+            [&](Database::ResultRow& row) -> ErrorOr<void> {
+                if (auto id = row.read_integer<SessionTabId>("id"sv); !id.is_error())
+                    kept_tabs.set(id.value());
+                return {};
+            }));
+        auto tree = TRY(read_session_tab_folders(session_id, [](auto) { return true; }));
         if (tree.has_value())
             tree = tree->with_only_tabs_kept([&](auto key) { return kept_tabs.contains(key); });
         TRY(write_session_tab_folders(session_id, tree));
@@ -1487,7 +1498,7 @@ ErrorOr<Vector<SessionStore::ClosedUnit>> SessionStore::PersistedStorage::load_c
                 HashTable<SessionTabId> unit_tab_ids;
                 for (auto const& tab : tabs)
                     unit_tab_ids.set(tab.tab_id);
-                tab_folders = parse_tab_folders(session_row.tab_folders, unit_tab_ids);
+                tab_folders = parse_tab_folders(session_row.tab_folders, [&](auto key) { return unit_tab_ids.contains(key); });
             }
 
             units.append({

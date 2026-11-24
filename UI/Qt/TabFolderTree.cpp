@@ -520,6 +520,11 @@ String TabFolderTree::serialize() const
 
 ErrorOr<TabFolderTree> TabFolderTree::deserialize(StringView serialized, HashTable<TabKey> const& allowed_tabs)
 {
+    return deserialize_with(serialized, [&](auto key) { return allowed_tabs.contains(key); });
+}
+
+ErrorOr<TabFolderTree> TabFolderTree::deserialize_with(StringView serialized, Function<bool(TabKey)> const& is_allowed_tab)
+{
     auto json = TRY(JsonValue::from_string(serialized));
     if (!json.is_object())
         return Error::from_string_literal("Tab folder tree is not an object");
@@ -542,7 +547,7 @@ ErrorOr<TabFolderTree> TabFolderTree::deserialize(StringView serialized, HashTab
                 auto key = entry.get_i64("tab"sv);
                 if (!key.has_value())
                     return Error::from_string_literal("Tab folder tree tab is not an integer");
-                if (allowed_tabs.contains(*key) && !tree.m_tab_parents.contains(*key))
+                if (is_allowed_tab(*key) && !tree.m_tab_parents.contains(*key))
                     tree.insert(Item::tab(*key), parent, NumericLimits<size_t>::max());
                 continue;
             }

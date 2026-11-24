@@ -626,3 +626,11 @@ TEST_CASE(splitting_a_folder_with_tabs_on_both_sides_keeps_it_in_both)
     EXPECT_EQ(split.first.children(both), items({ tab(1) }));
     EXPECT_EQ(split.second.children(both), items({ tab(2), folder(empty) }));
 }
+
+TEST_CASE(deserializing_can_keep_every_tab_reference)
+{
+    auto tree = TRY_OR_FAIL(TabFolderTree::deserialize_with(R"({"version":1,"root":[{"tab":5},{"folder":{"id":1,"name":"x","collapsed":false,"children":[{"tab":7},{"tab":5}]}}]})"sv, [](auto) { return true; }));
+    EXPECT_EQ(tree.children(), items({ tab(5), folder(1) }));
+    // A repeated reference still goes; it's the same tab.
+    EXPECT_EQ(tree.children(1), items({ tab(7) }));
+}

@@ -175,6 +175,7 @@ public:
     // Its size is at most MAX_SERIALIZED_BYTES_WITHOUT_TABS plus MAX_SERIALIZED_TAB_BYTES a tab.
     String serialize() const;
     static ErrorOr<TabFolderTree> deserialize(StringView, HashTable<TabKey> const& allowed_tabs);
+    static ErrorOr<TabFolderTree> deserialize_with(StringView, Function<bool(TabKey)> const& is_allowed_tab);
     // The same tree, with each tab's key mapped to another one; a tab that maps to nothing is dropped.
     TabFolderTree with_remapped_tabs(Function<Optional<TabKey>(TabKey)> const&) const;
 
