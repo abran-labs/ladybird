@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <AK/HashMap.h>
 #include <AK/HashTable.h>
 #include <UI/Qt/TabFolderSync.h>
 
@@ -178,6 +179,46 @@ Vector<Move> moves_to_reorder(Vector<TabKey> const& current, Vector<TabKey> cons
         in_place_for_good.set(key);
     }
     return moves;
+}
+
+StripGroups strip_groups(TabFolderTree const& tree, Vector<WindowTab> const& tabs, Optional<TabKey> active)
+{
+    StripGroups result;
+    result.group_of_tab.resize(tabs.size());
+    result.hidden.resize(tabs.size());
+
+    HashMap<TabKey, size_t> unpinned_index;
+    for (size_t i = 0; i < tabs.size(); ++i) {
+        if (!tabs[i].pinned)
+            unpinned_index.set(tabs[i].key, i);
+    }
+
+    // Each chip waits for the first unpinned tab that comes after it in tree order.
+    Vector<size_t> waiting_chips;
+    auto reached_tab = [&](TabKey key) {
+        for (auto chip : waiting_chips)
+            result.chips[chip].before_tab = key;
+        waiting_chips.clear();
+    };
+    for (auto item : tree.children()) {
+        if (item.is_tab()) {
+            if (unpinned_index.contains(item.id))
+                reached_tab(item.id);
+            continue;
+        }
+        auto const& folder = tree.folder(item.id).value();
+        waiting_chips.append(result.chips.size());
+        result.chips.append({ item.id, {}, folder.collapsed });
+        for (auto key : tree.tabs_inside(item.id)) {
+            auto index = unpinned_index.get(key);
+            if (!index.has_value())
+                continue;
+            reached_tab(key);
+            result.group_of_tab[*index] = item.id;
+            result.hidden[*index] = folder.collapsed && active != key;
+        }
+    }
+    return result;
 }
 
 Vector<SidebarRow> sidebar_rows(TabFolderTree const& tree, Vector<WindowTab> const& tabs, Optional<TabKey> active)

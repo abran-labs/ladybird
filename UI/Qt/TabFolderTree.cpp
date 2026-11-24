@@ -287,7 +287,7 @@ Optional<TabFolderId> TabFolderTree::create_folder(String name, Destination dest
         return {};
     m_last_folder_id = max(m_last_folder_id, *id);
     auto folder_id = *id;
-    m_folders.set(folder_id, FolderNode { .folder = { .id = folder_id, .name = move(name), .icon = {}, .collapsed = false }, .parent = {}, .children = {} });
+    m_folders.set(folder_id, FolderNode { .folder = { .id = folder_id, .name = move(name), .icon = {}, .color = {}, .collapsed = false }, .parent = {}, .children = {} });
     insert(Item::folder(folder_id), destination.parent, destination.index);
     return folder_id;
 }
@@ -334,6 +334,15 @@ bool TabFolderTree::set_folder_icon(TabFolderId id, Optional<String> icon)
     if (node == m_folders.end() || (icon.has_value() && !is_valid_folder_icon(*icon)))
         return false;
     node->value.folder.icon = move(icon);
+    return true;
+}
+
+bool TabFolderTree::set_folder_color(TabFolderId id, Optional<String> color)
+{
+    auto node = m_folders.find(id);
+    if (node == m_folders.end() || (color.has_value() && !is_valid_folder_color(*color)))
+        return false;
+    node->value.folder.color = move(color);
     return true;
 }
 
@@ -509,6 +518,8 @@ static JsonArray serialize_items(TabFolderTree const& tree, Vector<TabFolderTree
             folder_object.set("name"sv, folder.name);
             if (folder.icon.has_value())
                 folder_object.set("icon"sv, *folder.icon);
+            if (folder.color.has_value())
+                folder_object.set("color"sv, *folder.color);
             folder_object.set("collapsed"sv, folder.collapsed);
             folder_object.set("children"sv, serialize_items(tree, tree.children(item.id)));
             entry.set("folder"sv, move(folder_object));
@@ -580,6 +591,13 @@ ErrorOr<TabFolderTree> TabFolderTree::deserialize_with(StringView serialized, Fu
                     return Error::from_string_literal("Tab folder has an invalid icon");
                 icon = *icon_value;
             }
+            Optional<String> color;
+            if (folder_object->has("color"sv)) {
+                auto color_value = folder_object->get_string("color"sv);
+                if (!color_value.has_value() || !is_valid_folder_color(*color_value))
+                    return Error::from_string_literal("Tab folder has an invalid color");
+                color = *color_value;
+            }
             auto collapsed = false;
             if (folder_object->has("collapsed"sv)) {
                 auto collapsed_value = folder_object->get_bool("collapsed"sv);
@@ -591,7 +609,7 @@ ErrorOr<TabFolderTree> TabFolderTree::deserialize_with(StringView serialized, Fu
             if (!children.has_value())
                 return Error::from_string_literal("Tab folder has no children");
 
-            tree.m_folders.set(*id, FolderNode { .folder = { .id = *id, .name = *name, .icon = move(icon), .collapsed = collapsed }, .parent = {}, .children = {} });
+            tree.m_folders.set(*id, FolderNode { .folder = { .id = *id, .name = *name, .icon = move(icon), .color = move(color), .collapsed = collapsed }, .parent = {}, .children = {} });
             tree.insert(Item::folder(*id), parent, NumericLimits<size_t>::max());
             tree.m_last_folder_id = max(tree.m_last_folder_id, *id);
             TRY(self(self, *children, *id, depth + 1));

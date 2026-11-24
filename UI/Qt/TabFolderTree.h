@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <AK/Array.h>
 #include <AK/Error.h>
 #include <AK/Function.h>
 #include <AK/HashMap.h>
@@ -46,13 +47,19 @@ public:
     static constexpr size_t MAX_FOLDER_DEPTH = 32;
     static constexpr size_t MAX_FOLDERS = 256;
     // What the folders alone can take up when saved, at most: every name and icon escaped at six bytes a byte.
-    static constexpr size_t MAX_SERIALIZED_FOLDER_BYTES = 6 * MAX_FOLDER_NAME_BYTES + 6 * MAX_FOLDER_ICON_BYTES + 128;
+    // The longest saved color entry, "color":"<name>", with room to spare.
+    static constexpr size_t MAX_SERIALIZED_FOLDER_COLOR_BYTES = 32;
+    static constexpr size_t MAX_SERIALIZED_FOLDER_BYTES = 6 * MAX_FOLDER_NAME_BYTES + 6 * MAX_FOLDER_ICON_BYTES + MAX_SERIALIZED_FOLDER_COLOR_BYTES + 128;
     static constexpr size_t MAX_SERIALIZED_BYTES_WITHOUT_TABS = MAX_FOLDERS * MAX_SERIALIZED_FOLDER_BYTES + 64;
     // What each tab adds when saved, at most.
     static constexpr size_t MAX_SERIALIZED_TAB_BYTES = 32;
 
     static bool is_valid_folder_name(StringView name) { return name.length() <= MAX_FOLDER_NAME_BYTES; }
     static bool is_valid_folder_icon(StringView icon) { return !icon.is_empty() && icon.length() <= MAX_FOLDER_ICON_BYTES; }
+    // The named colors a folder can take, the ones the horizontal strip's group chips are drawn in. Each one is a stable
+    // id; how it looks is up to the UI and its theme.
+    static constexpr Array FOLDER_COLORS { "grey"sv, "blue"sv, "red"sv, "yellow"sv, "green"sv, "pink"sv, "purple"sv, "cyan"sv, "orange"sv };
+    static bool is_valid_folder_color(StringView color) { return FOLDER_COLORS.contains_slow(color); }
 
     struct Item {
         enum class Kind : u8 {
@@ -77,6 +84,8 @@ public:
         String name;
         // A stable id from the folder icon catalog, or nothing for the default folder icon.
         Optional<String> icon;
+        // One of FOLDER_COLORS, or nothing for the default color.
+        Optional<String> color;
         bool collapsed { false };
     };
 
@@ -141,6 +150,7 @@ public:
     Optional<TabFolderId> create_folder_around(String name, Vector<Item> const& items);
     bool rename_folder(TabFolderId, String name);
     bool set_folder_icon(TabFolderId, Optional<String> icon);
+    bool set_folder_color(TabFolderId, Optional<String> color);
     bool set_folder_collapsed(TabFolderId, bool collapsed);
 
     // Moves the items, in their order in the tree whatever order they're listed in, to the destination. An item inside

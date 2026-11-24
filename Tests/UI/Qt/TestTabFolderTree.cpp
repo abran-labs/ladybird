@@ -652,3 +652,34 @@ TEST_CASE(deserializing_can_keep_every_tab_reference)
     // A repeated reference still goes; it's the same tab.
     EXPECT_EQ(tree.children(1), items({ tab(7) }));
 }
+
+TEST_CASE(a_folder_color_is_one_of_the_named_colors_and_round_trips)
+{
+    auto tree = tree_with_tabs({ 1, 2 });
+    auto a = tree.create_folder_around("A"_string, items({ tab(1) })).release_value();
+    EXPECT(!tree.folder(a)->color.has_value());
+
+    EXPECT(TabFolderTree::is_valid_folder_color("blue"sv));
+    EXPECT(!TabFolderTree::is_valid_folder_color("chartreuse"sv));
+    EXPECT(!TabFolderTree::is_valid_folder_color(""sv));
+    EXPECT(!tree.set_folder_color(a, "chartreuse"_string));
+    EXPECT(!tree.folder(a)->color.has_value());
+
+    EXPECT(tree.set_folder_color(a, "green"_string));
+    auto restored = TRY_OR_FAIL(TabFolderTree::deserialize(tree.serialize(), allowed({ 1, 2 })));
+    EXPECT_EQ(restored.folder(a)->color, Optional<String> { "green"_string });
+    EXPECT_EQ(restored.serialize(), tree.serialize());
+
+    // Clearing the color goes back to the default, and the saved form leaves it out.
+    EXPECT(tree.set_folder_color(a, {}));
+    EXPECT(!tree.serialize().contains("color"sv));
+}
+
+TEST_CASE(a_saved_tree_without_colors_still_reads_and_a_bad_color_fails_it)
+{
+    auto allowed_tabs = allowed({ 1 });
+    auto old = TRY_OR_FAIL(TabFolderTree::deserialize(R"({"version":1,"root":[{"folder":{"id":3,"name":"a","collapsed":false,"children":[{"tab":1}]}}]})"sv, allowed_tabs));
+    EXPECT(!old.folder(3)->color.has_value());
+    EXPECT(TabFolderTree::deserialize(R"({"version":1,"root":[{"folder":{"id":3,"name":"a","color":"mauve","collapsed":false,"children":[]}}]})"sv, allowed_tabs).is_error());
+    EXPECT(TabFolderTree::deserialize(R"({"version":1,"root":[{"folder":{"id":3,"name":"a","color":7,"collapsed":false,"children":[]}}]})"sv, allowed_tabs).is_error());
+}

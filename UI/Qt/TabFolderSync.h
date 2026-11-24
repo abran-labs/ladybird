@@ -60,6 +60,26 @@ Vector<Move> moves_to_reorder(Vector<TabKey> const& current, Vector<TabKey> cons
 // The sidebar's rows below the pinned tiles. Pinned tabs have no row, and only an unpinned active tab previews.
 Vector<SidebarRow> sidebar_rows(TabFolderTree const&, Vector<WindowTab> const&, Optional<TabKey> active);
 
+// The horizontal strip's view of the folders, modeled on Chromium's tab groups: each top-level folder is a chip that
+// comes right before the folder's first unpinned tab, and all of that folder's tabs, at any depth, belong to its group.
+// Nested folders keep their places in the tree, and are only reached through their top-level chip. A collapsed chip hides
+// its tabs, except the active one, so the page on screen always has its tab. Pinned tabs show no group.
+struct StripGroup {
+    TabFolderId folder { 0 };
+    // The unpinned tab the chip comes right before, whether shown or not, or nothing for a chip after every tab.
+    Optional<TabKey> before_tab;
+    bool collapsed { false };
+
+    bool operator==(StripGroup const&) const = default;
+};
+struct StripGroups {
+    Vector<StripGroup> chips;
+    // For each of the window's tabs, in the window's order: the top-level folder it's in, and whether it's hidden.
+    Vector<Optional<TabFolderId>> group_of_tab;
+    Vector<bool> hidden;
+};
+StripGroups strip_groups(TabFolderTree const&, Vector<WindowTab> const&, Optional<TabKey> active);
+
 // The tabs of the visible rows from one tab's row to another's, in row order, or nothing if either has no row.
 Vector<TabKey> tab_range(Vector<SidebarRow> const&, TabKey anchor, TabKey target);
 
