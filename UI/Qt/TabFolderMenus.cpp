@@ -76,10 +76,12 @@ Action exec_folder(QWidget* parent, QPoint const& global_pos)
     return action;
 }
 
-void add_move_menu(QMenu& menu, TabFolderTree const& tree, std::function<void(TabFolderId)> move_tabs, std::function<void()> create_folder)
+void add_move_menu(QMenu& menu, TabFolderTree const& tree, Terms terms, std::function<void(TabFolderId)> move_tabs, std::function<void()> create_folder)
 {
-    auto* submenu = menu.addMenu(QStringLiteral("Move to Folder"));
-    auto const new_folder_label = QStringLiteral("New Folder…");
+    auto groups = terms == Terms::Group;
+    auto* submenu = menu.addMenu(groups ? QStringLiteral("Move to Group") : QStringLiteral("Move to Folder"));
+    auto const new_folder_label = groups ? QStringLiteral("New Group…") : QStringLiteral("New Folder…");
+    auto const untitled_label = groups ? QStringLiteral("Untitled Group") : QStringLiteral("Untitled Folder");
 
     auto folders = tree.folders_in_order();
     Vector<QString> paths;
@@ -91,7 +93,7 @@ void add_move_menu(QMenu& menu, TabFolderTree const& tree, std::function<void(Ta
         ancestor_paths.resize(entry.depth);
         auto path = qstring_from_ak_string(tree.folder(entry.id)->name);
         if (path.isEmpty())
-            path = QStringLiteral("Untitled Folder");
+            path = untitled_label;
         if (!ancestor_paths.is_empty())
             path = ancestor_paths.last() + QStringLiteral(" / ") + path;
         ancestor_paths.append(path);

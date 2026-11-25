@@ -23,6 +23,7 @@
 #include <UI/Qt/ChromeLayout.h>
 #include <UI/Qt/ChromeStyle.h>
 #include <UI/Qt/FolderIcons.h>
+#include <UI/Qt/HorizontalDrop.h>
 #include <UI/Qt/Icon.h>
 #include <UI/Qt/LadybirdButton.h>
 #include <UI/Qt/SessionStore.h>
@@ -1605,7 +1606,7 @@ Vector<TabFolderTree::Item> TabBar::selected_sidebar_items() const
 
 bool TabBar::is_selected_sidebar_tab(int index) const
 {
-    if (tab_layout() == TabLayout::Horizontal || m_sidebar_selection.is_empty() || !m_tab_widget)
+    if (m_sidebar_selection.is_empty() || !m_tab_widget)
         return false;
     auto* tab = m_tab_widget->tab(index);
     return tab && tab->session_tab_id().has_value() && m_sidebar_selection.contains_slow(*tab->session_tab_id());
@@ -2306,7 +2307,7 @@ void TabBar::set_tab_layout(TabLayout tab_layout)
         return;
 
     end_row_drag(false);
-    if (m_vertical_drag_cursor_active && m_strip_drag_card) {
+    if ((m_vertical_drag_cursor_active || !m_horizontal_moving.is_empty()) && m_strip_drag_card) {
         end_strip_drag();
         clear_drop_preview();
     }
@@ -2536,7 +2537,7 @@ bool TabBar::event(QEvent* event)
     if (event->type() == QEvent::Hide || event->type() == QEvent::WindowDeactivate || event->type() == QEvent::UngrabMouse) {
         if (m_row_drag.has_value()) {
             end_row_drag(false);
-        } else if (m_vertical_drag_cursor_active && m_strip_drag_card) {
+        } else if ((m_vertical_drag_cursor_active || !m_horizontal_moving.is_empty()) && m_strip_drag_card) {
             end_strip_drag();
             clear_drop_preview();
         } else if (event->type() != QEvent::UngrabMouse && m_vertical_drag_landing_end.has_value()) {
@@ -2682,6 +2683,8 @@ void TabBar::paintEvent(QPaintEvent*)
         if (!is_vertical && (tab_rect.right() < 0 || tab_rect.left() > width()))
             continue;
 
+        if (!is_vertical && is_selected_sidebar_tab(index))
+            painter.fillRect(tab_rect.adjusted(1, 4, -1, -1), horizontal_tab_hover_surface(Theme::chrome_palette(*this), 1));
         bool is_selected = index == currentIndex();
         auto selection = selection_of(index);
         auto hover_progress = hover_progress_of(index);
@@ -2966,8 +2969,14 @@ void TabBar::paintEvent(QPaintEvent*)
     m_tabs_with_cut_titles = AK::move(tabs_with_cut_titles);
 
     painter.setClipping(false);
-    if (!is_vertical)
+    if (!is_vertical) {
         paint_strip_groups(painter);
+        if (m_horizontal_landing.has_value()) {
+            painter.setBrush(Qt::NoBrush);
+            painter.setPen(QPen(Theme::accent(), 2));
+            painter.drawRoundedRect(m_horizontal_landing->indicator, 2, 2);
+        }
+    }
     if (is_vertical && m_vertical_drop_line.isValid()) {
         painter.save();
         auto clip = m_row_drag.has_value() || dragging_pinned_tab() ? rect() : unpinned_clip;
@@ -3138,6 +3147,7 @@ void TabBar::mousePressEvent(QMouseEvent* event)
     }
 
     if (auto chip = strip_chip_at(event->pos()); chip.has_value() && event->button() == Qt::LeftButton) {
+        m_drag_start_position = event->pos();
         m_pressed_chip = chip;
         m_pressed_tab = nullptr;
         update();
@@ -3164,9 +3174,12 @@ void TabBar::mousePressEvent(QMouseEvent* event)
     // NB: QTabBar finds the pressed tab without our scroll offset, so we select it ourselves. Ctrl and Shift selections
     // in the folder sidebar deliberately leave the current page alone.
     if (pressed_tab >= 0 && event->button() == Qt::LeftButton) {
-        auto* browser_window = tab_layout() == TabLayout::Horizontal ? nullptr : qobject_cast<BrowserWindow*>(window());
+        auto* browser_window = qobject_cast<BrowserWindow*>(window());
         if (browser_window && (event->modifiers().testFlag(Qt::ControlModifier) || event->modifiers().testFlag(Qt::ShiftModifier))) {
-            browser_window->select_tab_for_folder(*m_tab_widget->tab(pressed_tab), event->modifiers());
+            if (tab_layout() == TabLayout::Horizontal)
+                browser_window->select_horizontal_tab(*m_pressed_tab, event->modifiers());
+            else
+                browser_window->select_tab_for_folder(*m_pressed_tab, event->modifiers());
         } else {
             // A press on a tab of the selection keeps the selection, for a drag to carry along, until it ends without one.
             m_clear_folder_selection_on_release = browser_window && is_selected_sidebar_tab(pressed_tab);
@@ -3188,7 +3201,7 @@ void TabBar::mousePressEvent(QMouseEvent* event)
 void TabBar::mouseMoveEvent(QMouseEvent* event)
 {
     if (m_strip_drag_card) {
-        if (m_vertical_drag_cursor_active && !event->buttons().testFlag(Qt::LeftButton)) {
+        if ((m_vertical_drag_cursor_active || !m_horizontal_moving.is_empty()) && !event->buttons().testFlag(Qt::LeftButton)) {
             end_strip_drag();
             clear_drop_preview();
         } else {
@@ -3210,6 +3223,8 @@ void TabBar::mouseMoveEvent(QMouseEvent* event)
     set_hovered_folder(folder_at(event->pos()));
     set_hovered_chip(strip_chip_at(event->pos()));
     if (m_pressed_chip.has_value()) {
+        if (event->buttons().testFlag(Qt::LeftButton) && (event->pos() - m_drag_start_position).manhattanLength() >= TAB_DRAG_START_DISTANCE)
+            start_chip_drag(*m_pressed_chip, event->pos());
         event->accept();
         return;
     }
@@ -3275,6 +3290,17 @@ void TabBar::mouseReleaseEvent(QMouseEvent* event)
                 update_row_drag(event->pos(), false);
             end_row_drag(drop);
         }
+        event->accept();
+        return;
+    }
+    if (!m_horizontal_moving.is_empty() && event->button() == Qt::LeftButton) {
+        update_drop_preview(event->pos());
+        auto landing = m_horizontal_landing;
+        auto moving = m_horizontal_moving;
+        end_strip_drag();
+        clear_drop_preview();
+        if (auto* browser = qobject_cast<BrowserWindow*>(window()); browser && landing.has_value())
+            browser->apply_horizontal_drop(moving, landing->destination, landing->pin_slot);
         event->accept();
         return;
     }
@@ -3519,8 +3545,109 @@ int TabBar::drop_index_at(QPoint const& position) const
     return dragged_index.has_value() && drop_slot > *dragged_index ? drop_slot + 1 : drop_slot;
 }
 
+Optional<TabBar::HorizontalLanding> TabBar::horizontal_landing_at(QPoint point) const
+{
+    using Item = TabFolderTree::Item;
+    auto* browser = qobject_cast<BrowserWindow*>(window());
+    if (!browser || m_horizontal_moving.is_empty() || !m_tab_widget->tab_drop_area_contains(*this, point))
+        return {};
+    auto const& tree = browser->tab_folders();
+    auto folder_drag = m_horizontal_moving.first().is_folder();
+    auto line = [&](int x) { return QRect(clamp(x, 1, max(1, width() - 2)), 5, 1, height() - 10); };
+    auto target = [&](TabFolderDestination destination, QRect indicator, Optional<int> pin_slot = {}) -> Optional<HorizontalLanding> {
+        if (!tree.can_move_items(m_horizontal_moving, destination))
+            return {};
+        return HorizontalLanding { destination, pin_slot, indicator };
+    };
+    auto beside = [&](Item item, bool after, int x) -> Optional<HorizontalLanding> {
+        auto destination = HorizontalDrop::beside_root(tree, item, after);
+        if (!destination.has_value() || m_horizontal_moving.contains_slow(item))
+            return {};
+        return target(*destination, line(x));
+    };
+    auto pins = pinned_tab_count();
+    if (!folder_drag) {
+        for (int i = 0; i < pins; ++i) {
+            auto tile = visual_tab_rect(i);
+            if (point.x() <= tile.right()) {
+                auto after = point.x() >= tile.center().x();
+                return target(TabFolderDestination::at_end_of({}), line(after ? tile.right() : tile.left()), i + after);
+            }
+        }
+        // With no pins yet the first tab's leading foot is the entry to the pinned segment.
+        if (!pins && !m_scroll_offset && point.x() < HORIZONTAL_TAB_END_ROOM)
+            return target(TabFolderDestination::at_end_of({}), line(1), 0);
+    }
+
+    // A group's visual unit includes its chip, all shown descendants, and the spaces between them. Its outside
+    // edges are root gaps, even when the adjacent tabs on both sides belong to different folders.
+    QHash<TabFolderId, QRect> bounds;
+    for (auto const& chip : m_strip_chips) {
+        if (!chip.provisional) {
+            if (auto box = strip_chip_rect(chip.folder); box.has_value())
+                bounds.insert(chip.folder, *box);
+        }
+    }
+    for (int i = pins; i < count(); ++i) {
+        auto group = m_strip_group_of_tab.get(m_tab_widget->tab(i));
+        if (group.has_value() && is_tab_shown_on_strip(i))
+            bounds[*group] = bounds.value(*group).united(visual_tab_rect(i));
+    }
+    // Walk in tree order so the gap preceding a chip never adopts the folder of the previous tab.
+    int last_edge = pins ? visual_tab_rect(pins - 1).right() + 1 : 0;
+    for (auto root : tree.children()) {
+        QRect span;
+        if (root.is_folder()) {
+            span = bounds.value(root.id);
+        } else {
+            auto* tab = tab_for_item(root);
+            if (!tab || tab->is_pinned())
+                continue;
+            span = visual_tab_rect(m_tab_widget->index_of(tab));
+        }
+        if (!span.isValid())
+            continue;
+        last_edge = span.right() + 1;
+        if (point.x() > span.right())
+            continue;
+        if (point.x() < span.left() + 3)
+            return beside(root, false, span.left());
+        if (folder_drag || root.is_tab() || point.x() >= span.right() - 2) {
+            auto after = point.x() >= span.center().x();
+            return beside(root, after, after ? last_edge : span.left());
+        }
+        auto chip = strip_chip_rect(root.id);
+        if (!chip.has_value())
+            return {};
+        if (point.x() <= chip->right() || tree.folder(root.id)->collapsed)
+            return target(TabFolderDestination::at_end_of(root.id), *chip);
+        for (int i = pins; i < count(); ++i) {
+            auto* tab = m_tab_widget->tab(i);
+            if (!tab || !is_tab_shown_on_strip(i) || m_strip_group_of_tab.get(tab) != root.id)
+                continue;
+            auto member = visual_tab_rect(i);
+            if (point.x() > member.right())
+                continue;
+            auto item = Item::tab(tab->session_tab_id().value());
+            if (m_horizontal_moving.contains_slow(item))
+                return {};
+            auto after = point.x() >= member.center().x();
+            if (auto destination = HorizontalDrop::beside_member(tree, item, root.id, m_horizontal_moving, after); destination.has_value())
+                return target(*destination, line(after ? member.right() : member.left()));
+            return {};
+        }
+        return target(TabFolderDestination::at_end_of(root.id), *chip);
+    }
+    return target(TabFolderDestination::at_end_of({}), line(last_edge));
+}
+
 void TabBar::update_drop_preview(QPoint const& position)
 {
+    if (!m_horizontal_moving.is_empty()) {
+        m_horizontal_landing = horizontal_landing_at(position);
+        update();
+        return;
+    }
     if (tab_layout() != TabLayout::Horizontal) {
         m_drop_slot = {};
         auto drop = strip_drop_at(position);
@@ -4070,6 +4197,21 @@ QPoint TabBar::tab_drag_hot_spot() const
     return m_position_in_selected_tab_while_dragging - m_tab_drag_card_offset + QPoint(TAB_DRAG_IMAGE_MARGIN, TAB_DRAG_IMAGE_MARGIN);
 }
 
+void TabBar::start_chip_drag(TabFolderId folder, QPoint position)
+{
+    auto chip = strip_chip_rect(folder);
+    m_pressed_chip.clear();
+    if (!chip.has_value())
+        return;
+    m_strip_drag_card = new TabDragCard(*window(), grab(*chip));
+    m_horizontal_moving = { TabFolderTree::Item::folder(folder) };
+    m_strip_drag_cancellation_filter = new TabDragCancellationFilter([this] { end_strip_drag(); });
+    qApp->installEventFilter(m_strip_drag_cancellation_filter);
+    m_strip_drag_card->show();
+    m_strip_drag_card->raise();
+    update_strip_drag(position);
+}
+
 void TabBar::start_strip_drag(int index, QPoint position)
 {
     // NB: The card is drawn once, before the tab is dragged, since the strip leaves a gap where the dragged tab is, and
@@ -4084,8 +4226,12 @@ void TabBar::start_strip_drag(int index, QPoint position)
     m_tab_drag_pixmap = render_tab_drag_pixmap(index);
     m_tab_drag_card_offset = tab_drag_card_rect(index).topLeft() - visual_tab_rect(index).topLeft();
     m_strip_drag_card = new TabDragCard(*window(), m_tab_drag_pixmap);
-    if (tab_layout() != TabLayout::Horizontal)
+    if (tab_layout() != TabLayout::Horizontal) {
         show_vertical_drag_card(tab_drag_card_rect(index), index);
+    } else if (auto key = m_tab_widget->tab(index)->session_tab_id(); key.has_value()) {
+        m_horizontal_moving = TabFolderDrag::items_to_drag(TabFolderTree::Item::tab(*key), selected_sidebar_items());
+        m_clear_folder_selection_on_release = false;
+    }
 
     s_active_tab_drag_source = m_tab_widget;
     s_active_tab_dragged_tab = m_tab_widget->tab(index);
@@ -4104,11 +4250,16 @@ void TabBar::start_strip_drag(int index, QPoint position)
 
     update_tab_button_geometry();
     update();
-    update_strip_drag(tab_layout() == TabLayout::Horizontal ? mapFromGlobal(QCursor::pos()) : position);
+    update_strip_drag(position);
 }
 
 void TabBar::update_strip_drag(QPoint position)
 {
+    if (!m_horizontal_moving.is_empty() && (m_horizontal_moving.first().is_folder() || m_horizontal_moving.size() > 1)) {
+        m_strip_drag_card->move(mapTo(window(), QPoint(position.x() + 8, height() / 2)));
+        update_drop_preview(position);
+        return;
+    }
     auto dragged_tab = s_active_tab_dragged_tab;
     if (!dragged_tab || m_tab_widget->index_of(dragged_tab) < 0) {
         end_strip_drag();
@@ -4147,6 +4298,8 @@ void TabBar::end_strip_drag(bool keep_vertical_card)
         if (!keep_vertical_card)
             clear_vertical_drag_card();
     }
+    m_horizontal_moving.clear();
+    m_horizontal_landing.clear();
     delete m_strip_drag_card;
     m_strip_drag_card = nullptr;
     m_tab_drag_pixmap = {};

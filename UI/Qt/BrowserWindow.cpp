@@ -684,11 +684,22 @@ void BrowserWindow::initialize_window_context_menu()
 
 void BrowserWindow::show_window_context_menu(QPoint global_position)
 {
-    show_window_context_menu(global_position, false);
+    // The empty part of the horizontal strip makes a group, as Chromium's strip does; the rest of the window's padding,
+    // which has no strip in it, doesn't.
+    auto* tab_bar = m_tabs_container->tab_bar();
+    auto in_strip = false;
+    if (tab_bar->tab_layout() == TabLayout::Horizontal) {
+        auto strip_top = m_tabs_container->mapToGlobal(QPoint(0, 0)).y();
+        auto strip_bottom = tab_bar->mapToGlobal(QPoint(0, tab_bar->height())).y();
+        in_strip = global_position.y() >= strip_top && global_position.y() < strip_bottom;
+    }
+    show_window_context_menu(global_position, in_strip);
 }
 
 void BrowserWindow::show_window_context_menu(QPoint global_position, bool include_new_folder)
 {
+    // The sidebar calls the tree's folders that, and its menus keep doing so; the strip says groups.
+    m_new_folder_action->setText(m_tabs_container->tab_bar()->tab_layout() == TabLayout::Horizontal ? QStringLiteral("New Group…") : QStringLiteral("New Folder…"));
     m_new_folder_action->setVisible(include_new_folder);
     m_new_folder_action->setEnabled(include_new_folder && m_tab_folders.can_create_folder());
     m_reopen_closed_tab_action->setEnabled(session().has_closed_units());
@@ -874,6 +885,27 @@ void BrowserWindow::update_tab_folders(Optional<TabFolderTree::TabKey> new_tab_a
                 chip.before_tab = tab_for_key(*group.before_tab);
             chips.append(AK::move(chip));
         }
+        // A subgroup being made has no chip of its own, so give it a provisional one beside its parent's: it's what the
+        // name editor sits over. A top-level folder being made comes with its own chip from the tree.
+        if (provisional_folder.has_value()) {
+            auto parent = sidebar_tree.parent_of(TabFolderTree::Item::folder(*provisional_folder));
+            auto folder = sidebar_tree.folder(*provisional_folder);
+            if (parent.has_value() && folder.has_value()) {
+                TabBar::StripChip chip;
+                chip.folder = *provisional_folder;
+                chip.name = qstring_from_ak_string(folder->name);
+                chip.color = TabFolderMenus::effective_folder_color(*folder);
+                chip.provisional = true;
+                for (auto const& sibling : chips) {
+                    if (sibling.folder == *parent) {
+                        chip.before_tab = sibling.before_tab;
+                        break;
+                    }
+                }
+                // NB: It goes last, since chips that share an anchor lay out in their order.
+                chips.append(AK::move(chip));
+            }
+        }
         HashMap<Tab const*, TabFolderId> group_of_tab;
         HashTable<Tab const*> hidden;
         for (size_t i = 0; i < tabs.size(); ++i) {
@@ -924,12 +956,24 @@ void BrowserWindow::start_creating_tab_folder(TabFolderEditing::FolderCreation c
 {
     auto* tab_bar = m_tabs_container->tab_bar();
     tab_bar->cancel_folder_name_edit();
+    // The strip calls the tree's folders groups, and one inside a group a subgroup, so the name a new one starts with
+    // reads that way there.
+    auto parent = creation.parent;
+    auto horizontal = tab_bar->tab_layout() == TabLayout::Horizontal;
+    auto keep_collapsed = horizontal && parent.has_value() && m_tab_folders.folder(*parent).has_value() && m_tab_folders.folder(*parent)->collapsed;
     m_folder_creation = AK::move(creation);
     update_tab_folders();
-    if (!tab_bar->edit_folder_name({}, qstring_from_ak_string(TabFolderEditing::NEW_FOLDER_NAME), [this](Optional<String> name) {
+    QString default_name;
+    if (horizontal)
+        default_name = parent.has_value() ? QStringLiteral("New Subgroup") : QStringLiteral("New Group");
+    else
+        default_name = qstring_from_ak_string(TabFolderEditing::NEW_FOLDER_NAME);
+    if (!tab_bar->edit_folder_name({}, default_name, [this, parent, keep_collapsed](Optional<String> name) {
             auto creation = m_folder_creation.release_value();
-            if (name.has_value())
-                (void)creation.commit(m_tab_folders, name.release_value());
+            auto created = name.has_value() ? creation.commit(m_tab_folders, name.release_value()) : Optional<TabFolderId> {};
+            // A closed group on the strip stays closed: its chip is where it is, and the editor sat beside it.
+            if (created.has_value() && keep_collapsed)
+                (void)m_tab_folders.set_folder_collapsed(*parent, true);
             update_tab_folders();
         })) {
         m_folder_creation.clear();
@@ -978,6 +1022,68 @@ void BrowserWindow::clear_tab_folder_selection()
     update_tab_folders();
 }
 
+void BrowserWindow::select_horizontal_tab(Tab& tab, Qt::KeyboardModifiers modifiers)
+{
+    if (!modifiers.testFlag(Qt::ShiftModifier)) {
+        select_tab_for_folder(tab, modifiers);
+        return;
+    }
+    auto key = tab.session_tab_id();
+    if (!key.has_value())
+        return;
+    Vector<TabFolderSync::SidebarRow> visible;
+    for (int i = 0; i < tab_count(); ++i) {
+        if (auto id = tab_at(i)->session_tab_id(); id.has_value() && m_tabs_container->tab_bar()->is_tab_shown_on_strip(i))
+            visible.append({ TabFolderTree::Item::tab(*id) });
+    }
+    m_folder_selection = TabFolderEditing::extended(AK::move(m_folder_selection), visible, *key, m_current_tab ? m_current_tab->session_tab_id() : Optional<TabFolderTree::TabKey> {});
+    update_tab_folders();
+}
+
+void BrowserWindow::apply_horizontal_drop(Vector<TabFolderTree::Item> const& items, TabFolderDestination destination, Optional<int> pin_slot)
+{
+    using Item = TabFolderTree::Item;
+    Vector<TabFolderSync::TabKey> current;
+    Vector<TabFolderSync::TabKey> pins_before, pins_after, moving_pins;
+    Vector<Tab*> changed;
+    for (int i = 0; i < tab_count(); ++i) {
+        auto* tab = tab_at(i);
+        auto key = tab->session_tab_id();
+        if (!key.has_value())
+            return;
+        current.append(*key);
+        if (items.contains_slow(Item::tab(*key))) {
+            if (tab->is_pinned() != pin_slot.has_value())
+                changed.append(tab);
+            if (pin_slot.has_value())
+                moving_pins.append(*key);
+        } else if (tab->is_pinned()) {
+            (i < pin_slot.value_or(tab_count()) ? pins_before : pins_after).append(*key);
+        }
+    }
+    if (m_reordering_tab_folders || !m_tab_folders.move_items(items, destination))
+        return;
+    // Apply one transaction. No intermediate tabMoved may infer membership from an adjacent tab, and without folders
+    // reconcile() follows the native strip, so install the requested native order *before* refreshing the projection.
+    pins_before.extend(moving_pins);
+    pins_before.extend(pins_after);
+    auto wanted = pins_before;
+    for (auto key : m_tab_folders.tabs_in_order()) {
+        if (!pins_before.contains_slow(key))
+            wanted.append(key);
+    }
+    m_reordering_tab_folders = true;
+    for (auto* tab : changed)
+        tab->set_pinned(pin_slot.has_value());
+    for (auto move : TabFolderSync::moves_to_reorder(current, wanted))
+        m_tabs_container->tab_bar()->moveTab(static_cast<int>(move.from), static_cast<int>(move.to));
+    m_reordering_tab_folders = false;
+    for (auto* tab : changed)
+        pinned_state_changed(*tab);
+    update_tab_folders();
+    sync_session_tab_order();
+}
+
 void BrowserWindow::select_tab_for_folder(Tab& tab, Qt::KeyboardModifiers modifiers)
 {
     auto key = tab.session_tab_id();
@@ -1010,7 +1116,7 @@ void BrowserWindow::show_tab_context_menu(Tab& tab, QPoint global_position)
 {
     bool horizontal = m_tabs_container->tab_bar()->tab_layout() == TabLayout::Horizontal;
     Vector<TabFolderTree::TabKey> keys;
-    if (auto clicked_key = tab.session_tab_id(); !horizontal && clicked_key.has_value()) {
+    if (auto clicked_key = tab.session_tab_id(); clicked_key.has_value()) {
         Vector<TabFolderTree::TabKey> order;
         for (int i = 0; i < tab_count(); ++i) {
             if (auto key = tab_at(i)->session_tab_id(); key.has_value())
@@ -1098,12 +1204,10 @@ void BrowserWindow::show_tab_context_menu(Tab& tab, QPoint global_position)
     menu->addSeparator();
     menu->addAction(Application::the().reopen_recently_closed_tab_action());
     Optional<TabFolderId> folder;
-    if (horizontal) {
-        if (auto clicked_key = tab.session_tab_id(); clicked_key.has_value() && !tab.is_pinned())
-            keys = { *clicked_key };
-    }
-    if (!keys.is_empty()) {
-        TabFolderMenus::add_move_menu(*menu, m_tab_folders, [&](TabFolderId id) {
+    if (targets.contains([&](auto const& target) {
+            return target->session_tab_id().has_value() && (!horizontal || !target->is_pinned());
+        })) {
+        TabFolderMenus::add_move_menu(*menu, m_tab_folders, horizontal ? TabFolderMenus::Terms::Group : TabFolderMenus::Terms::Folder, [&](TabFolderId id) {
             command = Command::MoveToFolder;
             folder = id; }, [&] { command = Command::CreateFolder; });
     }
@@ -1168,7 +1272,7 @@ void BrowserWindow::show_tab_context_menu(Tab& tab, QPoint global_position)
         Vector<TabFolderTree::Item> items;
         keys.clear();
         for (auto const& target : targets) {
-            if (!still_here(target))
+            if (!still_here(target) || (horizontal && target->is_pinned()))
                 continue;
             if (auto id = target->session_tab_id(); id.has_value()) {
                 items.append(TabFolderTree::Item::tab(*id));
@@ -1311,6 +1415,7 @@ void BrowserWindow::show_strip_group_context_menu(TabFolderId id, QPoint global_
         Rename,
         Color,
         NewTab,
+        NewSubgroup,
         Ungroup,
         Close,
         ActivateTab,
@@ -1347,6 +1452,7 @@ void BrowserWindow::show_strip_group_context_menu(TabFolderId id, QPoint global_
     }
     menu->addSeparator();
     menu->addAction(QStringLiteral("&New Tab in Group"), [&] { command = Command::NewTab; });
+    menu->addAction(QStringLiteral("&New Subgroup…"), [&] { command = Command::NewSubgroup; })->setEnabled(m_tab_folders.can_create_folder_in(id));
 
     // Folders inside the group keep their places in the tree; the strip reaches them, and their tabs, from here.
     auto add_nested = [&](auto& self, QMenu& parent_menu, TabFolderId parent) -> void {
@@ -1354,7 +1460,7 @@ void BrowserWindow::show_strip_group_context_menu(TabFolderId id, QPoint global_
             if (!item.is_folder())
                 continue;
             auto nested = m_tab_folders.folder(item.id);
-            auto label = nested->name.is_empty() ? QStringLiteral("Untitled Folder") : qstring_from_ak_string(nested->name);
+            auto label = nested->name.is_empty() ? QStringLiteral("Untitled Group") : qstring_from_ak_string(nested->name);
             label.replace(QLatin1Char('&'), QStringLiteral("&&"));
             auto* submenu = parent_menu.addMenu(label);
             self(self, *submenu, item.id);
@@ -1384,7 +1490,7 @@ void BrowserWindow::show_strip_group_context_menu(TabFolderId id, QPoint global_
         }
     };
     if (m_tab_folders.children(id).contains([](auto item) { return item.is_folder(); })) {
-        auto* nested = menu->addMenu(QStringLiteral("&Folders in Group"));
+        auto* nested = menu->addMenu(QStringLiteral("&Subgroups"));
         add_nested(add_nested, *nested, id);
     }
     menu->addSeparator();
@@ -1421,12 +1527,16 @@ void BrowserWindow::show_strip_group_context_menu(TabFolderId id, QPoint global_
         }
         auto& tab = last ? new_tab_from_url(Application::settings().new_tab_page_url(), Web::HTML::ActivateTab::Yes, TabLocation::after_tab(*last))
                          : new_tab_from_url(Application::settings().new_tab_page_url(), Web::HTML::ActivateTab::Yes, TabLocation::end());
-        if (auto key = tab.session_tab_id(); key.has_value() && !m_tab_folders.is_inside(TabFolderTree::Item::tab(*key), id))
+        // The tab joins the group itself, rather than the subgroup that holds the tab before it.
+        if (auto key = tab.session_tab_id(); key.has_value() && m_tab_folders.parent_of(TabFolderTree::Item::tab(*key)) != Optional<TabFolderId> { id })
             move_tab_folder_items({ TabFolderTree::Item::tab(*key) }, TabFolderDestination::at_end_of(id));
         else
             update_tab_folders();
         return;
     }
+    case Command::NewSubgroup:
+        start_creating_tab_folder({ id, {} });
+        return;
     case Command::ActivateTab:
         for (int i = 0; i < tab_count(); ++i) {
             if (tab_at(i)->session_tab_id() == chosen_tab) {

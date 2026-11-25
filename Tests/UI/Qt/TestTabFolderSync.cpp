@@ -460,3 +460,60 @@ TEST_CASE(a_tab_moved_within_or_into_an_open_group_on_the_strip_follows_its_neig
     TabFolderSync::follow_strip_move(tree, moved, 2);
     EXPECT(tree.is_inside(tab(2), work));
 }
+
+TEST_CASE(a_strip_pass_over_a_nested_tree_leaves_its_folders_and_their_look_alone)
+{
+    TabFolderId work = 0;
+    auto tree = work_tree(work);
+    auto inner = tree.create_folder_around("Inner"_string, items({ tab(3) })).release_value();
+    EXPECT(tree.rename_folder(inner, "Notes"_string));
+    EXPECT(tree.set_folder_icon(inner, "star"_string));
+    EXPECT(tree.set_folder_color(inner, "green"_string));
+
+    // The strip lays the group out flat, and every refresh hands the window's flat order back to the tree.
+    auto tabs = window({ unpinned(1), unpinned(2), unpinned(3), unpinned(4) });
+    TabFolderSync::reconcile(tree, tabs);
+    TabFolderSync::reconcile(tree, tabs);
+
+    EXPECT_EQ(tree.parent_of(folder(inner)), Optional<TabFolderId> { work });
+    EXPECT_EQ(tree.tabs_inside(work), keys({ 2, 3 }));
+    EXPECT_EQ(tree.folder(inner)->name, "Notes"_string);
+    EXPECT_EQ(tree.folder(inner)->icon.value_or(""_string), "star"_string);
+    EXPECT_EQ(tree.folder(inner)->color.value_or(""_string), "green"_string);
+
+    // The strip reaches the nested folder through its group's chip alone, and the tree still nests it.
+    auto strip = TabFolderSync::strip_groups(tree, tabs, 1);
+    Vector<StripGroup> expected { { work, 2, false } };
+    EXPECT_EQ(strip.chips, expected);
+    EXPECT_EQ(strip.group_of_tab, groups({ {}, work, work, {} }));
+}
+
+TEST_CASE(a_tab_added_to_a_group_joins_the_group_rather_than_the_subgroup_holding_the_tab_before_it)
+{
+    TabFolderId work = 0;
+    auto tree = work_tree(work);
+    auto inner = tree.create_folder_around("Inner"_string, items({ tab(3) })).release_value();
+
+    // A tab opened after 3 follows its neighbor into Inner.
+    TabFolderSync::reconcile(tree, window({ unpinned(1), unpinned(2), unpinned(3), unpinned(9), unpinned(4) }));
+    EXPECT_EQ(tree.children(inner), items({ tab(3), tab(9) }));
+
+    // New Tab in Group puts it in the group itself, where the chip it came from is.
+    EXPECT(tree.move_items(items({ tab(9) }), TabFolderDestination::at_end_of(work)));
+    EXPECT_EQ(tree.children(work), items({ tab(2), folder(inner), tab(9) }));
+    EXPECT_EQ(tree.parent_of(tab(9)), Optional<TabFolderId> { work });
+}
+
+TEST_CASE(a_tab_added_to_an_empty_group_ends_up_inside_it)
+{
+    TabFolderTree tree;
+    TabFolderSync::reconcile(tree, window({ unpinned(1), unpinned(2) }));
+    auto empty = tree.create_folder("Empty"_string).release_value();
+
+    // A tab opened at the end of the strip lands beside tab 2, at the root; the group then takes it in.
+    TabFolderSync::reconcile(tree, window({ unpinned(1), unpinned(2), unpinned(9) }));
+    EXPECT_EQ(tree.parent_of(tab(9)), Optional<TabFolderId> {});
+    EXPECT(tree.move_items(items({ tab(9) }), TabFolderDestination::at_end_of(empty)));
+    EXPECT_EQ(tree.children(empty), items({ tab(9) }));
+    EXPECT_EQ(tree.children(), items({ tab(1), tab(2), folder(empty) }));
+}

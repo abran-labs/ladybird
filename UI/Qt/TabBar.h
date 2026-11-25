@@ -434,6 +434,15 @@ private:
     Vector<StripChip> m_strip_chips;
     HashMap<Tab const*, TabFolderId> m_strip_group_of_tab;
     HashTable<Tab const*> m_strip_hidden;
+    struct HorizontalLanding {
+        TabFolderDestination destination;
+        Optional<int> pin_slot;
+        QRect indicator;
+    };
+    Optional<HorizontalLanding> horizontal_landing_at(QPoint) const;
+    void start_chip_drag(TabFolderId, QPoint);
+    Vector<TabFolderTree::Item> m_horizontal_moving;
+    Optional<HorizontalLanding> m_horizontal_landing;
     Optional<TabFolderId> m_pressed_chip;
     Optional<TabFolderId> m_hovered_chip;
 

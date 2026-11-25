@@ -207,6 +207,8 @@ public:
     // Where tabs and folders dragged along the sidebar land. A refused move changes nothing.
     void move_tab_folder_items(Vector<TabFolderTree::Item> const&, TabFolderDestination const&);
     void restore_closed_window_folders(TabFolderTree const&, Vector<Tab*> const&);
+    void apply_horizontal_drop(Vector<TabFolderTree::Item> const&, TabFolderDestination, Optional<int> pin_slot);
+    void select_horizontal_tab(Tab&, Qt::KeyboardModifiers);
     void select_tab_for_folder(Tab&, Qt::KeyboardModifiers);
     void clear_tab_folder_selection();
     void show_tab_context_menu(Tab&, QPoint global_position);
