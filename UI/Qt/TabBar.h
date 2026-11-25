@@ -252,6 +252,9 @@ private:
     // Where the pinned tabs sit in vertical tabs: a grid of tiles when expanded, one icon column when collapsed, and a
     // separator below. Its height is 0 when there's no pinned tab.
     struct PinnedRegion {
+        Vector<int> tiles;
+        int tile_height { 0 };
+        int folder_rows { 0 };
         int count { 0 };
         int columns { 1 };
         int tile_width { 0 };
@@ -338,6 +341,8 @@ private:
         size_t depth { 0 };
         size_t first_depth { 0 };
         Optional<TabFolderDestination> destination;
+        // Where the tabs in the drag land among the pinned tiles, when the pointer is over them.
+        Optional<int> pin_slot;
         QPointer<Tab> single_tab;
         QPoint last_position;
     };
@@ -347,6 +352,50 @@ private:
     // The rows changed under a drag, as when a tab closes: the drag carries on with what's left of it.
     void refresh_row_drag(bool allow_detach = false);
     void retarget_row_drag();
+    // Whether the rows a drag carries could land on the tiles, so an empty grid opens for them.
+    bool pinning_drop_allowed() const;
+    // The place among the pinned tiles that a drop at a position takes, or nothing outside the tiles.
+    Optional<int> tile_slot_at(QPoint const&) const;
+    // The line that shows a drop taking a place among the pinned tiles.
+    QRect tile_drop_line(int slot, PinnedRegion const&) const;
+    // The row under the divider that a pinned tile let go at a position unpins to, or nothing above the divider.
+    Optional<VerticalStripDrop> unpin_drop_at(QPoint const&) const;
+    // Where a dragged item lands among the sidebar's rows: the slot it is over, the depth the sideways drag picks, the
+    // folder it joins and the line that shows it. A place above the divider that only the folders take is refused.
+    struct RowDrop {
+        size_t slot { 0 };
+        size_t depth { 0 };
+        Optional<TabFolderId> folder;
+        Optional<TabFolderDestination> destination;
+        QRect line;
+        bool refused { false };
+    };
+    RowDrop resolve_row_drop(TabFolderTree const&, Vector<TabFolderSync::SidebarRow> const& remaining, Vector<size_t> const& gaps, Vector<TabFolderTree::Item> const& moving, QPoint position, size_t first_depth) const;
+    // Where a tile let go among the folders lands: on a header, or in a folder beside one of its tabs.
+    struct FolderDrop {
+        TabFolderId folder;
+        TabFolderDestination destination;
+    };
+    Optional<FolderDrop> folder_drop_at(QPoint const&) const;
+    // What a tab dragged along the sidebar does where it is let go: it keeps the tabs' places, pins on the tiles,
+    // joins a folder above the divider, or unpins under it. The gap between the folders and the divider takes nothing.
+    struct StripDrop {
+        enum class Kind {
+            None,
+            Move,
+            Pin,
+            Folder,
+            Unpin,
+        };
+        Kind kind { Kind::None };
+        int index { 0 };
+        QRect line;
+        Optional<TabFolderId> folder;
+        Optional<TabFolderDestination> destination;
+    };
+    StripDrop strip_drop_at(QPoint const&) const;
+    // The tab an item in the folders stands for, or nothing for a folder or a tab this window no longer has.
+    Tab* tab_for_item(TabFolderTree::Item) const;
     void animate_rows_from(HashMap<u64, qreal> start_y);
     bool vertical_drag_motion_enabled() const;
     void set_vertical_drop_indicator(QRect);
