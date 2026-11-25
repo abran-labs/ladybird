@@ -1188,18 +1188,29 @@ void TabBar::paint_strip_groups(QPainter& painter)
     auto title_font = ChromeStyle::chrome_title_font(font());
     painter.save();
     painter.setRenderHint(QPainter::Antialiasing, true);
+    QHash<TabFolderId, QRect> visible_chips;
     for (auto const& chip : m_strip_chips) {
-        if (dragging_chip(chip.folder))
+        if (!dragging_chip(chip.folder)) {
+            if (auto rect = strip_chip_rect(chip.folder); rect.has_value())
+                visible_chips.insert(chip.folder, *rect);
+        }
+    }
+    for (auto const& chip : m_strip_chips) {
+        auto found = visible_chips.constFind(chip.folder);
+        if (found == visible_chips.constEnd())
             continue;
-        auto chip_rect = strip_chip_rect(chip.folder);
-        if (!chip_rect.has_value())
-            continue;
+        auto const* chip_rect = &found.value();
         auto color = TabFolderMenus::folder_color(chip.color, dark);
         auto editing = m_folder_name_editor && (chip.provisional || m_edited_folder == chip.folder);
         if (inactive && !editing)
             color.setAlphaF(0.7f);
 
         auto right = chip_rect->right() + 1;
+        // A subgroup is part of its parent's span even if it is empty or all its tabs are hidden.
+        for (auto child = visible_chips.constBegin(); child != visible_chips.constEnd(); ++child) {
+            if (child.key() != chip.folder && chip_in_subtree(child.key(), chip.folder))
+                right = max(right, child.value().right() + 1);
+        }
         for (int index = 0; index < count(); ++index) {
             auto* tab = m_tab_widget->tab(index);
             auto group = m_strip_group_of_tab.get(tab);
@@ -1210,7 +1221,11 @@ void TabBar::paint_strip_groups(QPainter& painter)
                 right = max(right, qRound(horizontal_selected_tab_body_rect(QRectF(tab_rect), horizontal_tab_end_room(index)).right()));
         }
         if (right > chip_rect->right() + 1) {
-            QRectF underline { static_cast<qreal>(chip_rect->left()), static_cast<qreal>(HORIZONTAL_TAB_HEIGHT - STRIP_GROUP_UNDERLINE_THICKNESS - HORIZONTAL_TAB_CARD_SHAPE_BOTTOM_INSET), static_cast<qreal>(right - chip_rect->left()), static_cast<qreal>(STRIP_GROUP_UNDERLINE_THICKNESS) };
+            // Reserve the bottom lane for the root group so subgroup colors cannot interrupt its span.
+            auto y = HORIZONTAL_TAB_HEIGHT - STRIP_GROUP_UNDERLINE_THICKNESS - HORIZONTAL_TAB_CARD_SHAPE_BOTTOM_INSET;
+            if (chip.depth)
+                y -= STRIP_GROUP_UNDERLINE_THICKNESS;
+            QRectF underline { static_cast<qreal>(chip_rect->left()), static_cast<qreal>(y), static_cast<qreal>(right - chip_rect->left()), static_cast<qreal>(STRIP_GROUP_UNDERLINE_THICKNESS) };
             painter.setPen(Qt::NoPen);
             painter.setBrush(color);
             painter.drawRoundedRect(underline, STRIP_GROUP_UNDERLINE_THICKNESS / 2.0, STRIP_GROUP_UNDERLINE_THICKNESS / 2.0);
@@ -4359,6 +4374,9 @@ void TabBar::drag_tab_loose(Tab& tab, QPixmap card)
 
 QPoint TabBar::tab_drag_hot_spot() const
 {
+    // Detached horizontal pixmaps start at the pointer, not at the point grabbed on the strip.
+    if (tab_layout() == TabLayout::Horizontal)
+        return { TAB_DRAG_IMAGE_MARGIN, TAB_DRAG_IMAGE_MARGIN };
     return m_position_in_selected_tab_while_dragging - m_tab_drag_card_offset + QPoint(TAB_DRAG_IMAGE_MARGIN, TAB_DRAG_IMAGE_MARGIN);
 }
 
@@ -4379,8 +4397,13 @@ void TabBar::start_chip_drag(TabFolderId folder, QPoint position)
         if (auto group = m_strip_group_of_tab.get(m_tab_widget->tab(index)); group.has_value() && chip_in_subtree(*group, folder) && is_tab_shown_on_strip(index))
             span = span.united(visual_tab_rect(index));
     }
-    m_position_in_selected_tab_while_dragging = m_drag_start_position - span.topLeft();
-    m_strip_drag_card = new TabDragCard(*window(), grab(span));
+    // Use the same antialiased, transparent corners as a tab card rather than lifting the rectangular strip pixels.
+    auto contents = grab(span);
+    auto card = lift_drag_card(span.size(), STRIP_CHIP_RADIUS, [&](QPainter& painter) {
+        painter.drawPixmap(0, 0, contents);
+    });
+    m_position_in_selected_tab_while_dragging = m_drag_start_position - span.topLeft() + QPoint(TAB_DRAG_IMAGE_MARGIN, TAB_DRAG_IMAGE_MARGIN);
+    m_strip_drag_card = new TabDragCard(*window(), AK::move(card));
     m_horizontal_moving = { TabFolderTree::Item::folder(folder) };
     m_strip_drag_cancellation_filter = new TabDragCancellationFilter([this] { end_strip_drag(); });
     qApp->installEventFilter(m_strip_drag_cancellation_filter);
@@ -4457,8 +4480,9 @@ void TabBar::update_strip_drag(QPoint position)
         }
         m_strip_drag_card->set_group_color(group_color);
         if (m_strip_drag_card->show_pinned_preview(m_horizontal_landing.has_value() && m_horizontal_landing->pin_slot.has_value())) {
-            auto offset = QPoint(m_strip_drag_card->width() / 2, m_strip_drag_card->height() / 2);
-            m_strip_drag_card->move(mapTo(window(), position) - offset);
+            auto index = m_tab_widget->index_of(s_active_tab_dragged_tab);
+            auto top = index >= 0 ? tab_drag_card_rect(index).top() : HORIZONTAL_TAB_CARD_SHAPE_TOP_INSET;
+            m_strip_drag_card->move(mapTo(window(), QPoint(position.x() - m_strip_drag_card->width() / 2, top - TAB_DRAG_IMAGE_MARGIN)));
             return;
         }
     }
@@ -4549,6 +4573,8 @@ void TabBar::drag_tab_in_own_window(Tab& tab)
     auto position_in_tab = QPoint(
         min(m_position_in_selected_tab_while_dragging.x(), tab_rect.width() - 1),
         min(m_position_in_selected_tab_while_dragging.y(), tab_rect.height() - 1));
+    if (tab_bar->tab_layout() == TabLayout::Horizontal)
+        position_in_tab = {};
     auto position_in_window = tab_bar->mapTo(dragged_window, tab_rect.topLeft() + position_in_tab);
 
     // NB: Qt has the compositor move the window this mime data names with the pointer, at this position in the window.
