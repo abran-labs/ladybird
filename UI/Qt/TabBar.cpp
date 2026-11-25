@@ -722,6 +722,19 @@ public:
 
     QPoint hot_spot() const { return m_hot_spot; }
 
+    void set_pinned_pixmap(QPixmap pixmap) { m_pinned_pixmap = AK::move(pixmap); }
+
+    bool show_pinned_preview(bool pinned)
+    {
+        pinned = pinned && !m_pinned_pixmap.isNull();
+        if (pinned != m_show_pinned_preview) {
+            m_show_pinned_preview = pinned;
+            resize((pinned ? m_pinned_pixmap : m_pixmap).deviceIndependentSize().toSize());
+            update();
+        }
+        return pinned;
+    }
+
     void set_opacity(qreal opacity)
     {
         m_opacity = opacity;
@@ -741,10 +754,12 @@ private:
     {
         QPainter painter(this);
         painter.setOpacity(m_opacity);
-        painter.drawPixmap(0, 0, m_pixmap);
+        painter.drawPixmap(0, 0, m_show_pinned_preview ? m_pinned_pixmap : m_pixmap);
     }
 
     QPixmap m_pixmap;
+    QPixmap m_pinned_pixmap;
+    bool m_show_pinned_preview { false };
     QPoint m_hot_spot;
     qreal m_opacity { 1.0 };
     QPointer<WebContentView> m_page_view;
@@ -1082,6 +1097,14 @@ QRect TabBar::strip_tab_rect_unscrolled(int index) const
 
 Optional<QRect> TabBar::strip_chip_rect(TabFolderId folder) const
 {
+    auto rect = settled_chip_rect(folder);
+    if (rect.has_value())
+        rect->translate(qRound(current_chip_offset(folder)), 0);
+    return rect;
+}
+
+Optional<QRect> TabBar::settled_chip_rect(TabFolderId folder) const
+{
     if (tab_layout() != TabLayout::Horizontal)
         return {};
     for (size_t i = 0; i < m_strip_chips.size(); ++i) {
@@ -1150,6 +1173,8 @@ void TabBar::paint_strip_groups(QPainter& painter)
     painter.save();
     painter.setRenderHint(QPainter::Antialiasing, true);
     for (auto const& chip : m_strip_chips) {
+        if (m_horizontal_moving.contains_slow(TabFolderTree::Item::folder(chip.folder)))
+            continue;
         auto chip_rect = strip_chip_rect(chip.folder);
         if (!chip_rect.has_value())
             continue;
@@ -1184,6 +1209,11 @@ void TabBar::paint_strip_groups(QPainter& painter)
         auto radius = chip.name.isEmpty() && !editing ? STRIP_CHIP_EMPTY_HEIGHT / 2.0 : STRIP_CHIP_RADIUS;
         painter.drawRoundedRect(QRectF(*chip_rect), radius, radius);
         // A collapsed group's chip is ringed, so it reads as holding more than it shows.
+        if (m_horizontal_landing.has_value() && m_horizontal_landing->on_chip() && m_horizontal_landing->destination.parent == chip.folder) {
+            painter.setBrush(Qt::NoBrush);
+            painter.setPen(QPen(Theme::accent(), 2));
+            painter.drawRoundedRect(*chip_rect, radius, radius);
+        }
         if (chip.collapsed) {
             auto ring = fill;
             ring.setAlphaF(0.45f);
@@ -2969,14 +2999,8 @@ void TabBar::paintEvent(QPaintEvent*)
     m_tabs_with_cut_titles = AK::move(tabs_with_cut_titles);
 
     painter.setClipping(false);
-    if (!is_vertical) {
+    if (!is_vertical)
         paint_strip_groups(painter);
-        if (m_horizontal_landing.has_value()) {
-            painter.setBrush(Qt::NoBrush);
-            painter.setPen(QPen(Theme::accent(), 2));
-            painter.drawRoundedRect(m_horizontal_landing->indicator, 2, 2);
-        }
-    }
     if (is_vertical && m_vertical_drop_line.isValid()) {
         painter.save();
         auto clip = m_row_drag.has_value() || dragging_pinned_tab() ? rect() : unpinned_clip;
@@ -3553,17 +3577,17 @@ Optional<TabBar::HorizontalLanding> TabBar::horizontal_landing_at(QPoint point) 
         return {};
     auto const& tree = browser->tab_folders();
     auto folder_drag = m_horizontal_moving.first().is_folder();
-    auto line = [&](int x) { return QRect(clamp(x, 1, max(1, width() - 2)), 5, 1, height() - 10); };
-    auto target = [&](TabFolderDestination destination, QRect indicator, Optional<int> pin_slot = {}) -> Optional<HorizontalLanding> {
+    auto gap = [](int x) { return QRect(x, 0, 0, 0); };
+    auto target = [&](TabFolderDestination destination, QRect anchor, Optional<int> pin_slot = {}) -> Optional<HorizontalLanding> {
         if (!tree.can_move_items(m_horizontal_moving, destination))
             return {};
-        return HorizontalLanding { destination, pin_slot, indicator };
+        return HorizontalLanding { destination, pin_slot, anchor };
     };
     auto beside = [&](Item item, bool after, int x) -> Optional<HorizontalLanding> {
         auto destination = HorizontalDrop::beside_root(tree, item, after);
         if (!destination.has_value() || m_horizontal_moving.contains_slow(item))
             return {};
-        return target(*destination, line(x));
+        return target(*destination, gap(x));
     };
     auto pins = pinned_tab_count();
     if (!folder_drag) {
@@ -3571,12 +3595,12 @@ Optional<TabBar::HorizontalLanding> TabBar::horizontal_landing_at(QPoint point) 
             auto tile = visual_tab_rect(i);
             if (point.x() <= tile.right()) {
                 auto after = point.x() >= tile.center().x();
-                return target(TabFolderDestination::at_end_of({}), line(after ? tile.right() : tile.left()), i + after);
+                return target(TabFolderDestination::at_end_of({}), gap(after ? tile.right() + 1 : tile.left()), i + after);
             }
         }
         // With no pins yet the first tab's leading foot is the entry to the pinned segment.
         if (!pins && !m_scroll_offset && point.x() < HORIZONTAL_TAB_END_ROOM)
-            return target(TabFolderDestination::at_end_of({}), line(1), 0);
+            return target(TabFolderDestination::at_end_of({}), gap(0), 0);
     }
 
     // A group's visual unit includes its chip, all shown descendants, and the spaces between them. Its outside
@@ -3584,7 +3608,13 @@ Optional<TabBar::HorizontalLanding> TabBar::horizontal_landing_at(QPoint point) 
     QHash<TabFolderId, QRect> bounds;
     for (auto const& chip : m_strip_chips) {
         if (!chip.provisional) {
-            if (auto box = strip_chip_rect(chip.folder); box.has_value())
+            // Gaps use settled coordinates so a stationary pointer doesn't reverse a displacement. A chip,
+            // however, is a visible drop control: hit its painted body, preserving its narrow root-gap edges.
+            if (!folder_drag) {
+                if (auto shown = strip_chip_rect(chip.folder); shown.has_value() && shown->adjusted(3, 0, -3, 0).contains(point))
+                    return target(TabFolderDestination::at_end_of(chip.folder), *shown);
+            }
+            if (auto box = settled_chip_rect(chip.folder); box.has_value())
                 bounds.insert(chip.folder, *box);
         }
     }
@@ -3616,7 +3646,7 @@ Optional<TabBar::HorizontalLanding> TabBar::horizontal_landing_at(QPoint point) 
             auto after = point.x() >= span.center().x();
             return beside(root, after, after ? last_edge : span.left());
         }
-        auto chip = strip_chip_rect(root.id);
+        auto chip = settled_chip_rect(root.id);
         if (!chip.has_value())
             return {};
         if (point.x() <= chip->right() || tree.folder(root.id)->collapsed)
@@ -3632,19 +3662,37 @@ Optional<TabBar::HorizontalLanding> TabBar::horizontal_landing_at(QPoint point) 
             if (m_horizontal_moving.contains_slow(item))
                 return {};
             auto after = point.x() >= member.center().x();
-            if (auto destination = HorizontalDrop::beside_member(tree, item, root.id, m_horizontal_moving, after); destination.has_value())
-                return target(*destination, line(after ? member.right() : member.left()));
+            if (auto destination = HorizontalDrop::beside_member(tree, item, root.id, m_horizontal_moving, after); destination.has_value()) {
+                // For an outside tab the insertion anchor can be a whole flattened subfolder, not this one tab.
+                auto const& siblings = tree.children(destination->parent);
+                auto anchor = siblings[destination->index - (after ? 1 : 0)];
+                if (anchor.is_folder()) {
+                    for (int j = pins; j < count(); ++j) {
+                        auto key = m_tab_widget->tab(j)->session_tab_id();
+                        if (key.has_value() && is_tab_shown_on_strip(j) && tree.is_inside(Item::tab(*key), anchor.id))
+                            member = member.united(visual_tab_rect(j));
+                    }
+                }
+                return target(*destination, gap(after ? member.right() + 1 : member.left()));
+            }
             return {};
         }
         return target(TabFolderDestination::at_end_of(root.id), *chip);
     }
-    return target(TabFolderDestination::at_end_of({}), line(last_edge));
+    return target(TabFolderDestination::at_end_of({}), gap(last_edge));
 }
 
 void TabBar::update_drop_preview(QPoint const& position)
 {
     if (!m_horizontal_moving.is_empty()) {
-        m_horizontal_landing = horizontal_landing_at(position);
+        auto landing = horizontal_landing_at(position);
+        auto changed = landing.has_value() != m_horizontal_landing.has_value() || (landing.has_value() && (landing->anchor != m_horizontal_landing->anchor || landing->pin_slot != m_horizontal_landing->pin_slot));
+        m_horizontal_landing = landing;
+        if (changed) {
+            // Freeze the displaced strip when its chip becomes the target. Moving it back would take the
+            // destination away from the pointer before release.
+            animate_drop_preview(landing.has_value() && landing->on_chip() ? current_drop_preview() : horizontal_drop_preview());
+        }
         update();
         return;
     }
@@ -3715,8 +3763,13 @@ void TabBar::set_drop_slot(Optional<int> slot)
         return;
 
     m_drop_slot = slot;
+    animate_drop_preview(drop_preview_for_slot(slot));
+}
+
+void TabBar::animate_drop_preview(DropPreview target)
+{
     m_drop_preview_start = current_drop_preview();
-    m_drop_preview_target = drop_preview_for_slot(slot);
+    m_drop_preview_target = AK::move(target);
     m_drop_preview_progress = 0.0;
     m_drop_preview_animation->stop();
     // With reduced motion, the other tabs jump into place.
@@ -3786,11 +3839,86 @@ TabBar::DropPreview TabBar::drop_preview_for_slot(Optional<int> slot) const
     return preview;
 }
 
+bool TabBar::horizontal_drag_contains(int index) const
+{
+    if (m_horizontal_moving.is_empty())
+        return false;
+    auto* tab = m_tab_widget->tab(index);
+    if (auto group = m_strip_group_of_tab.get(tab); group.has_value() && m_horizontal_moving.contains_slow(TabFolderTree::Item::folder(*group)))
+        return true;
+    auto key = tab->session_tab_id();
+    return key.has_value() && m_horizontal_moving.contains_slow(TabFolderTree::Item::tab(*key));
+}
+
+TabBar::DropPreview TabBar::horizontal_drop_preview() const
+{
+    DropPreview preview;
+    if (!m_horizontal_landing.has_value() || m_horizontal_landing->on_chip())
+        return preview;
+    // Headers occupy space borrowed from Qt tabs, but move independently of those anchors. Remove the visible
+    // source pieces, then insert one gap at the resolved boundary. Never move a native tab during preview.
+    struct Piece {
+        int x;
+        int width;
+        int index;
+        Optional<TabFolderId> chip;
+        bool moving;
+    };
+    Vector<Piece> pieces;
+    int gap_width = 0;
+    for (int i = 0; i < count(); ++i) {
+        if (!is_tab_shown_on_strip(i))
+            continue;
+        auto rect = visual_tab_rect(i);
+        auto moving = horizontal_drag_contains(i);
+        pieces.append({ rect.left(), rect.width(), i, {}, moving });
+        if (moving) {
+            if (m_horizontal_landing->pin_slot.has_value())
+                gap_width += HORIZONTAL_PINNED_TAB_WIDTH;
+            else if (m_tab_widget->tab(i)->is_pinned())
+                gap_width += horizontal_tab_share();
+            else
+                gap_width += rect.width();
+        }
+    }
+    for (auto const& chip : m_strip_chips) {
+        if (auto rect = settled_chip_rect(chip.folder); rect.has_value()) {
+            auto moving = m_horizontal_moving.contains_slow(TabFolderTree::Item::folder(chip.folder));
+            pieces.append({ rect->left(), strip_chip_room(chip), -1, chip.folder, moving });
+            if (moving)
+                gap_width += strip_chip_room(chip);
+        }
+    }
+    quick_sort(pieces, [](auto const& a, auto const& b) { return a.x < b.x; });
+    preview.tab_shifts.resize(count());
+    int removed = 0;
+    for (auto const& piece : pieces) {
+        if (piece.moving) {
+            removed += piece.width;
+            continue;
+        }
+        auto shift = (piece.x >= m_horizontal_landing->anchor.x() ? gap_width : 0) - removed;
+        if (piece.chip.has_value())
+            preview.chip_offsets.insert(*piece.chip, shift);
+        else
+            preview.tab_shifts[piece.index].x_offset = shift;
+    }
+    return preview;
+}
+
+qreal TabBar::current_chip_offset(TabFolderId id) const
+{
+    auto start = m_drop_preview_start.chip_offsets.value(id);
+    return start + (m_drop_preview_target.chip_offsets.value(id) - start) * m_drop_preview_progress;
+}
+
 TabBar::DropPreview TabBar::current_drop_preview() const
 {
     DropPreview preview;
     for (int index = 0; index < count(); ++index)
         preview.tab_shifts.append(current_tab_shift(index));
+    for (auto const& chip : m_strip_chips)
+        preview.chip_offsets.insert(chip.folder, current_chip_offset(chip.folder));
     preview.strip_growth = current_strip_growth();
     preview.pinned_region_growth = current_pinned_region_growth();
     return preview;
@@ -4009,7 +4137,7 @@ int TabBar::horizontal_tabs_end_offset() const
 
 QRect TabBar::shifted_tab_rect(int index) const
 {
-    if (!is_tab_shown_on_strip(index))
+    if (!is_tab_shown_on_strip(index) || horizontal_drag_contains(index))
         return {};
     auto tab_rect = animated_tab_rect(index, visual_tab_rect(index));
     auto shift = current_tab_shift(index);
@@ -4203,7 +4331,13 @@ void TabBar::start_chip_drag(TabFolderId folder, QPoint position)
     m_pressed_chip.clear();
     if (!chip.has_value())
         return;
-    m_strip_drag_card = new TabDragCard(*window(), grab(*chip));
+    auto span = *chip;
+    for (int index = 0; index < count(); ++index) {
+        if (is_tab_shown_on_strip(index) && m_strip_group_of_tab.get(m_tab_widget->tab(index)) == folder)
+            span = span.united(visual_tab_rect(index));
+    }
+    m_position_in_selected_tab_while_dragging = m_drag_start_position - span.topLeft();
+    m_strip_drag_card = new TabDragCard(*window(), grab(span));
     m_horizontal_moving = { TabFolderTree::Item::folder(folder) };
     m_strip_drag_cancellation_filter = new TabDragCancellationFilter([this] { end_strip_drag(); });
     qApp->installEventFilter(m_strip_drag_cancellation_filter);
@@ -4231,6 +4365,17 @@ void TabBar::start_strip_drag(int index, QPoint position)
     } else if (auto key = m_tab_widget->tab(index)->session_tab_id(); key.has_value()) {
         m_horizontal_moving = TabFolderDrag::items_to_drag(TabFolderTree::Item::tab(*key), selected_sidebar_items());
         m_clear_folder_selection_on_release = false;
+        if (!m_tab_widget->tab(index)->is_pinned()) {
+            auto size = QSize(HORIZONTAL_PINNED_TAB_WIDTH, tab_drag_card_rect(index).height());
+            auto icon = tabIcon(index);
+            auto icon_size = icon.isNull() ? CHROME_ICON_CANVAS_SIZE : TAB_ICON_SIZE;
+            auto const& shown_icon = icon.isNull() ? m_fallback_tab_icon : icon;
+            m_strip_drag_card->set_pinned_pixmap(lift_drag_card(size, tab_drag_card_radius(), [&](QPainter& painter) {
+                QRect icon_rect(QPoint(), QSize(icon_size, icon_size));
+                icon_rect.moveCenter(QRect(QPoint(), size).center());
+                shown_icon.paint(&painter, icon_rect);
+            }));
+        }
     }
 
     s_active_tab_drag_source = m_tab_widget;
@@ -4255,9 +4400,16 @@ void TabBar::start_strip_drag(int index, QPoint position)
 
 void TabBar::update_strip_drag(QPoint position)
 {
-    if (!m_horizontal_moving.is_empty() && (m_horizontal_moving.first().is_folder() || m_horizontal_moving.size() > 1)) {
-        m_strip_drag_card->move(mapTo(window(), QPoint(position.x() + 8, height() / 2)));
+    if (!m_horizontal_moving.is_empty()) {
         update_drop_preview(position);
+        if (m_strip_drag_card->show_pinned_preview(m_horizontal_landing.has_value() && m_horizontal_landing->pin_slot.has_value())) {
+            auto offset = QPoint(m_strip_drag_card->width() / 2, m_strip_drag_card->height() / 2);
+            m_strip_drag_card->move(mapTo(window(), position) - offset);
+            return;
+        }
+    }
+    if (!m_horizontal_moving.is_empty() && (m_horizontal_moving.first().is_folder() || m_horizontal_moving.size() > 1)) {
+        m_strip_drag_card->move(mapTo(window(), QPoint(position.x() - m_position_in_selected_tab_while_dragging.x(), m_drag_start_position.y() - m_position_in_selected_tab_while_dragging.y())));
         return;
     }
     auto dragged_tab = s_active_tab_dragged_tab;
@@ -4283,7 +4435,8 @@ void TabBar::update_strip_drag(QPoint position)
         auto card_position = QPoint(position.x() - m_position_in_selected_tab_while_dragging.x() + m_tab_drag_card_offset.x(), card_rect.top());
         m_strip_drag_card->move(mapTo(window(), card_position) - QPoint(TAB_DRAG_IMAGE_MARGIN, TAB_DRAG_IMAGE_MARGIN));
     }
-    update_drop_preview(position);
+    if (m_horizontal_moving.is_empty())
+        update_drop_preview(position);
     if (m_vertical_drag_cursor_active)
         move_vertical_drag_card(position);
 }
@@ -4298,6 +4451,8 @@ void TabBar::end_strip_drag(bool keep_vertical_card)
         if (!keep_vertical_card)
             clear_vertical_drag_card();
     }
+    if (!m_horizontal_moving.is_empty())
+        clear_drop_preview();
     m_horizontal_moving.clear();
     m_horizontal_landing.clear();
     delete m_strip_drag_card;
@@ -4796,7 +4951,7 @@ void TabBar::update_tab_button_geometry()
                     microphone->hide();
                 continue;
             }
-            auto is_dragged = index == dragged_index;
+            auto is_dragged = index == dragged_index || horizontal_drag_contains(index);
             auto tab_rect = shifted_tab_rect(index);
             auto shape_rect = horizontal_tab_card_shape_rect(QRectF(tab_rect), horizontal_tab_end_room(index));
             auto* left_button = tabButton(index, QTabBar::LeftSide);

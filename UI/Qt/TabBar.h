@@ -208,6 +208,7 @@ private:
     };
     struct DropPreview {
         Vector<TabShift> tab_shifts;
+        QHash<TabFolderId, qreal> chip_offsets;
         qreal strip_growth { 0 };
         qreal pinned_region_growth { 0 };
     };
@@ -224,7 +225,9 @@ private:
     void set_drop_slot(Optional<int>);
     void clear_drop_preview();
     DropPreview drop_preview_for_slot(Optional<int>) const;
+    void animate_drop_preview(DropPreview);
     DropPreview current_drop_preview() const;
+    qreal current_chip_offset(TabFolderId) const;
     TabShift current_tab_shift(int index) const;
     qreal current_strip_growth() const;
     qreal current_pinned_region_growth() const;
@@ -437,9 +440,14 @@ private:
     struct HorizontalLanding {
         TabFolderDestination destination;
         Optional<int> pin_slot;
-        QRect indicator;
+        // A chip body for a direct group drop; otherwise a zero-width gap boundary in settled strip coordinates.
+        QRect anchor;
+        bool on_chip() const { return anchor.isValid(); }
     };
     Optional<HorizontalLanding> horizontal_landing_at(QPoint) const;
+    DropPreview horizontal_drop_preview() const;
+    bool horizontal_drag_contains(int index) const;
+    Optional<QRect> settled_chip_rect(TabFolderId) const;
     void start_chip_drag(TabFolderId, QPoint);
     Vector<TabFolderTree::Item> m_horizontal_moving;
     Optional<HorizontalLanding> m_horizontal_landing;
@@ -520,7 +528,7 @@ private:
     QPoint m_drag_start_position;
     // NB: A tab is dragged within its strip without a drag and drop session. It is drawn as a card that slides along the
     //     strip, until it is pulled out of the strip.
-    QWidget* m_strip_drag_card { nullptr };
+    TabDragCard* m_strip_drag_card { nullptr };
     QPixmap m_tab_drag_pixmap;
     // Where the card a dragged tab is drawn as sits in the tab.
     QPoint m_tab_drag_card_offset;
