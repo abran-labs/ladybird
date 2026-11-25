@@ -117,6 +117,8 @@ public:
     void update_microphone_indicators();
     // How far the end of the horizontal tabs is from where it settles, while tabs open and close.
     int horizontal_tabs_end_offset() const;
+    // The + follows painted pieces during local drags, without changing the strip's layout or hit targets.
+    Optional<int> horizontal_drag_end() const;
     // A horizontal tab that closes shrinks away as the others close the gap.
     void prepare_for_tab_removal(int index);
 
@@ -243,10 +245,9 @@ private:
     void toggle_window_maximized();
     bool start_window_move();
     void start_tab_drag(int index, QPoint position);
-    QPoint tab_drag_hot_spot() const;
     void start_strip_drag(int index, QPoint position);
     void update_strip_drag(QPoint position);
-    void end_strip_drag(bool keep_vertical_card = false);
+    void end_strip_drag(bool keep_vertical_card = false, bool leaving_strip = false);
     void drag_tab_loose(Tab&, QPixmap card);
     void drag_tab_in_own_window(Tab&);
     void start_hover_animation(int tab_index, qreal target_progress);
@@ -405,6 +406,11 @@ private:
     bool vertical_drag_motion_enabled() const;
     void set_vertical_drop_indicator(QRect);
     QRectF displayed_vertical_drop_indicator() const;
+    struct CompactDragImage {
+        QPixmap pixmap;
+        QPoint hot_spot;
+    };
+    CompactDragImage compact_drag_image(QRect source, int tab_index, SidebarRow const* folder, size_t item_count) const;
     void show_vertical_drag_card(QRect source, int tab_index, SidebarRow const* folder = nullptr, size_t item_count = 1);
     void move_vertical_drag_card(QPoint);
     void land_vertical_drag_card(QRect);
@@ -447,7 +453,7 @@ private:
         bool on_chip() const { return anchor.isValid(); }
     };
     Optional<HorizontalLanding> horizontal_landing_at(QPoint) const;
-    DropPreview horizontal_drop_preview() const;
+    DropPreview horizontal_drop_preview();
     bool horizontal_drag_contains(int index) const;
     bool chip_in_subtree(TabFolderId chip, TabFolderId root) const;
     bool dragging_chip(TabFolderId) const;
@@ -544,6 +550,7 @@ private:
     Optional<TabFolderTree::Item> m_row_drag_grabbed;
     QPoint m_vertical_drag_landing_start;
     Optional<QPoint> m_vertical_drag_landing_end;
+    Optional<int> m_horizontal_gap_end;
 };
 
 class TabWidget final : public QWidget {
@@ -613,7 +620,7 @@ public:
     bool can_expand_vertical_tabs_on_hover() const;
     void update_tab_button_visibility();
     void update_tab_layout();
-    void place_horizontal_new_tab_button();
+    void place_horizontal_new_tab_button(bool glide = false);
     int horizontal_tab_strip_drag_space() const;
     void show_all_tabs();
     void update_all_tabs_entries();
@@ -772,6 +779,7 @@ private:
     int m_vertical_tabs_expanded_width { 0 };
     int m_vertical_tabs_resize_start_global_x { 0 };
     int m_vertical_tabs_resize_start_width { 0 };
+    QVariantAnimation* m_horizontal_plus_glide { nullptr };
 };
 
 class TabBarButton final : public QPushButton {
