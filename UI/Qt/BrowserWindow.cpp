@@ -2975,10 +2975,12 @@ void BrowserWindow::begin_window_close_preflight(Function<void(bool approved)> o
     };
     if (m_current_tab && in_scope(*m_current_tab))
         tabs.append(m_current_tab);
-    for_each_tab([&](auto& tab) {
-        if (&tab != m_current_tab && in_scope(tab))
-            tabs.append(&tab);
-    });
+    for (int index = 0; index < m_tabs_container->count(); ++index) {
+        auto* tab = m_tabs_container->tab(index);
+        // A window close only needs to check loaded pages, but folder deletion also uses this snapshot to remove tabs.
+        if (tab != m_current_tab && (folder_to_delete.has_value() || tab->is_loaded()) && in_scope(*tab))
+            tabs.append(tab);
+    }
 
     Vector<WindowCloseCoordinator::Preflight> preflights;
     preflights.ensure_capacity(tabs.size());
