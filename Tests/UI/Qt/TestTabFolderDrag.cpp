@@ -339,12 +339,12 @@ TEST_CASE(a_discontiguous_selection_drops_in_tree_order_into_a_folder)
     EXPECT_EQ(tree.children(work), items({ tab(2), tab(1), tab(3), tab(4) }));
 }
 
-TEST_CASE(horizontal_drops_use_the_chip_not_the_hidden_subfolder_as_the_destination)
+TEST_CASE(horizontal_subgroup_edge_inserts_beside_the_subgroup_in_its_parent)
 {
     TabFolderId work;
     auto tree = work_tree(work);
     auto inner = tree.create_folder_around("Inner"_string, { tab(3) }).value();
-    auto place = HorizontalDrop::beside_member(tree, tab(3), work, { tab(4) }, true);
+    auto place = HorizontalDrop::beside(tree, folder(inner), true);
     EXPECT(place.has_value());
     EXPECT(tree.move_items({ tab(4) }, *place));
     EXPECT_EQ(tree.children(work), items({ tab(2), folder(inner), tab(4) }));
@@ -357,14 +357,14 @@ TEST_CASE(horizontal_root_gap_moves_a_whole_closed_group_then_ungroups_a_member)
     auto tree = work_tree(work);
     auto inner = tree.create_folder_around("Inner"_string, { tab(3) }).value();
     EXPECT(tree.set_folder_collapsed(work, true));
-    auto end = HorizontalDrop::beside_root(tree, tab(4), true);
+    auto end = HorizontalDrop::beside(tree, tab(4), true);
     EXPECT(end.has_value());
     EXPECT(tree.move_items({ folder(work) }, *end));
     EXPECT_EQ(tree.children(), items({ tab(1), tab(4), folder(work) }));
     EXPECT_EQ(tree.children(work), items({ tab(2), folder(inner) }));
     EXPECT_EQ(tree.children(inner), items({ tab(3) }));
 
-    auto gap = HorizontalDrop::beside_root(tree, folder(work), false);
+    auto gap = HorizontalDrop::beside(tree, folder(work), false);
     EXPECT(gap.has_value());
     EXPECT(tree.move_items({ tab(3) }, *gap));
     EXPECT_EQ(tree.children(), items({ tab(1), tab(4), tab(3), folder(work) }));

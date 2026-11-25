@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: BSD-2-Clause
  */
 
+#include <LibGfx/Color.h>
 #include <UI/Qt/TabFolderMenus.h>
 
 #include <UI/Qt/StringUtils.h>
@@ -49,9 +50,10 @@ QColor folder_color(QString const& name, bool dark)
     return QColor(dark ? entries[0].dark : entries[0].light);
 }
 
-QColor folder_color_text(bool dark)
+QColor folder_color_text(QColor const& fill)
 {
-    return dark ? QColor(0x20, 0x21, 0x24) : QColor(Qt::white);
+    Gfx::Color background(fill.red(), fill.green(), fill.blue());
+    return background.contrast_ratio(Gfx::Color::Black) >= background.contrast_ratio(Gfx::Color::White) ? Qt::black : Qt::white;
 }
 
 Action exec_folder(QWidget* parent, QPoint const& global_pos)

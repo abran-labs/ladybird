@@ -153,6 +153,8 @@ public:
         bool provisional { false };
         // The tab the chip sits before, or nothing for a chip after every tab.
         QPointer<Tab> before_tab;
+        size_t depth { 0 };
+        QString label() const { return depth ? QString(static_cast<int>(depth), QChar(0x203a)) + QLatin1Char(' ') + name : name; }
 
         bool operator==(StripChip const&) const = default;
     };
@@ -447,6 +449,8 @@ private:
     Optional<HorizontalLanding> horizontal_landing_at(QPoint) const;
     DropPreview horizontal_drop_preview() const;
     bool horizontal_drag_contains(int index) const;
+    bool chip_in_subtree(TabFolderId chip, TabFolderId root) const;
+    bool dragging_chip(TabFolderId) const;
     Optional<QRect> settled_chip_rect(TabFolderId) const;
     void start_chip_drag(TabFolderId, QPoint);
     Vector<TabFolderTree::Item> m_horizontal_moving;

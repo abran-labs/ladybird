@@ -231,24 +231,28 @@ StripGroups strip_groups(TabFolderTree const& tree, Vector<WindowTab> const& tab
             result.chips[chip].before_tab = key;
         waiting_chips.clear();
     };
-    for (auto item : tree.children()) {
-        if (item.is_tab()) {
-            if (unpinned_index.contains(item.id))
-                reached_tab(item.id);
-            continue;
-        }
-        auto const& folder = tree.folder(item.id).value();
-        waiting_chips.append(result.chips.size());
-        result.chips.append({ item.id, {}, folder.collapsed });
-        for (auto key : tree.tabs_inside(item.id)) {
-            auto index = unpinned_index.get(key);
-            if (!index.has_value())
+    auto walk = [&](auto& self, Optional<TabFolderId> parent, Optional<TabFolderId> collapsed, size_t depth) -> void {
+        for (auto item : tree.children(parent)) {
+            if (item.is_tab()) {
+                if (auto index = unpinned_index.get(item.id); index.has_value()) {
+                    reached_tab(item.id);
+                    result.group_of_tab[*index] = collapsed.has_value() ? collapsed : parent;
+                    result.hidden[*index] = collapsed.has_value() && active != item.id;
+                }
                 continue;
-            reached_tab(key);
-            result.group_of_tab[*index] = item.id;
-            result.hidden[*index] = folder.collapsed && active != key;
+            }
+            auto hidden_by = collapsed;
+            if (!hidden_by.has_value()) {
+                bool closed = tree.folder(item.id)->collapsed;
+                waiting_chips.append(result.chips.size());
+                result.chips.append({ item.id, {}, closed, depth });
+                if (closed)
+                    hidden_by = item.id;
+            }
+            self(self, item.id, hidden_by, depth + 1);
         }
-    }
+    };
+    walk(walk, {}, {}, 0);
     return result;
 }
 

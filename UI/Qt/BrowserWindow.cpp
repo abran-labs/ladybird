@@ -860,7 +860,7 @@ void BrowserWindow::update_tab_folders(Optional<TabFolderTree::TabKey> new_tab_a
     }
     m_tabs_container->tab_bar()->set_sidebar_rows(AK::move(rows), sidebar_tree.has_folders(), m_folder_selection.keys);
 
-    // The horizontal strip shows the same tree: a chip for each top-level folder, before its tabs.
+    // The horizontal strip shows the same tree: a chip for each visible folder, before its tabs.
     {
         auto tab_for_key = [&](TabFolderTree::TabKey key) -> Tab* {
             for (int i = 0; i < m_tabs_container->count(); ++i) {
@@ -877,6 +877,7 @@ void BrowserWindow::update_tab_folders(Optional<TabFolderTree::TabKey> new_tab_a
                 continue;
             TabBar::StripChip chip;
             chip.folder = group.folder;
+            chip.depth = group.depth;
             chip.name = qstring_from_ak_string(folder->name);
             chip.color = TabFolderMenus::effective_folder_color(*folder);
             chip.collapsed = group.collapsed;
@@ -884,27 +885,6 @@ void BrowserWindow::update_tab_folders(Optional<TabFolderTree::TabKey> new_tab_a
             if (group.before_tab.has_value())
                 chip.before_tab = tab_for_key(*group.before_tab);
             chips.append(AK::move(chip));
-        }
-        // A subgroup being made has no chip of its own, so give it a provisional one beside its parent's: it's what the
-        // name editor sits over. A top-level folder being made comes with its own chip from the tree.
-        if (provisional_folder.has_value()) {
-            auto parent = sidebar_tree.parent_of(TabFolderTree::Item::folder(*provisional_folder));
-            auto folder = sidebar_tree.folder(*provisional_folder);
-            if (parent.has_value() && folder.has_value()) {
-                TabBar::StripChip chip;
-                chip.folder = *provisional_folder;
-                chip.name = qstring_from_ak_string(folder->name);
-                chip.color = TabFolderMenus::effective_folder_color(*folder);
-                chip.provisional = true;
-                for (auto const& sibling : chips) {
-                    if (sibling.folder == *parent) {
-                        chip.before_tab = sibling.before_tab;
-                        break;
-                    }
-                }
-                // NB: It goes last, since chips that share an anchor lay out in their order.
-                chips.append(AK::move(chip));
-            }
         }
         HashMap<Tab const*, TabFolderId> group_of_tab;
         HashTable<Tab const*> hidden;

@@ -38,7 +38,7 @@ enum class Terms {
 QString effective_folder_color(TabFolderTree::Folder const&);
 QColor folder_color(QString const& name, bool dark);
 // What reads on a chip of that color.
-QColor folder_color_text(bool dark);
+QColor folder_color_text(QColor const& fill);
 
 Action exec_folder(QWidget* parent, QPoint const& global_pos);
 

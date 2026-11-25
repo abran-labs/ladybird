@@ -357,22 +357,39 @@ TEST_CASE(a_top_level_folder_is_a_chip_before_its_first_tab)
     EXPECT_EQ(strip.hidden, flags({ false, false, false, false }));
 }
 
-TEST_CASE(nested_folders_belong_to_their_top_level_chip_without_chips_of_their_own)
+TEST_CASE(expanded_parent_shows_nested_chip_and_its_collapse_only_hides_its_own_members)
 {
     TabFolderId work = 0;
     auto tree = work_tree(work);
     auto inner = tree.create_folder_around("Inner"_string, items({ tab(3) })).release_value();
-    // Collapsing only the nested folder doesn't hide anything on the strip.
     EXPECT(tree.set_folder_collapsed(inner, true));
     auto tabs = window({ unpinned(1), unpinned(2), unpinned(3), unpinned(4) });
     auto strip = TabFolderSync::strip_groups(tree, tabs, 1);
-    Vector<StripGroup> expected { { work, 2, false } };
+    Vector<StripGroup> expected { { work, 2, false }, { inner, 3, true, 1 } };
     EXPECT_EQ(strip.chips, expected);
-    EXPECT_EQ(strip.group_of_tab, groups({ {}, work, work, {} }));
-    EXPECT_EQ(strip.hidden, flags({ false, false, false, false }));
+    EXPECT_EQ(strip.group_of_tab, groups({ {}, work, inner, {} }));
+    EXPECT_EQ(strip.hidden, flags({ false, false, true, false }));
     // The tree itself is untouched: the nested folder is still there, still collapsed.
     EXPECT_EQ(tree.parent_of(folder(inner)), Optional<TabFolderId> { work });
     EXPECT(tree.folder(inner)->collapsed);
+}
+
+TEST_CASE(an_empty_nested_chip_has_an_anchor_until_its_parent_collapses)
+{
+    TabFolderId work = 0;
+    auto tree = work_tree(work);
+    auto empty = tree.create_folder("Empty"_string, TabFolderDestination::at_end_of(work)).release_value();
+    auto tabs = window({ unpinned(1), unpinned(2), unpinned(3), unpinned(4) });
+    auto strip = TabFolderSync::strip_groups(tree, tabs, 3);
+    Vector<StripGroup> expanded { { work, 2, false }, { empty, 4, false, 1 } };
+    EXPECT_EQ(strip.chips, expanded);
+    EXPECT(tree.set_folder_collapsed(work, true));
+    strip = TabFolderSync::strip_groups(tree, tabs, 3);
+    Vector<StripGroup> collapsed { { work, 2, true } };
+    EXPECT_EQ(strip.chips, collapsed);
+    EXPECT_EQ(strip.hidden, flags({ false, true, false, false }));
+    EXPECT(tree.set_folder_collapsed(work, false));
+    EXPECT_EQ(TabFolderSync::strip_groups(tree, tabs, 3).chips, expanded);
 }
 
 TEST_CASE(a_collapsed_chip_hides_its_tabs_but_never_the_active_one)
@@ -481,11 +498,10 @@ TEST_CASE(a_strip_pass_over_a_nested_tree_leaves_its_folders_and_their_look_alon
     EXPECT_EQ(tree.folder(inner)->icon.value_or(""_string), "star"_string);
     EXPECT_EQ(tree.folder(inner)->color.value_or(""_string), "green"_string);
 
-    // The strip reaches the nested folder through its group's chip alone, and the tree still nests it.
     auto strip = TabFolderSync::strip_groups(tree, tabs, 1);
-    Vector<StripGroup> expected { { work, 2, false } };
+    Vector<StripGroup> expected { { work, 2, false }, { inner, 3, false, 1 } };
     EXPECT_EQ(strip.chips, expected);
-    EXPECT_EQ(strip.group_of_tab, groups({ {}, work, work, {} }));
+    EXPECT_EQ(strip.group_of_tab, groups({ {}, work, inner, {} }));
 }
 
 TEST_CASE(a_tab_added_to_a_group_joins_the_group_rather_than_the_subgroup_holding_the_tab_before_it)
