@@ -184,7 +184,7 @@ Vector<SidebarRow> sidebar_rows(TabFolderTree const& tree, Vector<WindowTab> con
 {
     HashTable<TabKey> pinned;
     for (auto const& tab : tabs) {
-        if (tab.pinned)
+        if (tab.pinned && !tree.parent_of(Item::tab(tab.key)).has_value())
             pinned.set(tab.key);
     }
     // A pinned tab shows on its tile, so it has nothing to preview.
@@ -211,7 +211,12 @@ Vector<SidebarRow> sidebar_rows(TabFolderTree const& tree, Vector<WindowTab> con
                 rows.append({ Item::tab(*active), depth + 1, true, TabFolderTree::FolderGlyph::Open });
         }
     };
-    walk(walk, tree.children(), 0);
+    Vector<Item> folders;
+    Vector<Item> loose;
+    for (auto item : tree.children())
+        (item.is_folder() ? folders : loose).append(item);
+    walk(walk, folders, 0);
+    walk(walk, loose, 0);
     return rows;
 }
 

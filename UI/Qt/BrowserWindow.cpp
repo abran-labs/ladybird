@@ -895,8 +895,24 @@ void BrowserWindow::start_creating_tab_folder(TabFolderEditing::FolderCreation c
 
 void BrowserWindow::move_tab_folder_items(Vector<TabFolderTree::Item> const& items, TabFolderDestination const& destination)
 {
-    if (m_tab_folders.move_items(items, destination))
-        update_tab_folders();
+    if (!m_tab_folders.move_items(items, destination))
+        return;
+    update_tab_folders();
+    // A tab in a folder is one of its rows, and the pins belong to the tiles: it comes out of them, as itself.
+    for (auto item : items) {
+        if (!item.is_tab() || !m_tab_folders.parent_of(item).has_value())
+            continue;
+        for (int i = 0; i < tab_count(); ++i) {
+            auto* tab = tab_at(i);
+            if (tab->session_tab_id() != item.id)
+                continue;
+            if (tab->is_pinned())
+                unpin_tab_where_it_is(*tab);
+            else
+                update_tab_close_button(*tab);
+            break;
+        }
+    }
 }
 
 void BrowserWindow::restore_closed_window_folders(TabFolderTree const& restored, Vector<Tab*> const& tabs)
@@ -934,7 +950,7 @@ void BrowserWindow::select_tab_for_folder(Tab& tab, Qt::KeyboardModifiers modifi
             auto* candidate = m_tabs_container->tab(i);
             if (auto id = candidate->session_tab_id(); id.has_value()) {
                 tabs.append({ *id, candidate->is_pinned() });
-                if (candidate->is_pinned())
+                if (candidate->is_pinned() && !m_tab_folders.parent_of(TabFolderTree::Item::tab(*id)).has_value())
                     rows.append({ TabFolderTree::Item::tab(*id) });
             }
         }
@@ -1768,6 +1784,80 @@ void BrowserWindow::unpin_tab(Tab& tab)
     pinned_state_changed(tab);
 }
 
+void BrowserWindow::unpin_tab_where_it_is(Tab& tab)
+{
+    if (!tab.is_pinned())
+        return;
+    // NB: The strip's order follows the tree here, so a move along it would drag the tab to another folder.
+    tab.set_pinned(false);
+    pinned_state_changed(tab);
+}
+
+void BrowserWindow::pin_tabs(Vector<Tab*> const& tabs, int pinned_index)
+{
+    auto slot = pinned_index;
+    for (auto* tab : tabs) {
+        if (!tab)
+            continue;
+        // A tab that a folder still holds leaves it for the tiles, as the same tab.
+        if (auto key = tab->session_tab_id(); key.has_value() && m_tab_folders.parent_of(TabFolderTree::Item::tab(*key)).has_value()) {
+            (void)m_tab_folders.move_items({ TabFolderTree::Item::tab(*key) }, TabFolderDestination::at_end_of({}));
+            update_tab_folders();
+            update_tab_close_button(*tab);
+        }
+        if (!tab->is_pinned())
+            pin_tab(*tab, slot);
+        else if (auto index = tab_index(tab); index >= 0)
+            move_tab(index, slot);
+        ++slot;
+    }
+}
+
+void BrowserWindow::unpin_tab_at(Tab& tab, int row)
+{
+    auto index = tab_index(&tab);
+    if (index < 0 || !tab.is_pinned())
+        return;
+
+    // Without folders the strip owns the order, so the row is a place in it.
+    if (!m_tab_folders.has_folders()) {
+        tab.set_pinned(false);
+        auto destination = clamp(pinned_tab_count() + row, pinned_tab_count(), m_tabs_container->count() - 1);
+        if (index != destination)
+            m_tabs_container->tab_bar()->moveTab(index, destination);
+        pinned_state_changed(tab);
+        return;
+    }
+
+    // The rows under the divider are the unpinned root tabs in the folders' order, so the row picks a place in the tree.
+    if (auto key = tab.session_tab_id(); key.has_value()) {
+        Vector<TabFolderTree::TabKey> loose;
+        for (auto item : m_tab_folders.children()) {
+            if (!item.is_tab())
+                continue;
+            for (int i = 0; i < tab_count(); ++i) {
+                auto* candidate = tab_at(i);
+                if (candidate->session_tab_id() == item.id && !candidate->is_pinned()) {
+                    loose.append(item.id);
+                    break;
+                }
+            }
+        }
+        Optional<TabFolderDestination> destination;
+        if (row >= 0 && static_cast<size_t>(row) < loose.size())
+            destination = m_tab_folders.position_of(TabFolderTree::Item::tab(loose[row]));
+        else
+            destination = TabFolderDestination::at_end_of({});
+        if (destination.has_value() && m_tab_folders.contains(TabFolderTree::Item::tab(*key))) {
+            (void)m_tab_folders.move_items({ TabFolderTree::Item::tab(*key) }, *destination);
+            // The tree already chose the root slot. A second strip move could adopt a neighbor's folder.
+            unpin_tab_where_it_is(tab);
+            return;
+        }
+    }
+    unpin_tab(tab);
+}
+
 void BrowserWindow::pinned_state_changed(Tab& tab)
 {
     // A move already reported the new order, through the tab bar's tabMoved signal.
@@ -1876,10 +1966,18 @@ void BrowserWindow::initialize_tab_buttons(Tab* tab)
     auto index = m_tabs_container->index_of(tab);
     m_tabs_container->set_tab_icon(index, tab->tab_icon());
 
-    // A pinned tab has no close button.
-    m_tabs_container->tab_bar()->setTabButton(index, TAB_CLOSE_BUTTON_POSITION, tab->is_pinned() ? nullptr : create_tab_close_button(*tab));
+    // A pinned tab has no close button, unless a folder holds it as one of its rows.
+    m_tabs_container->tab_bar()->setTabButton(index, TAB_CLOSE_BUTTON_POSITION, tab_shows_close_button(*tab) ? create_tab_close_button(*tab) : nullptr);
     m_tabs_container->update_tab_button_visibility();
     update_tab_audio_button(*tab);
+}
+
+bool BrowserWindow::tab_shows_close_button(Tab& tab) const
+{
+    if (!tab.is_pinned())
+        return true;
+    auto key = tab.session_tab_id();
+    return key.has_value() && m_tab_folders.parent_of(TabFolderTree::Item::tab(*key)).has_value();
 }
 
 void BrowserWindow::update_tab_close_button(Tab& tab)
@@ -1890,10 +1988,10 @@ void BrowserWindow::update_tab_close_button(Tab& tab)
 
     auto* tab_bar = m_tabs_container->tab_bar();
     auto* close_button = tab_bar->tabButton(index, TAB_CLOSE_BUTTON_POSITION);
-    if (tab.is_pinned() && close_button) {
+    if (!tab_shows_close_button(tab) && close_button) {
         tab_bar->setTabButton(index, TAB_CLOSE_BUTTON_POSITION, nullptr);
         close_button->deleteLater();
-    } else if (!tab.is_pinned() && !close_button) {
+    } else if (tab_shows_close_button(tab) && !close_button) {
         tab_bar->setTabButton(index, TAB_CLOSE_BUTTON_POSITION, create_tab_close_button(tab));
     }
     m_tabs_container->update_tab_button_visibility();

@@ -939,6 +939,7 @@ void TabBar::lay_out_sidebar_rows(bool animate)
 
 void TabBar::rows_changed_layout()
 {
+    set_scroll_offset(m_scroll_offset);
     updateGeometry();
     update_tab_button_geometry();
     update();
@@ -963,7 +964,7 @@ qreal TabBar::row_opacity(LaidOutRow const& row) const
 
 TabBar::LaidOutRow const* TabBar::laid_out_row_of_tab(int index) const
 {
-    if (!uses_sidebar_rows() || !m_tab_widget || index < pinned_tab_count())
+    if (!uses_sidebar_rows() || !m_tab_widget || index < 0)
         return nullptr;
     auto* tab = m_tab_widget->tab(index);
     if (!tab)
@@ -984,9 +985,11 @@ int TabBar::sidebar_row_indent(size_t depth) const
 QRect TabBar::sidebar_row_rect(LaidOutRow const& row, PinnedRegion const& region) const
 {
     auto indent = sidebar_row_indent(row.row.row.depth);
+    bool upper = row.row.row.depth || row.row.row.item.is_folder();
+    auto origin = upper ? region.tile_height : region.height - region.folder_rows * VERTICAL_TAB_HEIGHT;
     return {
         vertical_tabs_left() + indent,
-        qRound(VERTICAL_TAB_BAR_END_ROOM + region.height + displayed_row_y(row) - m_scroll_offset),
+        qRound(VERTICAL_TAB_BAR_END_ROOM + origin + displayed_row_y(row) - (upper && !region.scrolls ? 0 : m_scroll_offset)),
         max(0, vertical_bar_width() - indent),
         VERTICAL_TAB_HEIGHT,
     };
@@ -1001,7 +1004,7 @@ QRect TabBar::sidebar_rect_for_tab(int index, PinnedRegion const& region) const
 int TabBar::sidebar_content_height() const
 {
     if (uses_sidebar_rows())
-        return static_cast<int>(m_sidebar_rows.size()) * VERTICAL_TAB_HEIGHT;
+        return (static_cast<int>(m_sidebar_rows.size()) - pinned_region().folder_rows) * VERTICAL_TAB_HEIGHT;
     return max(0, count() - pinned_tab_count()) * VERTICAL_TAB_HEIGHT;
 }
 
@@ -1009,7 +1012,7 @@ int TabBar::sidebar_tab_index_at(QPoint const& position, PinnedRegion const& reg
 {
     if (!uses_sidebar_rows())
         return -1;
-    for (int index = region.count; index < count(); ++index) {
+    for (int index = 0; index < count(); ++index) {
         auto const* row = laid_out_row_of_tab(index);
         if (!row || row->leaving)
             continue;
@@ -1024,7 +1027,7 @@ Optional<TabFolderId> TabBar::folder_at(QPoint const& position) const
     if (!uses_sidebar_rows())
         return {};
     auto region = pinned_region();
-    if (!rect().contains(position) || position.y() < VERTICAL_TAB_BAR_END_ROOM + region.fixed_height())
+    if (!rect().contains(position))
         return {};
     for (auto const& row : m_laid_out_rows) {
         if (row.row.row.item.is_folder() && !row.row.provisional && !row.leaving && sidebar_row_rect(row, region).contains(position))
@@ -1095,7 +1098,9 @@ void TabBar::cancel_folder_name_edit()
 void TabBar::ensure_edited_folder_visible()
 {
     if (auto row = edited_folder_row_rect(); row.has_value()) {
-        auto top = VERTICAL_TAB_BAR_END_ROOM + pinned_region().fixed_height();
+        if (!pinned_region().scrolls)
+            return;
+        auto top = VERTICAL_TAB_BAR_END_ROOM;
         auto bottom = height() - VERTICAL_TAB_BAR_END_ROOM;
         if (row->top() < top)
             set_scroll_offset(m_scroll_offset + row->top() - top);
@@ -1119,7 +1124,7 @@ void TabBar::update_folder_name_editor_geometry()
     }
     auto shape = tab_card_shape_rect(*row);
     auto title = shape.adjusted(VERTICAL_TAB_CONTENT_LEADING_INSET + TAB_ICON_SIZE + HORIZONTAL_TAB_CONTENT_GAP - 2, 3, -TAB_CONTENT_HORIZONTAL_INSET + 2, -3);
-    auto top = VERTICAL_TAB_BAR_END_ROOM + pinned_region().fixed_height();
+    auto top = VERTICAL_TAB_BAR_END_ROOM;
     auto visible = title.intersected(rect().adjusted(0, top, 0, -VERTICAL_TAB_BAR_END_ROOM));
     // An empty QWidget mask means no clipping, so move the field outside the bar when the row is scrolled away.
     m_folder_name_editor->setGeometry(visible.isEmpty() ? title.translated(0, -height() - title.bottom() - 1) : title);
@@ -1158,7 +1163,7 @@ void TabBar::update_folder_glyphs()
         if (!row.row.item.is_folder())
             continue;
         auto id = row.row.item.id;
-        auto direct = m_row_drag.has_value() && m_hovered_folder == id;
+        auto direct = (m_row_drag.has_value() || m_strip_drag_card) && m_hovered_folder == id;
         FolderIconState state = direct ? FolderIconState { {}, TabFolderTree::FolderGlyph::Open } : FolderIconState { row.icon, row.row.glyph };
         auto old = m_folder_glyphs.constFind(id);
         changed |= old != m_folder_glyphs.constEnd() && old.value() != state;
@@ -1218,7 +1223,7 @@ void TabBar::paint_sidebar_folder_rows(QPainter& painter, QRect const& clip)
         painter.setOpacity(opacity);
         auto shape = sidebar_folder_shape(rect, collapsed);
         auto id = row.row.row.item.id;
-        if (m_row_drag.has_value() && m_hovered_folder == id) {
+        if ((m_row_drag.has_value() || m_strip_drag_card) && m_hovered_folder == id) {
             paint_selected_vertical_tab(painter, Theme::chrome_palette(*this), shape, collapsed ? COLLAPSED_VERTICAL_TAB_RADIUS : VERTICAL_TAB_RADIUS);
         } else if (m_hovered_folder == id || m_pressed_folder == id) {
             painter.setPen(Qt::NoPen);
@@ -1372,7 +1377,7 @@ void TabBar::show_vertical_drag_card(QRect source, int tab_index, SidebarRow con
 {
     clear_vertical_drag_card();
     auto collapsed = tab_layout() == TabLayout::VerticalCollapsed;
-    auto icon_only = collapsed || (tab_index >= 0 && tab_index < pinned_tab_count() && pinned_tabs_are_tiles());
+    auto icon_only = collapsed || (tab_index >= 0 && pinned_region().tiles.contains_slow(tab_index) && pinned_tabs_are_tiles());
     auto radius = tab_drag_card_radius();
     auto layers = static_cast<int>(min(item_count, 3uz));
     auto stack_offset = (layers - 1) * VERTICAL_DRAG_CARD_STACK_STEP;
@@ -1551,6 +1556,262 @@ bool TabBar::start_row_drag(TabFolderTree::Item pressed, Vector<TabFolderTree::I
     return true;
 }
 
+Tab* TabBar::tab_for_item(TabFolderTree::Item item) const
+{
+    if (!item.is_tab() || !m_tab_widget)
+        return nullptr;
+    for (int index = 0; index < count(); ++index) {
+        auto* tab = m_tab_widget->tab(index);
+        if (tab && tab->session_tab_id() == item.id)
+            return tab;
+    }
+    return nullptr;
+}
+
+bool TabBar::pinning_drop_allowed() const
+{
+    if (!m_row_drag.has_value() || m_row_drag->moving.is_empty())
+        return false;
+    // A folder is not a tab: the tiles have no place for one.
+    return !m_row_drag->moving.find_first_index_if([](auto item) { return item.is_folder(); }).has_value();
+}
+
+Optional<int> TabBar::tile_slot_at(QPoint const& position) const
+{
+    auto region = pinned_region();
+    if (region.tile_width <= 0)
+        return {};
+    auto scroll_offset = region.scrolls ? m_scroll_offset : 0;
+    auto y = position.y() - (VERTICAL_TAB_BAR_END_ROOM - scroll_offset);
+    if (y < 0 || y >= region.tile_height)
+        return {};
+    auto x = position.x() - vertical_tabs_left();
+    if (x < 0 || x >= region.columns * region.tile_width)
+        return {};
+    auto row = y / VERTICAL_TAB_HEIGHT;
+    auto column = min(x / region.tile_width, region.columns - 1);
+    auto slot = (row * region.columns) + column;
+    // A tile dropped past the last one joins the end of the grid.
+    return min(slot, static_cast<int>(region.tiles.size()));
+}
+
+QRect TabBar::tile_drop_line(int slot, PinnedRegion const& region) const
+{
+    auto scroll_offset = region.scrolls ? m_scroll_offset : 0;
+    auto cell = clamp(slot, 0, max(0, static_cast<int>(region.tiles.size()) - 1));
+    QRect cell_rect {
+        vertical_tabs_left() + ((cell % region.columns) * region.tile_width),
+        VERTICAL_TAB_BAR_END_ROOM + ((cell / region.columns) * VERTICAL_TAB_HEIGHT) - scroll_offset,
+        region.tile_width,
+        VERTICAL_TAB_HEIGHT,
+    };
+    auto x = slot > cell ? cell_rect.right() : cell_rect.left();
+    return { x, cell_rect.top() + 3, 2, cell_rect.height() - 6 };
+}
+
+
+
+// Where a drag lands among the rows, whether it started on a row or on a pinned tile.
+TabBar::RowDrop TabBar::resolve_row_drop(TabFolderTree const& tree, Vector<TabFolderSync::SidebarRow> const& remaining, Vector<size_t> const& gaps, Vector<TabFolderTree::Item> const& moving, QPoint position, size_t first_depth) const
+{
+    RowDrop drop;
+    auto region = pinned_region();
+    auto scroll_offset = region.scrolls ? m_scroll_offset : 0;
+    // Count only stationary rows for the tree destination, but keep the indicator on the actual edge hit.
+    auto upper = position.y() < VERTICAL_TAB_BAR_END_ROOM + region.height - scroll_offset;
+    auto origin = VERTICAL_TAB_BAR_END_ROOM + (upper ? region.tile_height : region.height - region.folder_rows * VERTICAL_TAB_HEIGHT)
+        - (upper && !region.scrolls ? 0 : m_scroll_offset);
+    auto divider_bottom = VERTICAL_TAB_BAR_END_ROOM + region.height - scroll_offset;
+    bool divider = region.height && position.y() >= divider_bottom - PINNED_TABS_SEPARATOR_HEIGHT && position.y() < divider_bottom;
+    auto row_position = (position.y() - origin) / static_cast<double>(VERTICAL_TAB_HEIGHT);
+    if (upper)
+        row_position = min(row_position, static_cast<double>(region.folder_rows));
+    drop.slot = clamp(qFloor(row_position + 0.5), 0, static_cast<int>(gaps.size()) - 1);
+    auto gap = gaps[drop.slot];
+    auto depth = first_depth + ((position.x() - m_drag_start_position.x()) / static_cast<double>(ROW_DRAG_DEPTH_STEP));
+    auto carries_folders = moving.find_first_index_if([](auto item) { return item.is_folder(); }).has_value();
+    auto separator_y = VERTICAL_TAB_BAR_END_ROOM + region.height - (PINNED_TABS_SEPARATOR_HEIGHT / 2) - scroll_offset;
+
+    // Under the divider there are only the loose rows. The place is the one the pointer is over, at the root, and how far
+    // across the row it is says nothing about depth or about the folder the tab came from.
+    if (region.height > 0 && position.y() >= separator_y && !carries_folders) {
+        auto place = TabFolderDestination::at_end_of({});
+        for (size_t i = min(gap, remaining.size()); i < remaining.size(); ++i) {
+            auto const& row = remaining[i];
+            if (row.depth != 0 || !row.item.is_tab())
+                continue;
+            if (auto position = tree.position_of(row.item); position.has_value())
+                place = *position;
+            break;
+        }
+        if (tree.can_move_items(moving, place)) {
+            drop.depth = 0;
+            drop.destination = place;
+            auto loose_top = VERTICAL_TAB_BAR_END_ROOM + region.height - m_scroll_offset;
+            auto y = loose_top + ((static_cast<int>(drop.slot) - region.folder_rows) * VERTICAL_TAB_HEIGHT);
+            drop.line = { vertical_tabs_left() + 3, y - 1, vertical_bar_width() - 6, 2 };
+        }
+        return drop;
+    }
+
+    Optional<TabFolderDrag::Target> target;
+    auto index = qFloor(row_position);
+    if (rect().contains(position) && index >= 0 && static_cast<size_t>(index) < m_laid_out_rows.size()) {
+        auto const& row = m_laid_out_rows[index];
+        if (row.row.row.item.is_folder() && !row.row.provisional && sidebar_folder_shape(sidebar_row_rect(row, region), tab_layout() == TabLayout::VerticalCollapsed).contains(position)) {
+            drop.folder = row.row.row.item.id;
+            target = TabFolderDrag::target_for_folder(tree, row.row.row, moving, gap);
+        }
+    }
+    if (divider) {
+        drop.folder.clear();
+        auto dest = TabFolderDestination::at_end_of({});
+        if (tree.can_move_items(moving, dest))
+            target = TabFolderDrag::Target { gap, 0, dest };
+    } else if (!drop.folder.has_value()) {
+        target = TabFolderDrag::target_for(tree, remaining, moving, gap, depth);
+    }
+    // The rows above the divider are the folders' own: a tab let go between them would show under the divider, where the
+    // line cannot say. Only folders take those gaps.
+    if (target.has_value() && !drop.folder.has_value() && upper && !carries_folders && target->depth == 0) {
+        drop.refused = true;
+        target.clear();
+    }
+    if (target.has_value()) {
+        drop.depth = target->depth;
+        drop.destination = target->destination;
+    }
+    if (drop.destination.has_value() && !drop.folder.has_value()) {
+        auto indent = sidebar_row_indent(drop.depth);
+        auto y = origin + (static_cast<int>(drop.slot) * VERTICAL_TAB_HEIGHT);
+        drop.line = { vertical_tabs_left() + indent + 3, y - 1, vertical_bar_width() - indent - 6, 2 };
+    }
+    return drop;
+}
+
+Optional<TabBar::FolderDrop> TabBar::folder_drop_at(QPoint const& position) const
+{
+    if (!uses_sidebar_rows() || !dragging_pinned_tab())
+        return {};
+    auto* browser = qobject_cast<BrowserWindow*>(window());
+    if (!browser || !s_active_tab_dragged_tab)
+        return {};
+    auto key = s_active_tab_dragged_tab->session_tab_id();
+    if (!key.has_value())
+        return {};
+
+    auto region = pinned_region();
+    auto scroll_offset = region.scrolls ? m_scroll_offset : 0;
+    // Above the divider the rows are the folders and their tabs; below it they are the loose tabs, which take the tile
+    // by unpinning it instead.
+    auto divider_top = VERTICAL_TAB_BAR_END_ROOM + region.height - PINNED_TABS_SEPARATOR_HEIGHT - scroll_offset;
+    if (position.y() >= divider_top)
+        return {};
+
+    auto const& tree = browser->tab_folders();
+    auto item = TabFolderTree::Item::tab(*key);
+    for (auto const& row : m_laid_out_rows) {
+        if (row.leaving || row.row.provisional || !sidebar_row_rect(row, region).contains(position))
+            continue;
+        // A loose tab of the plain list is not above the divider, so this is a folder or one of its tabs.
+        Optional<TabFolderDestination> destination;
+        Optional<TabFolderId> folder;
+        if (row.row.row.item.is_folder()) {
+            folder = row.row.row.item.id;
+            destination = TabFolderDestination::at_end_of(*folder);
+        } else if (row.row.row.depth > 0) {
+            folder = tree.parent_of(row.row.row.item);
+            destination = tree.position_of(row.row.row.item);
+        }
+        if (!folder.has_value() || !destination.has_value() || !tree.can_move_items({ item }, *destination))
+            return {};
+        return FolderDrop { *folder, *destination };
+    }
+    return {};
+}
+
+TabBar::StripDrop TabBar::strip_drop_at(QPoint const& position) const
+{
+    StripDrop drop;
+    if (tab_layout() == TabLayout::Horizontal)
+        return drop;
+
+    auto region = pinned_region();
+    auto scroll_offset = region.scrolls ? m_scroll_offset : 0;
+
+    if (dragging_pinned_tab()) {
+        // A tile keeps the tiles' places, joins a folder above the divider, and unpins below it. Between the folders and
+        // the divider there is nothing for it: those rows hold folders, and a loose tab shows under the divider.
+        if (tile_slot_at(position).has_value()) {
+            auto tiles = vertical_strip_drop_at(position);
+            drop.kind = StripDrop::Kind::Move;
+            drop.index = tiles.index;
+            drop.line = tiles.line;
+            return drop;
+        }
+        auto separator_y = VERTICAL_TAB_BAR_END_ROOM + region.height - (PINNED_TABS_SEPARATOR_HEIGHT / 2) - scroll_offset;
+        if (position.y() < separator_y) {
+            // The tile reads the same rows as a row drag would, so it lands where a row would.
+            auto rows = plain_rows(m_sidebar_rows);
+            auto gaps = TabFolderDrag::gaps_for_visible_slots(rows, rows);
+            auto key_item = s_active_tab_dragged_tab->session_tab_id();
+            if (key_item.has_value()) {
+                auto resolved = resolve_row_drop(qobject_cast<BrowserWindow*>(window())->tab_folders(), rows, gaps, { TabFolderTree::Item::tab(*key_item) }, position, 0);
+                if (resolved.destination.has_value()) {
+                    drop.kind = StripDrop::Kind::Folder;
+                    drop.folder = resolved.folder;
+                    drop.destination = resolved.destination;
+                    drop.line = resolved.line;
+                }
+            }
+            return drop;
+        }
+        if (auto unpin = unpin_drop_at(position); unpin.has_value()) {
+            drop.kind = StripDrop::Kind::Unpin;
+            drop.index = unpin->index;
+            drop.line = unpin->line;
+        }
+        return drop;
+    }
+
+    // A loose tab pins on the tiles, and otherwise moves along its own rows.
+    if (auto slot = tile_slot_at(position); slot.has_value()) {
+        drop.kind = StripDrop::Kind::Pin;
+        drop.index = *slot;
+        drop.line = tile_drop_line(*slot, region);
+        return drop;
+    }
+    auto tabs = vertical_strip_drop_at(position);
+    drop.kind = StripDrop::Kind::Move;
+    drop.index = tabs.index;
+    drop.line = tabs.line;
+    return drop;
+}
+
+Optional<TabBar::VerticalStripDrop> TabBar::unpin_drop_at(QPoint const& position) const
+{
+    if (!dragging_pinned_tab())
+        return {};
+    auto region = pinned_region();
+    if (region.height == 0)
+        return {};
+    auto scroll_offset = region.scrolls ? m_scroll_offset : 0;
+    // The divider is the line below the tiles and folders: everything below it is the loose tabs. The room above the
+    // line belongs to the folders, and takes nothing from a tab.
+    auto separator_y = VERTICAL_TAB_BAR_END_ROOM + region.height - (PINNED_TABS_SEPARATOR_HEIGHT / 2) - scroll_offset;
+    if (position.y() < separator_y)
+        return {};
+    auto loose_count = uses_sidebar_rows()
+        ? static_cast<int>(m_sidebar_rows.size()) - region.folder_rows
+        : count() - pinned_tab_count();
+    loose_count = max(0, loose_count);
+    auto loose_top = sidebar_rows_origin_y();
+    auto row_position = (position.y() - loose_top) / static_cast<double>(VERTICAL_TAB_HEIGHT);
+    auto row = clamp(qFloor(row_position + 0.5), 0, loose_count);
+    auto line_y = loose_top + (row * VERTICAL_TAB_HEIGHT);
+    return VerticalStripDrop { row, { vertical_tabs_left() + 3, line_y - 1, vertical_bar_width() - 6, 2 } };
+}
+
 void TabBar::retarget_row_drag()
 {
     VERIFY(m_row_drag.has_value());
@@ -1561,36 +1822,30 @@ void TabBar::retarget_row_drag()
     auto const& tree = browser_window->tab_folders();
     auto position = drag.last_position;
     auto region = pinned_region();
-    // Count only stationary rows for the tree destination, but keep the indicator on the actual edge hit.
-    auto row_position = (position.y() - sidebar_rows_origin_y()) / static_cast<double>(VERTICAL_TAB_HEIGHT);
-    drag.indicator_slot = clamp(qFloor(row_position + 0.5), 0, static_cast<int>(m_sidebar_rows.size()));
-    auto gap = drag.gaps[drag.indicator_slot];
-    auto depth = drag.first_depth + ((position.x() - m_drag_start_position.x()) / static_cast<double>(ROW_DRAG_DEPTH_STEP));
-    Optional<TabFolderDrag::Target> target;
-    Optional<TabFolderId> folder;
-    auto index = qFloor(row_position);
-    if (rect().contains(position) && position.y() >= VERTICAL_TAB_BAR_END_ROOM + region.fixed_height() && index >= 0 && static_cast<size_t>(index) < m_laid_out_rows.size()) {
-        auto const& row = m_laid_out_rows[index];
-        if (row.row.row.item.is_folder() && !row.row.provisional && sidebar_folder_shape(sidebar_row_rect(row, region), tab_layout() == TabLayout::VerticalCollapsed).contains(position)) {
-            folder = row.row.row.item.id;
-            target = TabFolderDrag::target_for_folder(tree, row.row.row, drag.moving, gap);
-        }
+
+    // A tab dropped on the pinned tiles pins there: a loose one for the first time, one that a folder still holds by
+    // coming back out of it.
+    auto tabs_to_pin = Vector<Tab*> {};
+    for (auto item : drag.moving) {
+        auto* tab = tab_for_item(item);
+        if (!tab)
+            break;
+        tabs_to_pin.append(tab);
     }
-    if (!folder.has_value())
-        target = TabFolderDrag::target_for(tree, drag.remaining, drag.moving, gap, depth);
-    set_hovered_folder(target.has_value() ? folder : Optional<TabFolderId> {});
-    drag.destination.clear();
-    if (target.has_value()) {
-        drag.depth = target->depth;
-        drag.destination = target->destination;
+    drag.pin_slot = tabs_to_pin.size() == drag.moving.size() && !tabs_to_pin.is_empty() ? tile_slot_at(position) : Optional<int> {};
+    if (drag.pin_slot.has_value()) {
+        set_hovered_folder({});
+        drag.destination.clear();
+        set_vertical_drop_indicator(tile_drop_line(*drag.pin_slot, region));
+        return;
     }
-    if (drag.destination.has_value() && !m_hovered_folder.has_value()) {
-        auto indent = sidebar_row_indent(drag.depth);
-        auto y = sidebar_rows_origin_y() + drag.indicator_slot * VERTICAL_TAB_HEIGHT;
-        set_vertical_drop_indicator({ vertical_tabs_left() + indent + 3, y - 1, vertical_bar_width() - indent - 6, 2 });
-    } else {
-        set_vertical_drop_indicator({});
-    }
+
+    auto resolved = resolve_row_drop(tree, drag.remaining, drag.gaps, drag.moving, position, drag.first_depth);
+    drag.indicator_slot = static_cast<int>(resolved.slot);
+    drag.depth = resolved.depth;
+    drag.destination = resolved.destination;
+    set_hovered_folder(resolved.destination.has_value() ? resolved.folder : Optional<TabFolderId> {});
+    set_vertical_drop_indicator(resolved.line);
 }
 
 void TabBar::update_row_drag(QPoint position, bool allow_detach)
@@ -1673,7 +1928,16 @@ void TabBar::end_row_drag(bool drop)
     set_hovered_folder({});
     update_folder_glyphs();
 
-    if (drop && drag.destination.has_value()) {
+    if (drop && drag.pin_slot.has_value()) {
+        if (browser_window) {
+            Vector<Tab*> tabs;
+            for (auto item : drag.moving) {
+                if (auto* tab = tab_for_item(item))
+                    tabs.append(tab);
+            }
+            browser_window->pin_tabs(tabs, *drag.pin_slot);
+        }
+    } else if (drop && drag.destination.has_value()) {
         if (browser_window) {
             auto const& tree = browser_window->tab_folders();
             if (tree.has_folders()) {
@@ -2048,7 +2312,7 @@ void TabBar::paintEvent(QPaintEvent*)
         if (m_hovered_tab_index != m_hover_animation_tab_index)
             paint_hover_shape(m_hovered_tab_index);
     } else {
-        paint_sidebar_folder_rows(painter, unpinned_clip);
+        paint_sidebar_folder_rows(painter, rect());
     }
 
     auto previously_selected_index = m_previously_selected_tab && m_tab_widget ? m_tab_widget->index_of(m_previously_selected_tab) : -1;
@@ -2060,7 +2324,8 @@ void TabBar::paintEvent(QPaintEvent*)
         // Unpinned tabs scroll under the pinned ones, so they never paint over them. The clips that each tab's title sets
         // later intersect with this one, rather than replacing it.
         if (is_vertical) {
-            if (index >= pinned_count)
+            auto* row = laid_out_row_of_tab(index);
+            if (!region.tiles.contains_slow(index) && !(row && row->row.row.depth))
                 painter.setClipRect(unpinned_clip);
             else
                 painter.setClipping(false);
@@ -2082,7 +2347,7 @@ void TabBar::paintEvent(QPaintEvent*)
         bool is_hovered = hover_progress > 0.0;
         auto is_folder_selected = is_vertical && is_selected_sidebar_tab(index);
         // A pinned tab is a tile that shows only its favicon, except where the pinned tabs keep their rows.
-        auto is_pinned_tile = index < pinned_count && pinned_tabs_are_tiles();
+        auto is_pinned_tile = (is_vertical ? region.tiles.contains_slow(index) : index < pinned_count) && pinned_tabs_are_tiles();
 
         QRectF shape_rect;
         if (is_collapsed_vertical)
@@ -2361,7 +2626,7 @@ void TabBar::paintEvent(QPaintEvent*)
     painter.setClipping(false);
     if (is_vertical && m_vertical_drop_line.isValid()) {
         painter.save();
-        auto clip = !m_row_drag.has_value() && dragging_pinned_tab() ? rect() : unpinned_clip;
+        auto clip = m_row_drag.has_value() || dragging_pinned_tab() ? rect() : unpinned_clip;
         painter.setClipRect(clip);
         auto line = displayed_vertical_drop_indicator();
         auto color = Theme::chrome(*this).muted;
@@ -2401,7 +2666,7 @@ void TabBar::paintEvent(QPaintEvent*)
         if (m_scroll_offset < max_scroll_offset())
             paint_fade(width() - HORIZONTAL_TAB_STRIP_FADE_WIDTH, true);
     }
-    if (is_vertical && (region.count > 0 || pinned_region_growth > 0)) {
+    if (is_vertical && (region.height > 0 || pinned_region_growth > 0)) {
         painter.setPen(Theme::chrome(*this).separator);
         auto separator_y = VERTICAL_TAB_BAR_END_ROOM + region.height + pinned_region_growth - (PINNED_TABS_SEPARATOR_HEIGHT / 2) - (region.scrolls ? m_scroll_offset : 0);
         painter.drawLine(QPoint(10, separator_y), QPoint(width() - 10, separator_y));
@@ -2669,17 +2934,33 @@ void TabBar::mouseReleaseEvent(QMouseEvent* event)
 
     if (m_strip_drag_card && event->button() == Qt::LeftButton) {
         auto dragged_tab = s_active_tab_dragged_tab;
-        auto drop_index = drop_index_at(event->pos());
+        auto drop = strip_drop_at(event->pos());
         auto vertical = m_vertical_drag_cursor_active;
         end_strip_drag(vertical);
         if (auto* source_window = qobject_cast<BrowserWindow*>(window()); source_window && dragged_tab) {
-            if (auto current_index = source_window->tab_index(dragged_tab); current_index >= 0) {
-                source_window->move_tab_to_window(current_index, *source_window, drop_index);
-                if (vertical) {
-                    auto new_index = source_window->tab_index(dragged_tab);
-                    if (new_index >= 0 && new_index != current_index)
-                        land_vertical_drag_card(visual_tab_rect(new_index));
-                }
+            auto current_index = source_window->tab_index(dragged_tab);
+            switch (drop.kind) {
+            case StripDrop::Kind::Unpin:
+                source_window->unpin_tab_at(*dragged_tab, drop.index);
+                break;
+            case StripDrop::Kind::Pin:
+                source_window->pin_tab(*dragged_tab, drop.index);
+                break;
+            case StripDrop::Kind::Folder:
+                if (auto key = dragged_tab->session_tab_id(); key.has_value() && drop.destination.has_value())
+                    source_window->move_tab_folder_items({ TabFolderTree::Item::tab(*key) }, *drop.destination);
+                break;
+            case StripDrop::Kind::Move:
+                if (current_index >= 0)
+                    source_window->move_tab_to_window(current_index, *source_window, drop.index);
+                break;
+            case StripDrop::Kind::None:
+                break;
+            }
+            if (vertical) {
+                auto new_index = source_window->tab_index(dragged_tab);
+                if (new_index >= 0 && new_index != current_index)
+                    land_vertical_drag_card(visual_tab_rect(new_index));
             }
         }
         if (vertical) {
@@ -2862,10 +3143,25 @@ int TabBar::drop_index_at(QPoint const& position) const
 void TabBar::update_drop_preview(QPoint const& position)
 {
     if (tab_layout() != TabLayout::Horizontal) {
-        auto drop = vertical_strip_drop_at(position);
-        m_drop_slot = drop.index;
-        set_vertical_drop_indicator(drop.line);
-        return;
+        m_drop_slot = {};
+        auto drop = strip_drop_at(position);
+        set_hovered_folder(drop.folder);
+        switch (drop.kind) {
+        case StripDrop::Kind::Move:
+            m_drop_slot = drop.index;
+            set_vertical_drop_indicator(drop.line);
+            return;
+        case StripDrop::Kind::Pin:
+        case StripDrop::Kind::Unpin:
+            set_vertical_drop_indicator(drop.line);
+            return;
+        case StripDrop::Kind::Folder:
+            set_vertical_drop_indicator(drop.line);
+            return;
+        case StripDrop::Kind::None:
+            set_vertical_drop_indicator({});
+            return;
+        }
     }
     set_drop_slot(drop_slot_at(position));
 }
@@ -2970,7 +3266,7 @@ TabBar::DropPreview TabBar::drop_preview_for_slot(Optional<int> slot) const
         move_to(index, incoming_drop_layout_rect(index < *slot ? index : index + 1));
     if (tab_layout() != TabLayout::Horizontal) {
         auto region = pinned_region();
-        auto incoming_region = pinned_region_for(region.count + (dragging_pinned_tab() ? 1 : 0));
+        auto incoming_region = pinned_region_for(pinned_tab_count() + (dragging_pinned_tab() ? 1 : 0));
         preview.pinned_region_growth = incoming_region.height - region.height;
         preview.strip_growth = preview.pinned_region_growth + (dragging_pinned_tab() ? 0 : VERTICAL_TAB_HEIGHT);
     } else if (count() > 0) {
@@ -3303,7 +3599,7 @@ void TabBar::start_tab_drag(int index, QPoint position)
         return;
 
     // An unpinned tab in the folder sidebar drags along the rows, with the rest of its selection when it's part of one.
-    if (uses_sidebar_rows() && index >= pinned_tab_count()) {
+    if (uses_sidebar_rows()) {
         if (auto const* row = laid_out_row_of_tab(index); row && !row->leaving) {
             auto item = row->row.row.item;
             if (start_row_drag(item, TabFolderDrag::items_to_drag(item, selected_sidebar_items()), position))
@@ -3472,6 +3768,7 @@ void TabBar::end_strip_drag(bool keep_vertical_card)
     s_active_tab_drag_source = nullptr;
     s_active_tab_dragged_tab = nullptr;
     m_pressed_tab = nullptr;
+    set_hovered_folder({});
     update_tab_button_geometry();
     update();
 }
@@ -3663,7 +3960,28 @@ TabBar::PinnedRegion TabBar::pinned_region_for(int pinned_count) const
         return region;
 
     region.count = pinned_count;
-    if (region.count == 0)
+    auto* browser = uses_sidebar_rows() ? qobject_cast<BrowserWindow*>(window()) : nullptr;
+    for (int i = 0; i < pinned_count; ++i) {
+        auto* tab = m_tab_widget && i < count() ? m_tab_widget->tab(i) : nullptr;
+        if (browser && tab && tab->session_tab_id().has_value() && browser->tab_folders().parent_of(TabFolderTree::Item::tab(*tab->session_tab_id())).has_value())
+            continue;
+        region.tiles.append(i);
+    }
+    if (uses_sidebar_rows()) {
+        for (auto const& row : m_sidebar_rows) {
+            if (!row.row.depth && row.row.item.is_tab())
+                break;
+            ++region.folder_rows;
+        }
+        // A pinned tab inside a folder shows as its row, so only the others are tiles.
+        region.count = static_cast<int>(region.tiles.size());
+    }
+    auto tile_count = static_cast<int>(region.tiles.size());
+    // With no tile at all, the rows still need the first tile's place to land in while one of them is dragged, so the
+    // top of the sidebar opens for it.
+    if (tile_count == 0 && region.folder_rows > 0 && pinning_drop_allowed())
+        tile_count = 1;
+    if (!tile_count && !region.folder_rows)
         return region;
 
     auto bar_width = vertical_bar_width();
@@ -3676,7 +3994,7 @@ TabBar::PinnedRegion TabBar::pinned_region_for(int pinned_count) const
         region.tile_width = bar_width / region.columns;
     }
 
-    auto rows = (region.count + region.columns - 1) / region.columns;
+    auto rows = (tile_count + region.columns - 1) / region.columns;
     // NB: The sidebar keeps its open layout while it closes, and takes it at once as it opens, so the tiles move
     //     between their grid at the open sidebar's width and the column at the collapsed sidebar's width as it toggles.
     //     A tile that followed the sidebar's width on the way would grow before it shrinks.
@@ -3684,10 +4002,11 @@ TabBar::PinnedRegion TabBar::pinned_region_for(int pinned_count) const
         region.collapsedness = m_tab_widget->vertical_tabs_toggle_collapsedness();
         region.tile_width = m_tab_widget->vertical_tabs_toggle_open_tab_width() / region.columns;
         region.collapsed_row_width = m_tab_widget->vertical_tabs_toggle_collapsed_tab_width();
-        region.height = qRound(((rows + ((region.count - rows) * region.collapsedness)) * VERTICAL_TAB_HEIGHT)) + PINNED_TABS_SEPARATOR_HEIGHT;
+        region.tile_height = qRound(((rows + ((tile_count - rows) * region.collapsedness)) * VERTICAL_TAB_HEIGHT));
     } else {
-        region.height = (rows * VERTICAL_TAB_HEIGHT) + PINNED_TABS_SEPARATOR_HEIGHT;
+        region.tile_height = rows * VERTICAL_TAB_HEIGHT;
     }
+    region.height = region.tile_height + region.folder_rows * VERTICAL_TAB_HEIGHT + PINNED_TABS_SEPARATOR_HEIGHT;
     region.scrolls = region.height > height() / 2;
     return region;
 }
@@ -3710,7 +4029,8 @@ QRect TabBar::visual_tab_rect(int index) const
 QRect TabBar::vertical_tab_rect(int index, PinnedRegion const& region) const
 {
     // While the pinned tabs stay in place, only the unpinned list scrolls, under them.
-    if (index < region.count) {
+    if (auto slot = region.tiles.find_first_index(index); slot.has_value()) {
+        index = static_cast<int>(*slot);
         auto row = index / region.columns;
         auto column = index % region.columns;
         auto scroll_offset = region.scrolls ? m_scroll_offset : 0;
@@ -3754,12 +4074,19 @@ int TabBar::tab_index_at(QPoint const& position) const
         return -1;
     auto pinned_y = y + (region.scrolls ? m_scroll_offset : 0);
     if (pinned_y < region.height) {
+        if (pinned_y >= region.tile_height && pinned_y < region.height - PINNED_TABS_SEPARATOR_HEIGHT) {
+            for (auto const& row : m_laid_out_rows) {
+                if (row.row.tab && row.row.row.depth && sidebar_row_rect(row, region).contains(position))
+                    return m_tab_widget->index_of(row.row.tab);
+            }
+            return -1;
+        }
         if (pinned_y >= region.height - PINNED_TABS_SEPARATOR_HEIGHT)
             return -1;
         // NB: Tiles on their way between the grid and the column are found by where they are drawn. Where they overlap,
         //     the later tile is drawn on top, so it is found first.
         if (region.collapsedness > 0) {
-            for (int index = region.count - 1; index >= 0; --index) {
+            for (auto index : region.tiles.in_reverse()) {
                 if (vertical_tab_rect(index, region).contains(position))
                     return index;
             }
@@ -3771,7 +4098,7 @@ int TabBar::tab_index_at(QPoint const& position) const
         auto row = pinned_y / VERTICAL_TAB_HEIGHT;
         auto column = min(x / region.tile_width, region.columns - 1);
         auto index = (row * region.columns) + column;
-        return index < region.count ? index : -1;
+        return static_cast<size_t>(index) < region.tiles.size() ? region.tiles[index] : -1;
     }
 
     if (uses_sidebar_rows())
@@ -3838,7 +4165,8 @@ void TabBar::ensure_tab_visible(int index)
     // A pinned tab that stays in place is always in view. Other rows use their actual rect, which also accounts for
     // folders hiding tabs and for the active-tab preview.
     auto region = pinned_region();
-    if (index < region.count && !region.scrolls)
+    auto* row = laid_out_row_of_tab(index);
+    if (!region.scrolls && (region.tiles.contains_slow(index) || (row && row->row.row.depth)))
         return;
     auto rect = visual_tab_rect(index);
     if (rect.isEmpty())
@@ -4107,7 +4435,8 @@ void TabBar::update_tab_button_geometry()
         }
 
         // An unpinned tab scrolled under the pinned tabs keeps its buttons out of sight.
-        if (region.count > 0 && !region.scrolls && index >= region.count && tab_rect.top() < region.height) {
+        auto* row = laid_out_row_of_tab(index);
+        if (!region.scrolls && !region.tiles.contains_slow(index) && !(row && row->row.row.depth) && tab_rect.top() < region.height) {
             for (auto* button : { close_button, speaker, static_cast<QWidget*>(microphone) }) {
                 if (button && button->isVisible())
                     button->setVisible(false);
@@ -4120,7 +4449,7 @@ void TabBar::update_tab_button_geometry()
             place_collapsed_button(index, speaker, shape_rect);
             place_collapsed_button(index, close_button, shape_rect);
             place_collapsed_button(index, microphone, shape_rect);
-        } else if (index < region.count && pinned_tabs_are_tiles()) {
+        } else if (region.tiles.contains_slow(index) && pinned_tabs_are_tiles()) {
             prepare_button(speaker, TabBarButton::Placement::Tab);
             prepare_button(microphone, TabBarButton::Placement::Tab);
             center_indicators_in(microphone, speaker, tab_rect);

@@ -180,8 +180,16 @@ public:
     int pinned_tab_count() const;
     // The tab joins the end of the pinned group, or the place in it that pinned_index gives.
     void pin_tab(Tab&, Optional<int> pinned_index = {});
+    // The tabs join the pinned group one after the other, from the place that pinned_index gives.
+    void pin_tabs(Vector<Tab*> const&, int pinned_index);
     // The tab joins the start of the unpinned group.
     void unpin_tab(Tab&);
+    // The tab unpins into the row among the loose tabs that takes it: the unpinned root tabs, in the folders' order.
+    void unpin_tab_at(Tab&, int row);
+    // The tab unpins where the tree already holds it, without the strip's order pulling it beside a neighbor.
+    void unpin_tab_where_it_is(Tab&);
+    // A pinned tab is a tile and has no close button; a pinned tab in a folder is one of its rows, and has one.
+    bool tab_shows_close_button(Tab&) const;
     void activate_first_unpinned_tab();
 
     Tab& create_new_tab(Web::HTML::ActivateTab activate_tab, TabLocation);
