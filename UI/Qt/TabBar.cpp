@@ -1222,6 +1222,13 @@ void TabBar::paint_strip_groups(QPainter& painter)
             if (tab_rect.isValid())
                 right = max(right, qRound(horizontal_selected_tab_body_rect(QRectF(tab_rect), horizontal_tab_end_room(index)).right()));
         }
+        // shifted_tab_rect excludes the lifted member. Its provisional slot is still part of this
+        // group's underline exactly when releasing here would place it in this subtree.
+        if (m_horizontal_gap_end.has_value() && m_horizontal_landing.has_value() && !m_horizontal_landing->on_chip() && !m_horizontal_landing->pin_slot.has_value()) {
+            auto parent = m_horizontal_landing->destination.parent;
+            if (parent.has_value() && chip_in_subtree(*parent, chip.folder))
+                right = max(right, *m_horizontal_gap_end);
+        }
         if (right > chip_rect->right() + 1) {
             // Reserve the bottom lane for the root group so subgroup colors cannot interrupt its span.
             auto y = HORIZONTAL_TAB_HEIGHT - STRIP_GROUP_UNDERLINE_THICKNESS - HORIZONTAL_TAB_CARD_SHAPE_BOTTOM_INSET;
@@ -3157,6 +3164,7 @@ void TabBar::dragEnterEvent(QDragEnterEvent* event)
         return;
     }
 
+    update_drop_preview(event->position().toPoint());
     event->setDropAction(Qt::MoveAction);
     event->accept();
 }
@@ -3188,8 +3196,7 @@ void TabBar::dropEvent(QDropEvent* event)
         return;
     }
 
-    s_pending_tab_drop_target = m_tab_widget;
-    s_pending_tab_drop_index = drop_index_at(event->position().toPoint());
+    record_native_drop(event->position().toPoint());
 
     // NB: The drop preview stays up until the tab has actually moved, so the other tabs never jump back to their old
     //     places first.
@@ -3650,7 +3657,7 @@ Optional<TabBar::HorizontalLanding> TabBar::horizontal_landing_at(QPoint point) 
     };
     auto beside = [&](Item item, bool after, int x) -> Optional<HorizontalLanding> {
         auto destination = HorizontalDrop::beside(tree, item, after);
-        if (!destination.has_value() || m_horizontal_moving.contains_slow(item))
+        if (!destination.has_value() || (m_horizontal_moving.contains_slow(item) && (folder_drag || m_horizontal_moving.size() != 1)))
             return {};
         return target(*destination, gap(x));
     };
@@ -3699,6 +3706,15 @@ Optional<TabBar::HorizontalLanding> TabBar::horizontal_landing_at(QPoint point) 
         }
         return target(TabFolderDestination::at_end_of(chip.folder), *rect);
     }
+    // Pin tiles and chip bodies above are explicit pointer targets. For a member sliding between slots,
+    // compare the center of its painted body (not the grip or its shadow) to the settled boundaries.
+    // The source slot is a legal no-op: beside(self) preserves both sibling index and membership.
+    if (m_horizontal_moving.size() == 1 && !folder_drag && tree.parent_of(m_horizontal_moving.first()).has_value()) {
+        if (auto* tab = tab_for_item(m_horizontal_moving.first())) {
+            auto index = m_tab_widget->index_of(tab);
+            point.setX(point.x() - m_position_in_selected_tab_while_dragging.x() + m_tab_drag_card_offset.x() + tab_drag_card_rect(index).width() / 2);
+        }
+    }
     auto walk = [&](auto& self, Optional<TabFolderId> parent) -> Optional<HorizontalLanding> {
         int last_edge = pins ? visual_tab_rect(pins - 1).right() + 1 : 0;
         for (auto item : tree.children(parent)) {
@@ -3733,18 +3749,64 @@ Optional<TabBar::HorizontalLanding> TabBar::horizontal_landing_at(QPoint point) 
     return walk(walk, {});
 }
 
+void TabBar::record_native_drop(QPoint position)
+{
+    s_pending_tab_drop_target = m_tab_widget;
+    s_pending_tab_drop_index = drop_index_at(position);
+    if (m_native_horizontal_drag) {
+        update_drop_preview(position);
+        m_native_horizontal_drag->dropped = m_horizontal_landing;
+    }
+}
+
+void TabBar::update_horizontal_landing(QPoint position)
+{
+    if (m_horizontal_landing_position == position)
+        return;
+    m_horizontal_landing_position = position;
+    auto landing = horizontal_landing_at(position);
+    auto changed = landing.has_value() != m_horizontal_landing.has_value() || (landing.has_value() && (landing->anchor != m_horizontal_landing->anchor || landing->pin_slot != m_horizontal_landing->pin_slot));
+    m_horizontal_landing = landing;
+    if (changed) {
+        // Freeze the displaced strip when its chip becomes the target. Moving it back would take the
+        // destination away from the pointer before release.
+        animate_drop_preview(landing.has_value() && landing->on_chip() ? current_drop_preview() : horizontal_drop_preview());
+    }
+    update();
+}
+
 void TabBar::update_drop_preview(QPoint const& position)
 {
-    if (!m_horizontal_moving.is_empty()) {
-        auto landing = horizontal_landing_at(position);
-        auto changed = landing.has_value() != m_horizontal_landing.has_value() || (landing.has_value() && (landing->anchor != m_horizontal_landing->anchor || landing->pin_slot != m_horizontal_landing->pin_slot));
-        m_horizontal_landing = landing;
-        if (changed) {
-            // Freeze the displaced strip when its chip becomes the target. Moving it back would take the
-            // destination away from the pointer before release.
-            animate_drop_preview(landing.has_value() && landing->on_chip() ? current_drop_preview() : horizontal_drop_preview());
+    if (m_native_horizontal_drag && tab_layout() == TabLayout::Horizontal && dragged_tab_index().has_value()) {
+        if (!m_tab_widget->tab_drop_area_contains(*this, position)) {
+            leave_native_rail();
+            return;
         }
-        update();
+        auto& state = *m_native_horizontal_drag;
+        if (auto key = s_active_tab_dragged_tab->session_tab_id(); key.has_value()) {
+            if (!state.rail_card->isVisible()) {
+                // Qt Wayland snapshots QDrag's pixmap when exec starts. Keep the same native drag and input
+                // serial, minimizing its raster icon underneath the hand while the rail paints its own card.
+                for (auto* icon : QGuiApplication::topLevelWindows()) {
+                    if (icon->inherits("QShapedPixmapWindow") && icon->isVisible()) {
+                        state.icon_window = icon;
+                        state.icon_size = icon->size();
+                        icon->resize(1, 1);
+                        break;
+                    }
+                }
+                m_horizontal_moving = { TabFolderTree::Item::tab(*key) };
+                state.rail_card->show();
+                state.rail_card->raise();
+            }
+            update_horizontal_landing(position);
+            position_horizontal_card(*state.rail_card, position);
+            update_tab_button_geometry();
+            return;
+        }
+    }
+    if (!m_horizontal_moving.is_empty()) {
+        update_horizontal_landing(position);
         return;
     }
     if (tab_layout() != TabLayout::Horizontal) {
@@ -3798,8 +3860,26 @@ TabBar::VerticalStripDrop TabBar::vertical_strip_drop_at(QPoint const& position)
     return result;
 }
 
+void TabBar::leave_native_rail()
+{
+    auto* state = m_native_horizontal_drag;
+    if (!state || !state->rail_card || state->rail_card->isHidden())
+        return;
+    state->rail_card->hide();
+    if (state->icon_window)
+        state->icon_window->resize(state->icon_size);
+    state->icon_window.clear();
+    m_horizontal_moving.clear();
+    m_horizontal_landing_position.clear();
+    m_horizontal_landing.clear();
+    m_horizontal_gap_end.clear();
+    clear_drop_preview();
+    m_tab_widget->place_horizontal_new_tab_button(true);
+}
+
 void TabBar::hide_drop_preview()
 {
+    leave_native_rail();
     if (tab_layout() != TabLayout::Horizontal) {
         m_drop_slot.clear();
         set_vertical_drop_indicator({});
@@ -4202,9 +4282,12 @@ Optional<int> TabBar::horizontal_drag_end() const
                 end = max(end, min(width(), rect->right() + 1));
         }
     }
-    if (m_strip_drag_card) {
+    auto* card = m_strip_drag_card;
+    if (m_native_horizontal_drag && m_native_horizontal_drag->rail_card && !m_native_horizontal_drag->rail_card->isHidden())
+        card = m_native_horizontal_drag->rail_card;
+    if (card) {
         // Lifted cards have shadow padding on both sides; it isn't visible tab content.
-        auto right = m_strip_drag_card->mapToGlobal(QPoint(m_strip_drag_card->width() - TAB_DRAG_IMAGE_MARGIN, 0));
+        auto right = card->mapToGlobal(QPoint(card->width() - TAB_DRAG_IMAGE_MARGIN, 0));
         end = max(end, mapFromGlobal(right).x());
         if (m_horizontal_gap_end.has_value() && m_horizontal_landing.has_value() && !m_horizontal_landing->on_chip())
             end = max(end, min(width(), *m_horizontal_gap_end) - HORIZONTAL_TAB_END_ROOM);
@@ -4370,8 +4453,28 @@ void TabBar::drag_tab_loose(Tab& tab, QPixmap card)
     mime_data->setData(LADYBIRD_TAB_MIME_TYPE, QByteArray {});
     drag->setMimeData(mime_data);
     auto horizontal = tab_layout() == TabLayout::Horizontal;
+    NativeHorizontalDrag native;
     if (horizontal) {
         auto index = m_tab_widget->index_of(&tab);
+        if (tab.is_pinned()) {
+            // The captured source is a tile. Outside a pin target a returning tile previews an ordinary tab.
+            QSize size(visible_unpinned_tab_count() ? horizontal_tab_share() : HORIZONTAL_TAB_MAX_WIDTH, tab_drag_card_rect(index).height());
+            auto regular = lift_drag_card(size, tab_drag_card_radius(), [&](QPainter& painter) {
+                auto icon = tabIcon(index);
+                QRect icon_rect(TAB_CONTENT_HORIZONTAL_INSET, (size.height() - TAB_ICON_SIZE) / 2, TAB_ICON_SIZE, TAB_ICON_SIZE);
+                (icon.isNull() ? m_fallback_tab_icon : icon).paint(&painter, icon_rect);
+                auto text = QRect(QPoint(), size).adjusted(icon_rect.right() + TAB_CONTENT_HORIZONTAL_INSET, 0, -TAB_CONTENT_HORIZONTAL_INSET, 0);
+                painter.setFont(ChromeStyle::chrome_title_font(font()));
+                painter.setPen(Theme::chrome(*this).text);
+                painter.drawText(text, Qt::AlignVCenter | Qt::AlignLeft, painter.fontMetrics().elidedText(tabText(index), Qt::ElideRight, text.width()));
+            });
+            native.rail_card = new TabDragCard(*window(), AK::move(regular));
+            native.rail_card->set_pinned_pixmap(card);
+        } else {
+            native.rail_card = new TabDragCard(*window(), card);
+            prepare_pin_preview(*native.rail_card, index);
+        }
+        m_native_horizontal_drag = &native;
         auto image = compact_drag_image(tab_drag_card_rect(index), index, nullptr, 1);
         // A native drag surface has no widget opacity; composite the entire compact card once, as its overlay does.
         QPixmap translucent(image.pixmap.size());
@@ -4422,12 +4525,20 @@ void TabBar::drag_tab_loose(Tab& tab, QPixmap card)
     //     elsewhere, so a drag canceled there with Escape detaches its tab too.
     auto was_canceled = cancellation_filter.was_canceled();
 
+    if (horizontal) {
+        leave_native_rail();
+        m_native_horizontal_drag = nullptr;
+        delete native.rail_card.data();
+    }
     auto drop_target = s_pending_tab_drop_target;
 
     if (auto* source_window = qobject_cast<BrowserWindow*>(window()); source_window && dragged_tab) {
         if (auto current_index = source_window->tab_index(dragged_tab); current_index >= 0) {
             if (action == Qt::MoveAction && drop_target) {
-                if (auto* target_window = qobject_cast<BrowserWindow*>(drop_target->window()))
+                if (horizontal && drop_target == m_tab_widget && dragged_tab->session_tab_id().has_value()) {
+                    if (native.dropped.has_value())
+                        source_window->apply_horizontal_drop({ TabFolderTree::Item::tab(*dragged_tab->session_tab_id()) }, native.dropped->destination, native.dropped->pin_slot);
+                } else if (auto* target_window = qobject_cast<BrowserWindow*>(drop_target->window()))
                     source_window->move_tab_to_window(current_index, *target_window, s_pending_tab_drop_index);
             } else if (!drop_target && !was_canceled && m_tab_widget->count() > 1) {
                 source_window->detach_tab_to_new_window(current_index, QCursor::pos());
@@ -4481,6 +4592,21 @@ void TabBar::start_chip_drag(TabFolderId folder, QPoint position)
     update_strip_drag(position);
 }
 
+void TabBar::prepare_pin_preview(TabDragCard& card, int index)
+{
+    if (!m_tab_widget->tab(index)->is_pinned()) {
+        auto size = QSize(HORIZONTAL_PINNED_TAB_WIDTH, tab_drag_card_rect(index).height());
+        auto icon = tabIcon(index);
+        auto icon_size = icon.isNull() ? CHROME_ICON_CANVAS_SIZE : TAB_ICON_SIZE;
+        auto const& shown_icon = icon.isNull() ? m_fallback_tab_icon : icon;
+        card.set_pinned_pixmap(lift_drag_card(size, tab_drag_card_radius(), [&](QPainter& painter) {
+            QRect icon_rect(QPoint(), QSize(icon_size, icon_size));
+            icon_rect.moveCenter(QRect(QPoint(), size).center());
+            shown_icon.paint(&painter, icon_rect);
+        }));
+    }
+}
+
 void TabBar::start_strip_drag(int index, QPoint position)
 {
     // NB: The card is drawn once, before the tab is dragged, since the strip leaves a gap where the dragged tab is, and
@@ -4500,17 +4626,7 @@ void TabBar::start_strip_drag(int index, QPoint position)
     } else if (auto key = m_tab_widget->tab(index)->session_tab_id(); key.has_value()) {
         m_horizontal_moving = TabFolderDrag::items_to_drag(TabFolderTree::Item::tab(*key), selected_sidebar_items());
         m_clear_folder_selection_on_release = false;
-        if (!m_tab_widget->tab(index)->is_pinned()) {
-            auto size = QSize(HORIZONTAL_PINNED_TAB_WIDTH, tab_drag_card_rect(index).height());
-            auto icon = tabIcon(index);
-            auto icon_size = icon.isNull() ? CHROME_ICON_CANVAS_SIZE : TAB_ICON_SIZE;
-            auto const& shown_icon = icon.isNull() ? m_fallback_tab_icon : icon;
-            m_strip_drag_card->set_pinned_pixmap(lift_drag_card(size, tab_drag_card_radius(), [&](QPainter& painter) {
-                QRect icon_rect(QPoint(), QSize(icon_size, icon_size));
-                icon_rect.moveCenter(QRect(QPoint(), size).center());
-                shown_icon.paint(&painter, icon_rect);
-            }));
-        }
+        prepare_pin_preview(*m_strip_drag_card, index);
     }
 
     s_active_tab_drag_source = m_tab_widget;
@@ -4533,33 +4649,45 @@ void TabBar::start_strip_drag(int index, QPoint position)
     update_strip_drag(position);
 }
 
+void TabBar::position_horizontal_card(TabDragCard& card, QPoint position)
+{
+    QColor group_color;
+    if (!m_horizontal_moving.is_empty() && m_horizontal_moving.first().is_tab() && m_horizontal_landing.has_value() && m_horizontal_landing->destination.parent.has_value()) {
+        auto parent = *m_horizontal_landing->destination.parent;
+        for (auto const& chip : m_strip_chips) {
+            if (chip.folder == parent) {
+                group_color = TabFolderMenus::folder_color(chip.color, Theme::is_dark(*this));
+                break;
+            }
+        }
+    }
+    card.set_group_color(group_color);
+    if (card.show_pinned_preview(m_horizontal_landing.has_value() && m_horizontal_landing->pin_slot.has_value())) {
+        auto index = m_tab_widget->index_of(s_active_tab_dragged_tab);
+        auto top = index >= 0 ? tab_drag_card_rect(index).top() : HORIZONTAL_TAB_CARD_SHAPE_TOP_INSET;
+        card.move(mapTo(window(), QPoint(position.x() - card.width() / 2, top - TAB_DRAG_IMAGE_MARGIN)));
+        m_tab_widget->place_horizontal_new_tab_button();
+        return;
+    }
+    if (!m_horizontal_moving.is_empty() && (m_horizontal_moving.first().is_folder() || m_horizontal_moving.size() > 1)) {
+        card.move(mapTo(window(), QPoint(position.x() - m_position_in_selected_tab_while_dragging.x(), m_drag_start_position.y() - m_position_in_selected_tab_while_dragging.y())));
+    } else {
+        // The tab stays in its strip, and only slides along it.
+        auto card_rect = tab_drag_card_rect(m_tab_widget->index_of(s_active_tab_dragged_tab));
+        auto card_position = QPoint(position.x() - m_position_in_selected_tab_while_dragging.x() + m_tab_drag_card_offset.x(), card_rect.top());
+        card.move(mapTo(window(), card_position) - QPoint(TAB_DRAG_IMAGE_MARGIN, TAB_DRAG_IMAGE_MARGIN));
+    }
+    m_tab_widget->place_horizontal_new_tab_button();
+}
+
 void TabBar::update_strip_drag(QPoint position)
 {
     if (!m_horizontal_moving.is_empty()) {
         update_drop_preview(position);
-        QColor group_color;
-        if (m_horizontal_moving.first().is_tab() && m_horizontal_landing.has_value() && m_horizontal_landing->destination.parent.has_value()) {
-            auto parent = *m_horizontal_landing->destination.parent;
-            for (auto const& chip : m_strip_chips) {
-                if (chip.folder == parent) {
-                    group_color = TabFolderMenus::folder_color(chip.color, Theme::is_dark(*this));
-                    break;
-                }
-            }
-        }
-        m_strip_drag_card->set_group_color(group_color);
-        if (m_strip_drag_card->show_pinned_preview(m_horizontal_landing.has_value() && m_horizontal_landing->pin_slot.has_value())) {
-            auto index = m_tab_widget->index_of(s_active_tab_dragged_tab);
-            auto top = index >= 0 ? tab_drag_card_rect(index).top() : HORIZONTAL_TAB_CARD_SHAPE_TOP_INSET;
-            m_strip_drag_card->move(mapTo(window(), QPoint(position.x() - m_strip_drag_card->width() / 2, top - TAB_DRAG_IMAGE_MARGIN)));
-            m_tab_widget->place_horizontal_new_tab_button();
+        if (m_horizontal_moving.first().is_folder() || m_horizontal_moving.size() > 1) {
+            position_horizontal_card(*m_strip_drag_card, position);
             return;
         }
-    }
-    if (!m_horizontal_moving.is_empty() && (m_horizontal_moving.first().is_folder() || m_horizontal_moving.size() > 1)) {
-        m_strip_drag_card->move(mapTo(window(), QPoint(position.x() - m_position_in_selected_tab_while_dragging.x(), m_drag_start_position.y() - m_position_in_selected_tab_while_dragging.y())));
-        m_tab_widget->place_horizontal_new_tab_button();
-        return;
     }
     auto dragged_tab = s_active_tab_dragged_tab;
     if (!dragged_tab || m_tab_widget->index_of(dragged_tab) < 0) {
@@ -4578,14 +4706,8 @@ void TabBar::update_strip_drag(QPoint position)
         return;
     }
 
-    if (tab_layout() == TabLayout::Horizontal) {
-        // The tab stays in its strip, and only slides along it.
-        auto card_rect = tab_drag_card_rect(m_tab_widget->index_of(dragged_tab));
-        auto card_position = QPoint(position.x() - m_position_in_selected_tab_while_dragging.x() + m_tab_drag_card_offset.x(), card_rect.top());
-        m_strip_drag_card->move(mapTo(window(), card_position) - QPoint(TAB_DRAG_IMAGE_MARGIN, TAB_DRAG_IMAGE_MARGIN));
-    }
     if (tab_layout() == TabLayout::Horizontal)
-        m_tab_widget->place_horizontal_new_tab_button();
+        position_horizontal_card(*m_strip_drag_card, position);
     if (m_horizontal_moving.is_empty())
         update_drop_preview(position);
     if (m_vertical_drag_cursor_active)
@@ -4605,6 +4727,7 @@ void TabBar::end_strip_drag(bool keep_vertical_card, bool leaving_strip)
     if (!m_horizontal_moving.is_empty())
         clear_drop_preview();
     m_horizontal_moving.clear();
+    m_horizontal_landing_position.clear();
     m_horizontal_landing.clear();
     m_horizontal_gap_end.clear();
     delete m_strip_drag_card;
@@ -6266,7 +6389,7 @@ void TabWidget::dragMoveEvent(QDragMoveEvent* event)
 // strip.
 void TabWidget::dropEvent(QDropEvent* event)
 {
-    accept_tab_drop(event, m_tab_bar->drop_index_at(m_tab_bar->mapFrom(this, event->position().toPoint())));
+    accept_tab_drop(event, m_tab_bar->mapFrom(this, event->position().toPoint()));
 }
 
 bool TabWidget::eventFilter(QObject* watched, QEvent* event)
@@ -6307,7 +6430,7 @@ bool TabWidget::eventFilter(QObject* watched, QEvent* event)
             return true;
         case QEvent::Drop: {
             auto* drop_event = static_cast<QDropEvent*>(event);
-            accept_tab_drop(drop_event, m_tab_bar->drop_index_at(m_tab_bar->mapFrom(tab_strip, drop_event->position().toPoint())));
+            accept_tab_drop(drop_event, m_tab_bar->mapFrom(tab_strip, drop_event->position().toPoint()));
             return true;
         }
         default:
@@ -6490,15 +6613,14 @@ void TabWidget::accept_tab_drag(QDragMoveEvent* event, QWidget* target)
     event->accept();
 }
 
-void TabWidget::accept_tab_drop(QDropEvent* event, int index)
+void TabWidget::accept_tab_drop(QDropEvent* event, QPoint position_in_bar)
 {
     if (!target_can_accept_tab_drop(*this, *event)) {
         event->ignore();
         return;
     }
 
-    s_pending_tab_drop_target = this;
-    s_pending_tab_drop_index = index;
+    m_tab_bar->record_native_drop(position_in_bar);
     event->setDropAction(Qt::MoveAction);
     event->accept();
 }

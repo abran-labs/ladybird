@@ -125,6 +125,7 @@ public:
     int drop_index_at(QPoint const&) const;
     void update_drop_preview(QPoint const&);
     void hide_drop_preview();
+    void record_native_drop(QPoint);
 
     // A row of the vertical sidebar below the pinned tiles: a folder's header, or an unpinned tab, which may be the
     // active tab shown under a collapsed folder. The window lays them out from its folders; a tab with no row is hidden.
@@ -452,6 +453,17 @@ private:
         QRect anchor;
         bool on_chip() const { return anchor.isValid(); }
     };
+    struct NativeHorizontalDrag {
+        QPointer<TabDragCard> rail_card;
+        QPointer<QWindow> icon_window;
+        QSize icon_size;
+        Optional<HorizontalLanding> dropped;
+    };
+    NativeHorizontalDrag* m_native_horizontal_drag { nullptr }; // Only during QDrag::exec() on the source.
+    void leave_native_rail();
+    void update_horizontal_landing(QPoint);
+    void position_horizontal_card(TabDragCard&, QPoint);
+    void prepare_pin_preview(TabDragCard&, int);
     Optional<HorizontalLanding> horizontal_landing_at(QPoint) const;
     DropPreview horizontal_drop_preview();
     bool horizontal_drag_contains(int index) const;
@@ -461,6 +473,7 @@ private:
     void start_chip_drag(TabFolderId, QPoint);
     Vector<TabFolderTree::Item> m_horizontal_moving;
     Optional<HorizontalLanding> m_horizontal_landing;
+    Optional<QPoint> m_horizontal_landing_position;
     Optional<TabFolderId> m_pressed_chip;
     Optional<TabFolderId> m_hovered_chip;
 
@@ -704,7 +717,7 @@ private:
     void toggle_window_maximized();
     bool start_window_move();
     void accept_tab_drag(QDragMoveEvent*, QWidget* target);
-    void accept_tab_drop(QDropEvent*, int index);
+    void accept_tab_drop(QDropEvent*, QPoint position_in_bar);
 
     TabBar* m_tab_bar { nullptr };
     void size_hidden_pages_like_the_current_one();
