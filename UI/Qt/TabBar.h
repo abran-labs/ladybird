@@ -447,6 +447,8 @@ private:
     Optional<int> previous_visible_tab(int index) const;
     Optional<int> next_visible_tab(int index) const;
     void paint_strip_groups(QPainter&);
+    QHash<TabFolderId, QRect> visible_strip_chips() const;
+    int strip_group_content_end(TabFolderId, QHash<TabFolderId, QRect> const&) const;
     Vector<StripChip> m_strip_chips;
     HashMap<Tab const*, TabFolderId> m_strip_group_of_tab;
     HashTable<Tab const*> m_strip_hidden;
@@ -468,6 +470,8 @@ private:
     void leave_native_rail();
     DropPreview detached_horizontal_preview() const;
     void update_horizontal_landing(QPoint);
+    void set_horizontal_landing(Optional<HorizontalLanding>);
+    Optional<HorizontalLanding> separated_group_landing(QPoint, HorizontalLanding const&) const;
     void position_horizontal_card(TabDragCard&, QPoint);
     void prepare_pin_preview(TabDragCard&, int);
     Optional<HorizontalLanding> horizontal_landing_at(QPoint) const;

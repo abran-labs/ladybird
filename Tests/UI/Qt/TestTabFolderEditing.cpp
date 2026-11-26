@@ -135,6 +135,29 @@ TEST_CASE(root_and_subfolder_drafts_do_not_exist_until_accepted)
     EXPECT(!tree.folder(root)->collapsed);
 }
 
+TEST_CASE(first_child_subgroup_previews_and_commits_right_after_the_parent_chip)
+{
+    using Item = TabFolderTree::Item;
+    using TabFolderEditing::FolderCreation;
+    TabFolderTree tree;
+    auto parent = tree.create_folder("Parent"_string).value();
+    EXPECT(tree.add_tab(1, TabFolderDestination::at_end_of(parent)));
+    auto sibling = tree.create_folder("Sibling"_string, TabFolderDestination::at_end_of(parent)).value();
+    auto before = tree.serialize();
+    FolderCreation creation { parent, {}, FolderCreation::Placement::FirstChild };
+
+    auto preview = tree;
+    auto draft = creation.preview(preview).value();
+    auto preview_strip = TabFolderSync::strip_groups(preview, { { 1 } }, {});
+    EXPECT_EQ(preview_strip.chips, (Vector<TabFolderSync::StripGroup> { { parent, 1, false, 0 }, { draft, 1, false, 1 }, { sibling, {}, false, 1 } }));
+    EXPECT_EQ(tree.serialize(), before);
+
+    auto created = creation.commit(tree, "New Subgroup"_string).value();
+    auto committed_strip = TabFolderSync::strip_groups(tree, { { 1 } }, {});
+    EXPECT_EQ(committed_strip.chips, (Vector<TabFolderSync::StripGroup> { { parent, 1, false, 0 }, { created, 1, false, 1 }, { sibling, {}, false, 1 } }));
+    EXPECT_EQ(tree.children(parent), (Vector<Item> { Item::folder(created), Item::tab(1), Item::folder(sibling) }));
+}
+
 TEST_CASE(inline_editor_reports_enter_or_escape_only_once)
 {
     auto exercise = [](int key, Optional<String> expected) {

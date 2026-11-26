@@ -900,6 +900,17 @@ TabBar::TabBar(TabWidget* tab_widget)
     m_drop_preview_animation->setEndValue(1.0);
     connect(m_drop_preview_animation, &QVariantAnimation::valueChanged, this, [this](QVariant const& value) {
         m_drop_preview_progress = value.toReal();
+        // Even a stationary card can separate when the last remaining member slides under it.
+        // Only reconsider the source group's edge, never chase a chip animating past the pointer.
+        if (m_horizontal_landing_position.has_value() && m_horizontal_landing.has_value()) {
+            auto grip = *m_horizontal_landing_position;
+            if (auto loose = separated_group_landing(grip, *m_horizontal_landing); loose.has_value()) {
+                set_horizontal_landing(loose);
+                auto* card = m_native_horizontal_drag ? m_native_horizontal_drag->rail_card.data() : m_strip_drag_card;
+                if (card)
+                    position_horizontal_card(*card, grip);
+            }
+        }
         if (m_drop_preview_start.strip_growth != m_drop_preview_target.strip_growth) {
             updateGeometry();
             if (m_tab_widget && tab_layout() == TabLayout::Horizontal)
@@ -1179,6 +1190,46 @@ void TabBar::set_hovered_chip(Optional<TabFolderId> chip)
     update();
 }
 
+QHash<TabFolderId, QRect> TabBar::visible_strip_chips() const
+{
+    QHash<TabFolderId, QRect> visible_chips;
+    for (auto const& chip : m_strip_chips) {
+        if (!dragging_chip(chip.folder)) {
+            if (auto rect = strip_chip_rect(chip.folder); rect.has_value())
+                visible_chips.insert(chip.folder, *rect);
+        }
+    }
+    return visible_chips;
+}
+
+// Exclusive painted right edge, without the moving card or its provisional gap.
+int TabBar::strip_group_content_end(TabFolderId folder, QHash<TabFolderId, QRect> const& visible_chips) const
+{
+    auto right = visible_chips.value(folder).right() + 1;
+    // Projection is preorder, including the provisional editor which is not in the live tree yet.
+    Optional<size_t> depth;
+    for (auto const& chip : m_strip_chips) {
+        if (chip.folder == folder) {
+            depth = chip.depth;
+        } else if (depth.has_value()) {
+            if (chip.depth <= *depth)
+                break;
+            if (auto rect = visible_chips.constFind(chip.folder); rect != visible_chips.constEnd())
+                right = max(right, rect.value().right() + 1);
+        }
+    }
+    for (int index = 0; index < count(); ++index) {
+        auto* tab = m_tab_widget->tab(index);
+        auto group = m_strip_group_of_tab.get(tab);
+        if (!group.has_value() || !chip_in_subtree(*group, folder) || !is_tab_shown_on_strip(index))
+            continue;
+        auto tab_rect = shifted_tab_rect(index);
+        if (tab_rect.isValid())
+            right = max(right, qRound(horizontal_selected_tab_body_rect(QRectF(tab_rect), horizontal_tab_end_room(index)).right()));
+    }
+    return right;
+}
+
 // Each group's chip, and a line in its color under the chip and the group's shown tabs, as Chromium draws a tab group's
 // header and underline.
 void TabBar::paint_strip_groups(QPainter& painter)
@@ -1190,13 +1241,7 @@ void TabBar::paint_strip_groups(QPainter& painter)
     auto title_font = ChromeStyle::chrome_title_font(font());
     painter.save();
     painter.setRenderHint(QPainter::Antialiasing, true);
-    QHash<TabFolderId, QRect> visible_chips;
-    for (auto const& chip : m_strip_chips) {
-        if (!dragging_chip(chip.folder)) {
-            if (auto rect = strip_chip_rect(chip.folder); rect.has_value())
-                visible_chips.insert(chip.folder, *rect);
-        }
-    }
+    auto visible_chips = visible_strip_chips();
     for (auto const& chip : m_strip_chips) {
         auto found = visible_chips.constFind(chip.folder);
         if (found == visible_chips.constEnd())
@@ -1207,21 +1252,7 @@ void TabBar::paint_strip_groups(QPainter& painter)
         if (inactive && !editing)
             color.setAlphaF(0.7f);
 
-        auto right = chip_rect->right() + 1;
-        // A subgroup is part of its parent's span even if it is empty or all its tabs are hidden.
-        for (auto child = visible_chips.constBegin(); child != visible_chips.constEnd(); ++child) {
-            if (child.key() != chip.folder && chip_in_subtree(child.key(), chip.folder))
-                right = max(right, child.value().right() + 1);
-        }
-        for (int index = 0; index < count(); ++index) {
-            auto* tab = m_tab_widget->tab(index);
-            auto group = m_strip_group_of_tab.get(tab);
-            if (!group.has_value() || !chip_in_subtree(*group, chip.folder) || !is_tab_shown_on_strip(index))
-                continue;
-            auto tab_rect = shifted_tab_rect(index);
-            if (tab_rect.isValid())
-                right = max(right, qRound(horizontal_selected_tab_body_rect(QRectF(tab_rect), horizontal_tab_end_room(index)).right()));
-        }
+        auto right = strip_group_content_end(chip.folder, visible_chips);
         // shifted_tab_rect excludes the lifted member. Its provisional slot is still part of this
         // group's underline exactly when releasing here would place it in this subtree.
         if (m_horizontal_gap_end.has_value() && m_horizontal_landing.has_value() && !m_horizontal_landing->on_chip() && !m_horizontal_landing->pin_slot.has_value()) {
@@ -3733,6 +3764,7 @@ Optional<TabBar::HorizontalLanding> TabBar::horizontal_landing_at(QPoint point) 
         }
         return target(TabFolderDestination::at_end_of(chip.folder), *rect);
     }
+    auto grip = point;
     // Pin tiles and chip bodies above are explicit pointer targets. For a member sliding between slots,
     // compare the center of its painted body (not the grip or its shadow) to the settled boundaries.
     // The source slot is a legal no-op: beside(self) preserves both sibling index and membership.
@@ -3773,7 +3805,49 @@ Optional<TabBar::HorizontalLanding> TabBar::horizontal_landing_at(QPoint point) 
         }
         return target(TabFolderDestination::at_end_of(parent), gap(last_edge));
     };
-    return walk(walk, {});
+    auto landing = walk(walk, {});
+    if (landing.has_value()) {
+        if (auto loose = separated_group_landing(grip, *landing); loose.has_value())
+            return loose;
+    }
+    return landing;
+}
+
+Optional<TabBar::HorizontalLanding> TabBar::separated_group_landing(QPoint grip, HorizontalLanding const& landing) const
+{
+    if (landing.on_chip() || !landing.destination.parent.has_value() || m_horizontal_moving.size() != 1 || !m_horizontal_moving.first().is_tab())
+        return {};
+    auto* tab = tab_for_item(m_horizontal_moving.first());
+    auto folder = *landing.destination.parent;
+    if (!tab || m_strip_group_of_tab.get(tab) != folder)
+        return {}; // Explicit moves into other groups still use their own target.
+    auto card_left = grip.x() - m_position_in_selected_tab_while_dragging.x() + m_tab_drag_card_offset.x();
+    auto chips = visible_strip_chips();
+    if (!chips.contains(folder) || grip.x() <= m_drag_start_position.x() || card_left <= strip_group_content_end(folder, chips))
+        return {};
+
+    // The settled slot can still be beside(self) after a visible gap has opened. Root placement is
+    // after the outer group, not after the moving item (which would put it back in the group).
+    auto const& tree = as_if<BrowserWindow>(window())->tab_folders();
+    for (auto parent = tree.parent_of(TabFolderTree::Item::folder(folder)); parent.has_value(); parent = tree.parent_of(TabFolderTree::Item::folder(folder)))
+        folder = *parent;
+    auto item = TabFolderTree::Item::folder(folder);
+    auto dest = HorizontalDrop::beside(tree, item, true);
+    if (!dest.has_value())
+        return {};
+    auto end = NumericLimits<int>::min();
+    for (auto const& chip : m_strip_chips) {
+        if (chip_in_subtree(chip.folder, folder)) {
+            if (auto rect = settled_chip_rect(chip.folder); rect.has_value())
+                end = max(end, rect->right() + 1);
+        }
+    }
+    for (int i = 0; i < count(); ++i) {
+        auto group = m_strip_group_of_tab.get(m_tab_widget->tab(i));
+        if (group.has_value() && chip_in_subtree(*group, folder) && is_tab_shown_on_strip(i))
+            end = max(end, visual_tab_rect(i).right() + 1);
+    }
+    return HorizontalLanding { *dest, {}, QRect(end, 0, 0, 0) };
 }
 
 void TabBar::record_native_drop(QPoint position)
@@ -3791,7 +3865,11 @@ void TabBar::update_horizontal_landing(QPoint position)
     if (m_horizontal_landing_position == position)
         return;
     m_horizontal_landing_position = position;
-    auto landing = horizontal_landing_at(position);
+    set_horizontal_landing(horizontal_landing_at(position));
+}
+
+void TabBar::set_horizontal_landing(Optional<HorizontalLanding> landing)
+{
     auto changed = landing.has_value() != m_horizontal_landing.has_value() || (landing.has_value() && (landing->anchor != m_horizontal_landing->anchor || landing->pin_slot != m_horizontal_landing->pin_slot));
     m_horizontal_landing = landing;
     if (changed) {
@@ -4666,9 +4744,11 @@ void TabBar::start_chip_drag(TabFolderId folder, QPoint position)
             span = span.united(visual_tab_rect(index));
     }
     // Use the same antialiased, transparent corners as a tab card rather than lifting the rectangular strip pixels.
-    auto contents = grab(span);
     auto card = lift_drag_card(span.size(), STRIP_CHIP_RADIUS, [&](QPainter& painter) {
-        painter.drawPixmap(0, 0, contents);
+        // The strip is transparent over window chrome. grab() includes QWidget's palette backdrop,
+        // which can be light even in a dark browser. Render only its chrome and child controls.
+        painter.fillRect(QRect(QPoint(), span.size()), ChromeStyle::chrome_tab_strip_background(Theme::chrome_palette(*this)));
+        render(&painter, QPoint(), QRegion(span), QWidget::DrawChildren);
     });
     m_position_in_selected_tab_while_dragging = m_drag_start_position - span.topLeft() + QPoint(TAB_DRAG_IMAGE_MARGIN, TAB_DRAG_IMAGE_MARGIN);
     m_strip_drag_card = new TabDragCard(*window(), AK::move(card));

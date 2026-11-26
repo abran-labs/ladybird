@@ -1526,7 +1526,7 @@ void BrowserWindow::show_strip_group_context_menu(TabFolderId id, QPoint global_
         return;
     }
     case Command::NewSubgroup:
-        start_creating_tab_folder({ id, {} });
+        start_creating_tab_folder({ id, {}, TabFolderEditing::FolderCreation::Placement::FirstChild });
         return;
     case Command::ActivateTab:
         for (int i = 0; i < tab_count(); ++i) {

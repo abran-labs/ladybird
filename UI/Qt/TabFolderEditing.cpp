@@ -66,9 +66,16 @@ static void reveal_folder(TabFolderTree& tree, TabFolderId folder)
         (void)tree.set_folder_collapsed(*parent, false);
 }
 
+TabFolderDestination FolderCreation::empty_folder_destination() const
+{
+    if (placement == Placement::FirstChild)
+        return { parent, 0 };
+    return TabFolderDestination::at_end_of(parent);
+}
+
 Optional<TabFolderId> FolderCreation::preview(TabFolderTree& tree) const
 {
-    auto destination = TabFolderDestination::at_end_of(parent);
+    auto destination = empty_folder_destination();
     if (!tabs.is_empty()) {
         for (auto key : tabs) {
             if (!tree.contains(TabFolderTree::Item::tab(key)))
@@ -93,7 +100,7 @@ Optional<TabFolderId> FolderCreation::commit(TabFolderTree& tree, String name) c
     for (auto key : tabs)
         items.append(TabFolderTree::Item::tab(key));
     auto id = items.is_empty()
-        ? tree.create_folder(move(name), TabFolderDestination::at_end_of(parent))
+        ? tree.create_folder(move(name), empty_folder_destination())
         : tree.create_folder_around(move(name), items);
     if (id.has_value())
         reveal_folder(tree, *id);

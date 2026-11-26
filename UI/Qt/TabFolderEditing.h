@@ -43,12 +43,21 @@ Selection extended(Selection, Vector<TabFolderSync::SidebarRow> const&, TabKey c
 Vector<TabKey> context_tabs(Selection const&, TabKey clicked, Vector<TabKey> const& window_order);
 
 struct FolderCreation {
+    enum class Placement {
+        LastChild,
+        FirstChild,
+    };
+
     Optional<TabFolderId> parent;
     Vector<TabKey> tabs;
+    Placement placement { Placement::LastChild };
 
     // Adds a placeholder to a disposable copy; the tabs don't move until the real tree accepts the edit.
     Optional<TabFolderId> preview(TabFolderTree&) const;
     Optional<TabFolderId> commit(TabFolderTree&, String name) const;
+
+private:
+    TabFolderDestination empty_folder_destination() const;
 };
 
 // A folder's name, edited in place over its row in the sidebar. Return or leaving the field with a name accepts it;
