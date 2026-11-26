@@ -951,6 +951,13 @@ void BrowserWindow::start_creating_tab_folder(TabFolderEditing::FolderCreation c
     if (!tab_bar->edit_folder_name({}, default_name, [this, parent, keep_collapsed](Optional<String> name) {
             auto creation = m_folder_creation.release_value();
             auto created = name.has_value() ? creation.commit(m_tab_folders, name.release_value()) : Optional<TabFolderId> {};
+            // A group is made of ordinary tabs, but a pinned one joins only once the name is in: Escape changes nothing.
+            if (created.has_value()) {
+                Vector<TabFolderTree::Item> items;
+                for (auto key : creation.tabs)
+                    items.append(TabFolderTree::Item::tab(key));
+                unpin_tab_folder_items(items);
+            }
             // A closed group on the strip stays closed: its chip is where it is, and the editor sat beside it.
             if (created.has_value() && keep_collapsed)
                 (void)m_tab_folders.set_folder_collapsed(*parent, true);
@@ -966,6 +973,11 @@ void BrowserWindow::move_tab_folder_items(Vector<TabFolderTree::Item> const& ite
     if (!m_tab_folders.move_items(items, destination))
         return;
     update_tab_folders();
+    unpin_tab_folder_items(items);
+}
+
+void BrowserWindow::unpin_tab_folder_items(Vector<TabFolderTree::Item> const& items)
+{
     // A tab in a folder is one of its rows, and the pins belong to the tiles: it comes out of them, as itself.
     for (auto item : items) {
         if (!item.is_tab() || !m_tab_folders.parent_of(item).has_value())
@@ -1184,9 +1196,8 @@ void BrowserWindow::show_tab_context_menu(Tab& tab, QPoint global_position)
     menu->addSeparator();
     menu->addAction(Application::the().reopen_recently_closed_tab_action());
     Optional<TabFolderId> folder;
-    if (targets.contains([&](auto const& target) {
-            return target->session_tab_id().has_value() && (!horizontal || !target->is_pinned());
-        })) {
+    // Pinned tabs join groups too, as the tabs they are: the strips keep pins on the tiles, not on a group's rows.
+    if (targets.contains([](auto const& target) { return target->session_tab_id().has_value(); })) {
         TabFolderMenus::add_move_menu(*menu, m_tab_folders, horizontal ? TabFolderMenus::Terms::Group : TabFolderMenus::Terms::Folder, [&](TabFolderId id) {
             command = Command::MoveToFolder;
             folder = id; }, [&] { command = Command::CreateFolder; });
@@ -1252,7 +1263,7 @@ void BrowserWindow::show_tab_context_menu(Tab& tab, QPoint global_position)
         Vector<TabFolderTree::Item> items;
         keys.clear();
         for (auto const& target : targets) {
-            if (!still_here(target) || (horizontal && target->is_pinned()))
+            if (!still_here(target))
                 continue;
             if (auto id = target->session_tab_id(); id.has_value()) {
                 items.append(TabFolderTree::Item::tab(*id));
