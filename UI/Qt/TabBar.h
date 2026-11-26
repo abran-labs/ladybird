@@ -126,6 +126,7 @@ public:
     void update_drop_preview(QPoint const&);
     void hide_drop_preview();
     void record_native_drop(QPoint);
+    bool native_rail_contains(QPoint position_in_bar) const;
 
     // A row of the vertical sidebar below the pinned tiles: a folder's header, or an unpinned tab, which may be the
     // active tab shown under a collapsed folder. The window lays them out from its folders; a tab with no row is hidden.
@@ -216,6 +217,7 @@ private:
         QHash<TabFolderId, qreal> chip_offsets;
         qreal strip_growth { 0 };
         qreal pinned_region_growth { 0 };
+        qreal removed_width { 0 };
     };
 
     Optional<int> dragged_tab_index() const;
@@ -235,6 +237,8 @@ private:
     qreal current_chip_offset(TabFolderId) const;
     TabShift current_tab_shift(int index) const;
     qreal current_strip_growth() const;
+    qreal current_removed_width() const;
+    int visual_horizontal_scroll_limit() const;
     qreal current_pinned_region_growth() const;
     QRect shifted_tab_rect(int index) const;
     qreal selection_of(int index) const;
@@ -457,10 +461,12 @@ private:
         QPointer<TabDragCard> rail_card;
         QPointer<QWindow> icon_window;
         QSize icon_size;
+        QRect row_in_window;
         Optional<HorizontalLanding> dropped;
     };
     NativeHorizontalDrag* m_native_horizontal_drag { nullptr }; // Only during QDrag::exec() on the source.
     void leave_native_rail();
+    DropPreview detached_horizontal_preview() const;
     void update_horizontal_landing(QPoint);
     void position_horizontal_card(TabDragCard&, QPoint);
     void prepare_pin_preview(TabDragCard&, int);

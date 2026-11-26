@@ -3110,9 +3110,9 @@ void TabBar::paintEvent(QPaintEvent*)
             fade.setColorAt(fades_right ? 1.0 : 0.0, strip);
             painter.fillRect(QRect(x, 0, HORIZONTAL_TAB_STRIP_FADE_WIDTH, height()), fade);
         };
-        if (m_scroll_offset > 0)
+        if (min(m_scroll_offset, visual_horizontal_scroll_limit()) > 0)
             paint_fade(0, false);
-        if (m_scroll_offset < max_scroll_offset())
+        if (m_scroll_offset < visual_horizontal_scroll_limit())
             paint_fade(width() - HORIZONTAL_TAB_STRIP_FADE_WIDTH, true);
     }
     if (is_vertical && (region.height > 0 || pinned_region_growth > 0)) {
@@ -3159,7 +3159,7 @@ void TabBar::contextMenuEvent(QContextMenuEvent* event)
 
 void TabBar::dragEnterEvent(QDragEnterEvent* event)
 {
-    if (!m_tab_widget || !target_can_accept_tab_drop(*m_tab_widget, *event)) {
+    if (!m_tab_widget || !target_can_accept_tab_drop(*m_tab_widget, *event) || !native_rail_contains(event->position().toPoint())) {
         event->ignore();
         return;
     }
@@ -3177,7 +3177,7 @@ void TabBar::dragLeaveEvent(QDragLeaveEvent* event)
 
 void TabBar::dragMoveEvent(QDragMoveEvent* event)
 {
-    if (!m_tab_widget || !target_can_accept_tab_drop(*m_tab_widget, *event)) {
+    if (!m_tab_widget || !target_can_accept_tab_drop(*m_tab_widget, *event) || !native_rail_contains(event->position().toPoint())) {
         hide_drop_preview();
         event->ignore();
         return;
@@ -3190,7 +3190,7 @@ void TabBar::dragMoveEvent(QDragMoveEvent* event)
 
 void TabBar::dropEvent(QDropEvent* event)
 {
-    if (!m_tab_widget || !target_can_accept_tab_drop(*m_tab_widget, *event)) {
+    if (!m_tab_widget || !target_can_accept_tab_drop(*m_tab_widget, *event) || !native_rail_contains(event->position().toPoint())) {
         hide_drop_preview();
         event->ignore();
         return;
@@ -3206,6 +3206,33 @@ void TabBar::dropEvent(QDropEvent* event)
 
 bool TabBar::eventFilter(QObject* watched, QEvent* event)
 {
+    // Own this source's tab MIME at the native window, before Qt routes it to children. A rejected
+    // widget enter can suppress its later moves (e.g. toolbar -> edge -> pin); conversely, changing
+    // child targets sends spurious leaves. Neither is a transition between loose and rail modes.
+    if (m_native_horizontal_drag && watched == window()->windowHandle()) {
+        if (event->type() == QEvent::DragLeave) {
+            leave_native_rail();
+            return true;
+        }
+        if (event->type() == QEvent::DragMove || event->type() == QEvent::DragEnter || event->type() == QEvent::Drop) {
+            auto& drag = *static_cast<QDropEvent*>(event);
+            if (target_can_accept_tab_drop(*m_tab_widget, drag)) {
+                auto position = mapFrom(window(), drag.position().toPoint());
+                if (!native_rail_contains(position)) {
+                    leave_native_rail();
+                    drag.ignore();
+                } else {
+                    if (event->type() == QEvent::Drop)
+                        record_native_drop(position);
+                    else
+                        update_drop_preview(position);
+                    drag.setDropAction(Qt::MoveAction);
+                    drag.accept();
+                }
+                return true;
+            }
+        }
+    }
     // NB: Qt drops the pointer's moves over the microphone indicator rather than passing them on to the tab bar, so the
     //     indicator keeps its tab hovered like the buttons do.
     auto hovered_tab_for_button = [this](QObject* button) {
@@ -3775,10 +3802,22 @@ void TabBar::update_horizontal_landing(QPoint position)
     update();
 }
 
+bool TabBar::native_rail_contains(QPoint position_in_bar) const
+{
+    if (!m_native_horizontal_drag)
+        return true;
+    // Re-entry must be intentional: the 40px tear-off tolerance includes the toolbar. Do not
+    // measure against a child such as the + that moves as the gap animates.
+    auto row = m_native_horizontal_drag->row_in_window;
+    if (m_native_horizontal_drag->rail_card->isHidden())
+        row.adjust(0, 3, 0, -3);
+    return row.contains(mapTo(window(), position_in_bar));
+}
+
 void TabBar::update_drop_preview(QPoint const& position)
 {
     if (m_native_horizontal_drag && tab_layout() == TabLayout::Horizontal && dragged_tab_index().has_value()) {
-        if (!m_tab_widget->tab_drop_area_contains(*this, position)) {
+        if (!native_rail_contains(position)) {
             leave_native_rail();
             return;
         }
@@ -3792,9 +3831,14 @@ void TabBar::update_drop_preview(QPoint const& position)
                         state.icon_window = icon;
                         state.icon_size = icon->size();
                         icon->resize(1, 1);
+                        // Submit the small raster buffer before scheduling a paint of the rail card.
+                        QPaintEvent paint(QRect(0, 0, 1, 1));
+                        QApplication::sendEvent(icon, &paint);
                         break;
                     }
                 }
+                if (!state.icon_window && QGuiApplication::platformName().startsWith(QLatin1StringView("wayland")))
+                    return;
                 m_horizontal_moving = { TabFolderTree::Item::tab(*key) };
                 state.rail_card->show();
                 state.rail_card->raise();
@@ -3873,13 +3917,14 @@ void TabBar::leave_native_rail()
     m_horizontal_landing_position.clear();
     m_horizontal_landing.clear();
     m_horizontal_gap_end.clear();
-    clear_drop_preview();
+    animate_drop_preview(detached_horizontal_preview());
     m_tab_widget->place_horizontal_new_tab_button(true);
 }
 
 void TabBar::hide_drop_preview()
 {
-    leave_native_rail();
+    if (m_native_horizontal_drag)
+        return;
     if (tab_layout() != TabLayout::Horizontal) {
         m_drop_slot.clear();
         set_vertical_drop_indicator({});
@@ -3992,6 +4037,30 @@ bool TabBar::horizontal_drag_contains(int index) const
     return key.has_value() && m_horizontal_moving.contains_slow(TabFolderTree::Item::tab(*key));
 }
 
+TabBar::DropPreview TabBar::detached_horizontal_preview() const
+{
+    DropPreview preview;
+    auto index = dragged_tab_index();
+    if (!index.has_value())
+        return preview;
+    // Remove only the tab body. Qt lends its leading/trailing room to chips, which stay in the tree.
+    auto source = visual_tab_rect(*index);
+    preview.removed_width = source.width();
+    auto limit = max(0, max_scroll_offset() - source.width());
+    auto scroll_correction = max(0, m_scroll_offset - limit);
+    auto shift = [&](int left) { return scroll_correction - (left > source.right() ? source.width() : 0); };
+    preview.tab_shifts.resize(count());
+    for (int i = 0; i < count(); ++i) {
+        if (i != *index && is_tab_shown_on_strip(i))
+            preview.tab_shifts[i].x_offset = shift(visual_tab_rect(i).left());
+    }
+    for (auto const& chip : m_strip_chips) {
+        if (auto rect = settled_chip_rect(chip.folder); rect.has_value())
+            preview.chip_offsets.insert(chip.folder, shift(rect->left()));
+    }
+    return preview;
+}
+
 TabBar::DropPreview TabBar::horizontal_drop_preview()
 {
     m_horizontal_gap_end.clear();
@@ -4066,6 +4135,7 @@ TabBar::DropPreview TabBar::current_drop_preview() const
         preview.tab_shifts.append(current_tab_shift(index));
     for (auto const& chip : m_strip_chips)
         preview.chip_offsets.insert(chip.folder, current_chip_offset(chip.folder));
+    preview.removed_width = current_removed_width();
     preview.strip_growth = current_strip_growth();
     preview.pinned_region_growth = current_pinned_region_growth();
     return preview;
@@ -4088,6 +4158,18 @@ TabBar::TabShift TabBar::current_tab_shift(int index) const
         .width_delta = interpolate(start.width_delta, target.width_delta),
         .height_delta = interpolate(start.height_delta, target.height_delta),
     };
+}
+
+qreal TabBar::current_removed_width() const
+{
+    auto start = m_drop_preview_start.removed_width;
+    return start + (m_drop_preview_target.removed_width - start) * m_drop_preview_progress;
+}
+
+int TabBar::visual_horizontal_scroll_limit() const
+{
+    // The extra end room of a short strip is not overflow. Clamp after removing the tab.
+    return max(0, max_scroll_offset() - qRound(current_removed_width()));
 }
 
 qreal TabBar::current_strip_growth() const
@@ -4320,7 +4402,7 @@ int TabBar::horizontal_tabs_end_offset() const
 
 QRect TabBar::shifted_tab_rect(int index) const
 {
-    if (!is_tab_shown_on_strip(index) || horizontal_drag_contains(index))
+    if (!is_tab_shown_on_strip(index) || horizontal_drag_contains(index) || (m_native_horizontal_drag && index == dragged_tab_index()))
         return {};
     auto tab_rect = animated_tab_rect(index, visual_tab_rect(index));
     auto shift = current_tab_shift(index);
@@ -4474,7 +4556,10 @@ void TabBar::drag_tab_loose(Tab& tab, QPixmap card)
             native.rail_card = new TabDragCard(*window(), card);
             prepare_pin_preview(*native.rail_card, index);
         }
+        auto* row = parentWidget();
+        native.row_in_window = QRect(row->mapTo(window(), QPoint()), row->size());
         m_native_horizontal_drag = &native;
+        window()->windowHandle()->installEventFilter(this);
         auto image = compact_drag_image(tab_drag_card_rect(index), index, nullptr, 1);
         // A native drag surface has no widget opacity; composite the entire compact card once, as its overlay does.
         QPixmap translucent(image.pixmap.size());
@@ -4501,8 +4586,10 @@ void TabBar::drag_tab_loose(Tab& tab, QPixmap card)
     s_active_tab_dragged_tab = dragged_tab;
     s_pending_tab_drop_target = nullptr;
     s_pending_tab_drop_index = -1;
-    if (horizontal)
+    if (horizontal) {
+        animate_drop_preview(detached_horizontal_preview());
         m_tab_widget->place_horizontal_new_tab_button(true);
+    }
     update_tab_button_geometry();
     update();
 
@@ -4526,6 +4613,7 @@ void TabBar::drag_tab_loose(Tab& tab, QPixmap card)
     auto was_canceled = cancellation_filter.was_canceled();
 
     if (horizontal) {
+        window()->windowHandle()->removeEventFilter(this);
         leave_native_rail();
         m_native_horizontal_drag = nullptr;
         delete native.rail_card.data();
@@ -4724,7 +4812,7 @@ void TabBar::end_strip_drag(bool keep_vertical_card, bool leaving_strip)
         if (!keep_vertical_card)
             clear_vertical_drag_card();
     }
-    if (!m_horizontal_moving.is_empty())
+    if (!leaving_strip && !m_horizontal_moving.is_empty())
         clear_drop_preview();
     m_horizontal_moving.clear();
     m_horizontal_landing_position.clear();
@@ -5218,8 +5306,8 @@ void TabBar::update_tab_button_geometry()
         auto pinned_count = pinned_tab_count();
         // Buttons are widgets above the tab bar's painting, so the fade at a scrolling end can't cover them. They hide
         // there instead.
-        auto visible_left = m_scroll_offset > 0 ? HORIZONTAL_TAB_STRIP_FADE_WIDTH : 0;
-        auto visible_right = width() - (m_scroll_offset < max_scroll_offset() ? HORIZONTAL_TAB_STRIP_FADE_WIDTH : 0);
+        auto visible_left = min(m_scroll_offset, visual_horizontal_scroll_limit()) > 0 ? HORIZONTAL_TAB_STRIP_FADE_WIDTH : 0;
+        auto visible_right = width() - (m_scroll_offset < visual_horizontal_scroll_limit() ? HORIZONTAL_TAB_STRIP_FADE_WIDTH : 0);
         auto is_in_view = [&](QWidget* button) {
             return button->x() >= visible_left && button->x() + button->width() <= visible_right;
         };
@@ -6602,7 +6690,7 @@ void TabWidget::accept_tab_drag(QDragMoveEvent* event, QWidget* target)
         return;
     }
 
-    if (!tab_drop_area_contains(*target, event->position().toPoint())) {
+    if (!tab_drop_area_contains(*target, event->position().toPoint()) || !m_tab_bar->native_rail_contains(m_tab_bar->mapFrom(target, event->position().toPoint()))) {
         m_tab_bar->hide_drop_preview();
         event->ignore();
         return;
@@ -6615,7 +6703,7 @@ void TabWidget::accept_tab_drag(QDragMoveEvent* event, QWidget* target)
 
 void TabWidget::accept_tab_drop(QDropEvent* event, QPoint position_in_bar)
 {
-    if (!target_can_accept_tab_drop(*this, *event)) {
+    if (!target_can_accept_tab_drop(*this, *event) || !m_tab_bar->native_rail_contains(position_in_bar)) {
         event->ignore();
         return;
     }
